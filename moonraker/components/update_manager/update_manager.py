@@ -18,6 +18,7 @@ from .git_deploy import GitDeploy
 from .net_deploy import NetDeploy
 from .python_deploy import PythonDeploy
 from .system_deploy import PackageDeploy
+from .ota_deploy import OtaDeploy
 from ...common import RequestType
 from ...utils.filelock import AsyncExclusiveFileLock, LockTimeout
 
@@ -61,7 +62,8 @@ def get_deploy_class(
         AppType.GIT_REPO: GitDeploy,
         AppType.ZIP: NetDeploy,
         AppType.PYTHON: PythonDeploy,
-        AppType.EXECUTABLE: NetDeploy
+        AppType.EXECUTABLE: NetDeploy,
+        AppType.OTA: OtaDeploy
     }
     return _deployers.get(key, default)
 
@@ -92,17 +94,20 @@ class UpdateManager:
         self.updaters: Dict[str, BaseDeploy] = {}
         if config.getboolean('enable_system_updates', True):
             self.updaters['system'] = PackageDeploy(config)
-        mcfg = self.app_config["moonraker"]
-        kcfg = self.app_config["klipper"]
-        mclass = get_deploy_class(mcfg.get("type"), BaseDeploy)
-        self.updaters['moonraker'] = mclass(mcfg)
-        kclass = BaseDeploy
-        if (
-            os.path.exists(kcfg.get("path")) and
-            os.path.exists(kcfg.get("env"))
-        ):
-            kclass = get_deploy_class(kcfg.get("type"), BaseDeploy)
-        self.updaters['klipper'] = kclass(kcfg)
+        self._enable_moonraker_updates = config.getboolean('enable_moonraker_updates', True)
+        self._enable_klipper_updates   = config.getboolean('enable_klipper_updates', True)
+
+        if self._enable_moonraker_updates:
+            mcfg = self.app_config["moonraker"]
+            mclass = get_deploy_class(mcfg.get("type"), BaseDeploy)
+            self.updaters['moonraker'] = mclass(mcfg)
+
+        if self._enable_klipper_updates:
+            kcfg = self.app_config["klipper"]
+            kclass = BaseDeploy
+            if (os.path.exists(kcfg.get("path")) and os.path.exists(kcfg.get("env"))):
+                kclass = get_deploy_class(kcfg.get("type"), BaseDeploy)
+            self.updaters['klipper'] = kclass(kcfg)
 
         # TODO: The below check may be removed when invalid config options
         # raise a config error.
@@ -118,6 +123,12 @@ class UpdateManager:
         for section in client_sections:
             cfg = config[section]
             name = BaseDeploy.parse_name(cfg)
+
+            if name == "moonraker" and not self._enable_moonraker_updates:
+                continue
+            if name == "klipper" and not self._enable_klipper_updates:
+                continue
+
             if name in self.updaters:
                 if name not in ["klipper", "moonraker"]:
                     self.server.add_warning(
@@ -178,6 +189,10 @@ class UpdateManager:
         self.server.register_endpoint(
             "/machine/update/rollback", RequestType.POST, self._handle_rollback
         )
+        # Commit endpoint for OTA-style updaters
+        self.server.register_endpoint(
+            "/machine/update/commit", RequestType.POST, self._handle_commit
+        )
         self.server.register_notification("update_manager:update_response")
         self.server.register_notification("update_manager:update_refreshed")
 
@@ -225,6 +240,8 @@ class UpdateManager:
                 await updater.refresh()
 
     def _set_klipper_repo(self) -> None:
+        if not getattr(self, "_enable_klipper_updates", True):
+            return
         if self.klippy_identified_evt is not None:
             self.klippy_identified_evt.set()
 
@@ -512,6 +529,30 @@ class UpdateManager:
                 raise
             finally:
                 self.cmd_helper.clear_update_info()
+        return "ok"
+
+    def _handle_commit(self, web_request: WebRequest) -> str:
+        if self.kconn.is_printing():
+            raise self.server.error("Commit Refused: Klippy is printing")
+        app: str = web_request.get_str('name')
+        updater = self.updaters.get(app, None)
+        if updater is None:
+            raise self.server.error(f"Updater {app} not available", 404)
+        if not hasattr(updater, "commit"):
+            raise self.server.error(f"Updater {app} does not support commit", 400)
+        async def _run():
+            async with self.cmd_request_lock:
+                self.cmd_helper.set_update_info(f"commit_{app}", id(web_request))
+                try:
+                    await getattr(updater, "commit")()
+                except Exception as e:
+                    self.cmd_helper.notify_update_response(f"Error Committing {app}")
+                    self.cmd_helper.notify_update_response(str(e), is_complete=True)
+                    raise
+                finally:
+                    self.cmd_helper.clear_update_info()
+        # schedule coroutine
+        self.event_loop.create_task(_run())
         return "ok"
 
     async def close(self) -> None:

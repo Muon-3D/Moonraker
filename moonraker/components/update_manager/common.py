@@ -51,6 +51,7 @@ class AppType(ExtendedEnum):
     ZIP = 4
     PYTHON = 5
     EXECUTABLE = 6
+    OTA = 7
 
     @classmethod
     def detect(cls, app_path: Union[str, pathlib.Path, None] = None):
