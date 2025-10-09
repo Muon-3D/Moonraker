@@ -1,7 +1,7 @@
 # Moonraker component — wifi_autoproxy.py
 #
 # Enable it with a bare section in moonraker.conf:
-#     [wifi_autoproxy]
+#     [aux_api_proxy]
 #
 # ──────────────────────────────────────────────────────────────────────────
 import asyncio, json, logging, re, contextlib
@@ -151,6 +151,41 @@ class AuxAutoProxy:
     async def _openapi_handler(self, webreq):
         # return exactly the JSON you fetched from FastAPI
         return self._spec
+    
+
+
+    # ===== Internal aux-api helpers for other Moonraker components =====
+    async def get(self, path: str) -> Any:
+        url = f"{FASTAPI_ROOT}{path}"
+        resp = await self.http_client.get(url, connect_timeout=3., request_timeout=8.)
+        resp.raise_for_status()
+        with contextlib.suppress(Exception):
+            return resp.json()
+        return resp.content
+
+    async def post(self, path: str, body: Any | None = None) -> Any:
+        url = f"{FASTAPI_ROOT}{path}"
+        # If body is dict-like, send JSON; otherwise pass raw/None
+        if isinstance(body, (dict, list)):
+            resp = await self.http_client.post(url, json=body, connect_timeout=3., request_timeout=15.)
+        else:
+            resp = await self.http_client.post(url, body=body or "", connect_timeout=3., request_timeout=15.)
+        resp.raise_for_status()
+        with contextlib.suppress(Exception):
+            return resp.json()
+        return resp.content
+
+    # OTA convenience wrappers
+    async def ota_status(self) -> Any:
+        return await self.get("/update/status")
+
+    async def ota_start(self, url: str | None = None) -> Any:
+        body = {"url": url} if url else {}
+        return await self.post("/update/start", body)
+
+    async def ota_commit(self) -> Any:
+        return await self.post("/update/commit", {})
+        
 
 # Moonraker entry-point
 def load_component(config):
