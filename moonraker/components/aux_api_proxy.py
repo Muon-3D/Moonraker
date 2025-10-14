@@ -6,7 +6,7 @@
 # ──────────────────────────────────────────────────────────────────────────
 import asyncio, json, logging, re, contextlib
 from pathlib import Path
-from typing import Dict, Any, Callable
+from typing import Dict, Any, Callable, Optional
 from urllib.parse import urlencode
 
 FASTAPI_ROOT = "http://localhost:6789"         #  or "unix:/run/wifi.sock"
@@ -157,31 +157,37 @@ class AuxAutoProxy:
     # ===== Internal aux-api helpers for other Moonraker components =====
     async def get(self, path: str) -> Any:
         url = f"{FASTAPI_ROOT}{path}"
-        resp = await self.http_client.get(url, connect_timeout=3., request_timeout=8.)
-        resp.raise_for_status()
+        rsp = await self.http_client.get(
+            url, connect_timeout=3.0, request_timeout=20.0
+        )
+        rsp.raise_for_status()
         with contextlib.suppress(Exception):
-            return resp.json()
-        return resp.content
+            return rsp.json()
+        return rsp.content
 
-    async def post(self, path: str, body: Any | None = None) -> Any:
+    async def post(self, path: str, body: Optional[Any] = None) -> Any:
         url = f"{FASTAPI_ROOT}{path}"
-        # If body is dict-like, send JSON; otherwise pass raw/None
-        if isinstance(body, (dict, list)):
-            resp = await self.http_client.post(url, json=body, connect_timeout=3., request_timeout=15.)
-        else:
-            resp = await self.http_client.post(url, body=body or "", connect_timeout=3., request_timeout=15.)
-        resp.raise_for_status()
+        headers = {}
+        payload = None
+        if body is not None:
+            payload = json.dumps(body)
+            headers = {"Content-Type": "application/json"}
+        rsp = await self.http_client.post(
+            url, body=payload if payload is not None else "",
+            headers=headers,
+            connect_timeout=3.0, request_timeout=60.0
+        )
+        rsp.raise_for_status()
         with contextlib.suppress(Exception):
-            return resp.json()
-        return resp.content
+            return rsp.json()
+        return rsp.content
 
     # OTA convenience wrappers
     async def ota_status(self) -> Any:
         return await self.get("/update/status")
 
-    async def ota_start(self, url: str | None = None) -> Any:
-        body = {"url": url} if url else {}
-        return await self.post("/update/start", body)
+    async def ota_start(self, url: Optional[str] = None) -> Any:
+        return await self.post("/update/start", {"url": url} if url else {})
 
     async def ota_commit(self) -> Any:
         return await self.post("/update/commit", {})

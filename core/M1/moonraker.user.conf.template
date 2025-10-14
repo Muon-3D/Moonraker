@@ -1,0 +1,4 @@
+[include ${CORE_MOONRAKER_CONFIG_PATH}]
+
+### ------------------------------------###
+### ADD CUSTOM MODULES BELLOW THIS LINE ###

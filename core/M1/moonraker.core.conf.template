@@ -1,0 +1,49 @@
+[server]
+host: 0.0.0.0
+port: 7125
+max_upload_size: 1024
+klippy_uds_address: ${PRINTER_ADMIN_DIR}/comms/klippy.sock
+
+[file_manager]
+enable_object_processing: True
+
+[authorization]
+force_logins: false
+cors_domains:
+    *://my.fluidd.xyz
+    *://*.local
+    *://*.lan
+    *://localhost:100 #Access for MuonUI Local Service
+    *://localhost:5173 #Acces for MuonUI Dev Server
+trusted_clients:
+    10.0.0.0/8
+    127.0.0.0/8
+    169.254.0.0/16
+    172.16.0.0/12
+    192.168.0.0/16
+    FE80::/10
+    ::1/128
+
+[octoprint_compat]
+
+[history]
+
+[announcements]
+subscriptions:
+    fluidd
+    #todo add ciruclar screen
+
+[gcode_preprocessor]
+binary: ${AVOID_EXCLUDED_ZONE_BINARY}
+
+[aux_api_proxy]
+
+[update_manager]
+refresh_interval: 168
+enable_auto_refresh: True
+enable_system_updates: False
+enable_moonraker_updates: False
+enable_klipper_updates: False
+
+[update_manager MuonOS]
+type: ota
