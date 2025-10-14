@@ -1,15 +1,15 @@
 # OTA Image Deployment for Moonraker Update Manager
-# Component-to-component version (no HTTP self-calls)
+# Improved adaptive + robust version
 # License: GNU GPLv3 (same as Moonraker components)
 
 from __future__ import annotations
 import asyncio
 from typing import Any, Dict, Optional, cast
-
 from .base_deploy import BaseDeploy
 
-POLL_SECS = 1.0
-POLL_MAX_SECS = 30.0  # stop polling after boot kicks us, keep UI snappy
+POLL_SECS = 1.0                   # seconds between polls
+PROGRESS_IDLE_TIMEOUT = 60.0      # stop if no progress/state change for N seconds
+MAX_CONSECUTIVE_ERRORS = 5        # retry transient failures before assuming reboot
 
 class OtaDeploy(BaseDeploy):
     """
@@ -18,8 +18,6 @@ class OtaDeploy(BaseDeploy):
     """
 
     def __init__(self, config):
-        # Section name (eg. [update_manager os]) becomes self.name automatically.
-        # Prefix adds a label to log lines shown in the client.
         super().__init__(config, prefix="OTA")
         self.config = config
         self._status: Dict[str, Any] = {}
@@ -36,7 +34,6 @@ class OtaDeploy(BaseDeploy):
     # ---------- lifecycle -------------------------------------------------
 
     async def initialize(self) -> Dict[str, Any]:
-        # Let BaseDeploy restore/sanitize any persisted state
         storage = await super().initialize()
         return storage
 
@@ -55,44 +52,78 @@ class OtaDeploy(BaseDeploy):
             self._save_state()
 
     async def update(self) -> bool:
-        """Start an image update; briefly poll so the UI shows movement, then return."""
+        """Start an image update; poll adaptively so the UI shows progress."""
         self.notify_status("Starting OS image update… device may reboot.")
         aux = self._aux()
         await aux.ota_start()  # fire-and-forget; FastAPI does the heavy lifting
 
-        # Best-effort: short poll to surface early progress / state before reboot
-        total = 0.0
-        last_pct: Optional[int] = None
+        # Adaptive progress polling
+        last_progress: Optional[float] = None
+        last_state: Optional[str] = None
+        last_change_time = asyncio.get_event_loop().time()
+        consecutive_errors = 0
+
         try:
-            while total < POLL_MAX_SECS:
-                s = await aux.ota_status()
-                self._status = s
-                self._map_status(s)
-                # push a Versions tile refresh (Moonraker throttles these)
-                self.cmd_helper.notify_update_refreshed()
+            while True:
+                try:
+                    s = await aux.ota_status()
+                    self._status = s
+                    self._map_status(s)
+                    consecutive_errors = 0  # reset error counter
 
-                pct = self._progress
-                if pct is not None:
-                    ipct = int(pct)
-                    if last_pct != ipct:
-                        self.notify_status(f"Installing… {ipct}%")
-                        last_pct = ipct
+                    # push Versions tile refresh (Moonraker throttles)
+                    self.cmd_helper.notify_update_refreshed()
 
-                st = (self._state or "").lower()
-                if st in ("idle", "committing", "failed"):
-                    break
+                    pct = self._progress
+                    st = (self._state or "").lower()
 
-                await asyncio.sleep(POLL_SECS)
-                total += POLL_SECS
+                    # update timestamp if anything changed
+                    if pct != last_progress or st != last_state:
+                        last_change_time = asyncio.get_event_loop().time()
+                        last_progress = pct
+                        last_state = st
+
+                        # pretty progress message
+                        if pct is not None:
+                            self.notify_status(f"Installing… {pct:.1f}%")
+
+                    # stop if commit/idle/fail
+                    if st in ("idle", "failed"):
+                        break
+
+                    # detect stall
+                    now = asyncio.get_event_loop().time()
+                    if now - last_change_time > PROGRESS_IDLE_TIMEOUT:
+                        self._warnings.append(
+                            "No progress reported for a while; assuming reboot or stall."
+                        )
+                        break
+
+                    await asyncio.sleep(POLL_SECS)
+
+                except Exception as e:
+                    consecutive_errors += 1
+                    if consecutive_errors > MAX_CONSECUTIVE_ERRORS:
+                        self._warnings.append(f"Lost contact with OTA service: {e}")
+                        break
+                    await asyncio.sleep(POLL_SECS * 2)
+
         except Exception:
-            # Likely reboot in progress; just finish gracefully
+            # likely reboot in progress; just exit gracefully
             pass
 
-        # Final line for this request
-        if (self._state or "").lower() == "failed":
+        # --- Final messages ---
+        st = (self._state or "").lower()
+        if st == "failed":
             self.notify_status("OTA failed", is_complete=True)
             raise self.server.error(self._status.get("error", "OTA failed"))
-        self.notify_status("Update initiated.", is_complete=True)
+        elif st == "installing":
+            self.notify_status(
+                "Update still in progress… device may reboot soon.", is_complete=False
+            )
+        else:
+            self.notify_status("Update initiated.", is_complete=True)
+
         return True
 
     async def commit(self) -> bool:
@@ -105,14 +136,11 @@ class OtaDeploy(BaseDeploy):
         return True
 
     async def rollback(self) -> bool:
-        """Skeleton for future rollback support."""
         raise self.server.error("Rollback not implemented for OS image")
 
     # ---------- status for Moonraker/clients ------------------------------
 
     def get_update_status(self) -> Dict[str, Any]:
-        # Fluidd/Mainsail understand these fields; hashes let the UI light up even
-        # if versions aren't strict semver.
         version = self._current or "?"
         remote_version = self._target or version
         return {
@@ -131,7 +159,6 @@ class OtaDeploy(BaseDeploy):
         }
 
     def get_persistent_data(self) -> Dict[str, Any]:
-        # No custom persistence beyond base behavior
         return super().get_persistent_data()
 
     # ---------- helpers ---------------------------------------------------
@@ -139,7 +166,6 @@ class OtaDeploy(BaseDeploy):
     def _aux(self):
         aux = self.server.lookup_component("aux_api_proxy", None)
         if aux is None:
-            # As per your constraint, this should always exist
             raise self.server.error("aux_api_proxy component not loaded")
         return aux
 
@@ -150,14 +176,15 @@ class OtaDeploy(BaseDeploy):
         return cast(Dict[str, Any], data)
 
     def _map_status(self, s: Dict[str, Any]) -> None:
-        # Map AUX API → fields the UI uses
         self._state = (s.get("state") or "").lower()
         self._current = s.get("current_version") or self._current
-        # Only show target when update_available, else keep current to avoid false “update”
         if s.get("update_available"):
             self._target = s.get("target_version") or self._target
         else:
             self._target = self._current
         self._requires_commit = bool(s.get("requires_commit", False))
-        prog = s.get("progress", None)
-        self._progress = float(prog) if isinstance(prog, (int, float)) else None
+        prog = s.get("progress")
+        if isinstance(prog, (int, float)):
+            self._progress = round(float(prog), 1)
+        else:
+            self._progress = None
