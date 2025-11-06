@@ -57,6 +57,7 @@ class OtaDeploy(BaseDeploy):
     async def refresh(self) -> None:
         """Fetch current OTA status and cache mapped fields."""
         try:
+            await self._aux().ota_check_server()
             s = await self._aux_status()
             self._status = s
             self._map_status(s)

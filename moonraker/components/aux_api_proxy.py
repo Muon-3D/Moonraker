@@ -198,6 +198,9 @@ class AuxAutoProxy:
     # OTA convenience wrappers
     async def ota_status(self) -> Any:
         return await self.get("/update/status")
+    
+    async def ota_check_server(self) -> Any:
+        return await self.get("/update/check_server")
 
     async def ota_start(self, url: str | None = None) -> Any:
         body = {"url": url} if url else {}
