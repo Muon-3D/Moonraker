@@ -6,6 +6,8 @@ klippy_uds_address: ${PRINTER_ADMIN_DIR}/comms/klippy.sock
 
 [file_manager]
 enable_object_processing: True
+check_klipper_config_path: False
+check_klipper_config_examples_path: False
 
 [authorization]
 force_logins: false

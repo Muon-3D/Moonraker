@@ -280,9 +280,10 @@ class FileManager:
         if os.path.islink(path):
             path = os.path.realpath(path)
         if not os.path.isdir(path) or path == "/":
-            self.server.add_warning(
-                f"Supplied path ({path}) for ({root}) is invalid. Make sure\n"
-                "that the path exists and is not the file system root.")
+            if self.config.getboolean("check_klipper_config_examples_path", True):
+                self.server.add_warning(
+                    f"Supplied path ({path}) for ({root}) is invalid. Make sure\n"
+                    "that the path exists and is not the file system root.")
             return False
         # Check Folder Permissions
         missing_perms = []
