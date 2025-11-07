@@ -65,6 +65,7 @@ WATCH_FLAGS = iFlags.CREATE | iFlags.DELETE | iFlags.MODIFY \
 
 class FileManager:
     def __init__(self, config: ConfigHelper) -> None:
+        self.config = config
         self.server = config.get_server()
         self.event_loop = self.server.get_event_loop()
         self.reserved_paths: Dict[str, Tuple[pathlib.Path, bool]] = {}
@@ -153,6 +154,13 @@ class FileManager:
         cfg_writeble = config.getboolean("enable_config_write_access", True)
         self.register_data_folder("config", full_access=cfg_writeble)
 
+        #HACK rename config root to calibration
+        self.file_paths["calibration"] = self.file_paths.get("config")
+
+        config_defaults_path = config.get('config_defaults_path', None, deprecate=False)
+        if config_defaults_path is not None:
+            self.register_directory("defaults", config_defaults_path,full_access=False)
+
         config.get('log_path', None, deprecate=True)
         self.register_data_folder("logs")
         gc_path = self.register_data_folder("gcodes", full_access=True)
@@ -198,7 +206,8 @@ class FileManager:
             self.reserved_paths.pop("klipper", None)
             self.add_reserved_path("klipper", klipper_path)
             example_cfg_path = os.path.join(klipper_path, "config")
-            self.register_directory("config_examples", example_cfg_path)
+            #HACK, dont want or need example configs
+            # self.register_directory("config_examples", example_cfg_path)
             docs_path = os.path.join(klipper_path, "docs")
             self.register_directory("docs", docs_path)
 
@@ -280,10 +289,9 @@ class FileManager:
         if os.path.islink(path):
             path = os.path.realpath(path)
         if not os.path.isdir(path) or path == "/":
-            if self.config.getboolean("check_klipper_config_examples_path", True):
-                self.server.add_warning(
-                    f"Supplied path ({path}) for ({root}) is invalid. Make sure\n"
-                    "that the path exists and is not the file system root.")
+            self.server.add_warning(
+                f"Supplied path ({path}) for ({root}) is invalid. Make sure\n"
+                "that the path exists and is not the file system root.")
             return False
         # Check Folder Permissions
         missing_perms = []
