@@ -152,14 +152,15 @@ class FileManager:
 
         config.get('config_path', None, deprecate=True)
         cfg_writeble = config.getboolean("enable_config_write_access", True)
-        self.register_data_folder("config", full_access=cfg_writeble)
-
-        #HACK rename config root to calibration
-        self.file_paths["calibration"] = self.file_paths.get("config")
+        self.register_data_folder("calibration", full_access=cfg_writeble)
 
         config_defaults_path = config.get('config_defaults_path', None, deprecate=False)
         if config_defaults_path is not None:
             self.register_directory("defaults", config_defaults_path,full_access=False)
+
+        custom_config_path = config.get('config_custom_config_path', None, deprecate=False)
+        if custom_config_path is not None:
+            self.register_directory("config", custom_config_path, full_access=True)
 
         config.get('log_path', None, deprecate=True)
         self.register_data_folder("logs")
@@ -205,8 +206,8 @@ class FileManager:
         if klipper_path is not None:
             self.reserved_paths.pop("klipper", None)
             self.add_reserved_path("klipper", klipper_path)
-            example_cfg_path = os.path.join(klipper_path, "config")
             #HACK, dont want or need example configs
+            # example_cfg_path = os.path.join(klipper_path, "config")
             # self.register_directory("config_examples", example_cfg_path)
             docs_path = os.path.join(klipper_path, "docs")
             self.register_directory("docs", docs_path)

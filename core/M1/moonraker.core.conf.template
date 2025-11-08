@@ -8,6 +8,7 @@ klippy_uds_address: ${PRINTER_ADMIN_DIR}/comms/klippy.sock
 enable_object_processing: True
 check_klipper_config_path: False
 config_defaults_path: ${KLIPPER_DEFAULT_CONFIGS_DIR}
+config_custom_config_path: ${KLIPPER_DEVMODE_PATH}
 
 [authorization]
 force_logins: false
