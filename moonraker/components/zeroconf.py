@@ -33,6 +33,8 @@ if TYPE_CHECKING:
     from .machine import Machine
 
 ZC_SERVICE_TYPE = "_moonraker._tcp.local."
+OCTO_SERVICE_TYPE = "_octoprint._tcp.local."
+OCTO_VERSION = "1.5.0"
 
 class AsyncRunner:
     def __init__(self, ip_version: IPVersion) -> None:
@@ -85,6 +87,18 @@ class ZeroconfRegistrar:
         self.ssdp_server: Optional[SSDPServer] = None
         if config.getboolean("enable_ssdp", False):
             self.ssdp_server = SSDPServer(config)
+        self.octoprint_discovery: bool = config.getboolean(
+            "octoprint_discovery", False)
+        if self.octoprint_discovery:
+            self.octo_model_name: str = config.get(
+                "octoprint_model_name", "Moonraker"
+            )
+        # prefer IP or hostname in clients that understand it
+        # allowed: "ip" (default), "hostname"
+        self.octoprint_addr_pref: str = config.get(
+            "octoprint_addr_pref", "ip"
+        ).lower()
+        self.service_list: List[AsyncServiceInfo] = []
 
     async def component_init(self) -> None:
         logging.info("Starting Zeroconf services")
@@ -129,7 +143,23 @@ class ZeroconfRegistrar:
             properties=zc_service_props,
             server=f"{server_name}.local.",
         )
-        await self.runner.register_services([self.service_info])
+        self.service_list.append(self.service_info)
+        if self.octoprint_discovery:
+            octo_props = {
+                "version": OCTO_VERSION,
+                "model": self.octo_model_name,
+                "addr_pref": self.octoprint_addr_pref,
+            }
+            self.octo_service_info = AsyncServiceInfo(
+                OCTO_SERVICE_TYPE,
+                f"{instance_name} {host}.{OCTO_SERVICE_TYPE}",
+                addresses=addresses,
+                port=hi["port"],
+                properties=octo_props,
+                server=f"{server_name}.local.",
+            )
+            self.service_list.append(self.octo_service_info)
+        await self.runner.register_services(self.service_list)
         if self.ssdp_server is not None:
             addr = self.cfg_addr if not self.bound_all else machine.public_ip
             if not addr:
@@ -141,7 +171,7 @@ class ZeroconfRegistrar:
             self.ssdp_server.register_service(name, addr, hi["port"])
 
     async def close(self) -> None:
-        await self.runner.unregister_services([self.service_info])
+        await self.runner.unregister_services(self.service_list)
         if self.ssdp_server is not None:
             await self.ssdp_server.stop()
 
@@ -149,7 +179,7 @@ class ZeroconfRegistrar:
         if self.bound_all:
             addresses = [x for x in self._extract_ip_addresses(network)]
             self.service_info.addresses = addresses
-            await self.runner.update_services([self.service_info])
+            await self.runner.update_services(self.service_list)
 
     def _extract_ip_addresses(self, network: Dict[str, Any]) -> Iterator[bytes]:
         for ifname, ifinfo in network.items():

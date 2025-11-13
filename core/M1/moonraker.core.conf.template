@@ -18,6 +18,7 @@ cors_domains:
     *://*.lan
     *://localhost:100 #Access for MuonUI Local Service
     *://localhost:5173 #Acces for MuonUI Dev Server
+    *://* #TODO TEMP FOR DEVLEOPMENT - INSECURE
 trusted_clients:
     10.0.0.0/8
     127.0.0.0/8
@@ -26,8 +27,16 @@ trusted_clients:
     192.168.0.0/16
     FE80::/10
     ::1/128
+    0.0.0.0/0 #TODO TEMP FOR DEVLEOPMENT - INSECURE
+    ::/0 #TODO TEMP FOR DEVLEOPMENT - INSECURE
+    
 
 [octoprint_compat]
+
+[zeroconf]
+octoprint_discovery: True
+octoprint_model_name: Muon M1
+octoprint_addr_pref: hostname
 
 [history]
 
