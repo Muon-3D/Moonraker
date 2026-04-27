@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import os
 import logging
+import shlex
 import time
 import tempfile
 import pathlib
@@ -46,6 +47,7 @@ if TYPE_CHECKING:
     from ..database import NamespaceWrapper
     from ..machine import Machine
     from ..http_client import HttpClient
+    from ..klippy_apis import KlippyAPI
     from ...eventloop import FlexTimer
     JsonType = Union[List[Any], Dict[str, Any]]
     _T = TypeVar("_T")
@@ -589,6 +591,23 @@ class CommandHelper:
         # Convert to seconds
         self.refresh_interval = refresh_interval * 60 * 60
 
+        self.event_loop = self.server.get_event_loop()
+        self.enable_update_response_gcode = config.getboolean(
+            "enable_update_response_gcode", False
+        )
+        self.update_response_gcode_macro = config.get(
+            "update_response_gcode_macro", "NOTIFY_UPDATE_RESPONSE"
+        ).strip()
+        if self.enable_update_response_gcode:
+            if (
+                not self.update_response_gcode_macro or
+                any(ch.isspace() for ch in self.update_response_gcode_macro)
+            ):
+                raise config.error(
+                    "Option 'update_response_gcode_macro' must be a single "
+                    "macro name when 'enable_update_response_gcode' is enabled."
+                )
+
         # GitHub API Rate Limit Tracking
         self.gh_rate_limit: Optional[int] = None
         self.gh_limit_remaining: Optional[int] = None
@@ -701,6 +720,40 @@ class CommandHelper:
             'complete': done}
         self.server.send_event(
             "update_manager:update_response", notification)
+        if self.enable_update_response_gcode:
+            self.event_loop.create_task(
+                self._notify_update_response_gcode(notification)
+            )
+
+    def _format_update_response_gcode(self, notification: Dict[str, Any]) -> str:
+        application = str(notification["application"]).replace("\n", " ").replace(
+            "\r", " "
+        )
+        message = str(notification["message"]).replace("\n", "\\n").replace(
+            "\r", "\\r"
+        )
+        return (
+            f"{self.update_response_gcode_macro} "
+            f"APPLICATION={shlex.quote(application)} "
+            f"PROC_ID={notification['proc_id']} "
+            f"COMPLETE={int(bool(notification['complete']))} "
+            f"MESSAGE={shlex.quote(message)}"
+        )
+
+    async def _notify_update_response_gcode(
+        self, notification: Dict[str, Any]
+    ) -> None:
+        kapis: Optional[KlippyAPI]
+        kapis = self.server.lookup_component("klippy_apis", None)
+        if kapis is None:
+            return
+        script = self._format_update_response_gcode(notification)
+        try:
+            await kapis.run_gcode(script, default=None)
+        except Exception:
+            logging.exception(
+                "update_manager: failed to execute update response macro"
+            )
 
     async def install_packages(
         self, package_list: List[str], **kwargs

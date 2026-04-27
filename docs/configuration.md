@@ -2000,6 +2000,14 @@ channel: dev
 #   commit tagged by Moonraker.  The beta and stable channels will see less
 #   frequent updates.  When omitted, Moonraker and Klipper will default to
 #   the channel based extension type.
+enable_update_response_gcode: False
+#   When set to True Moonraker executes a Klipper gcode macro whenever
+#   an update progress response is emitted.
+update_response_gcode_macro: NOTIFY_UPDATE_RESPONSE
+#   The macro name to execute when "enable_update_response_gcode" is
+#   enabled.  The macro receives the following parameters:
+#   "APPLICATION", "PROC_ID", "COMPLETE", and "MESSAGE".  The
+#   "COMPLETE" parameter will be 0 or 1.
 ```
 
 /// Note
