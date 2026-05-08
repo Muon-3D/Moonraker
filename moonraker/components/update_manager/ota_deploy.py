@@ -9,7 +9,7 @@ from typing import Any, Dict, Optional, cast
 from .base_deploy import BaseDeploy
 
 POLL_SECS = 0.75
-PROGRESS_IDLE_TIMEOUT = 60.0
+PROGRESS_IDLE_TIMEOUT = 300.0
 MAX_CONSECUTIVE_ERRORS = 5
 
 PROGRESS_ANNOUNCE_STEP = 0.5
