@@ -81,6 +81,29 @@ binary: ${AVOID_EXCLUDED_ZONE_BINARY}
 # print request -- indefinitely.
 timeout: 120
 
+[resumable_upload]
+# KAN-193.  Session-create / chunk-append / finalize triad for large print files
+# over poor Wi-Fi.  Absent this section the component never loads and clients
+# fall back to the single-shot multipart POST at /server/files/upload -- a safe
+# degradation, unlike [gcode_preprocessor] above.
+#
+# The staging directory defaults to a "muon-upload" subdirectory of TMPDIR, and
+# TMPDIR is ${PRINTER_ADMIN_DIR}/.tmp (moonraker.service.template:18).  That is
+# on the persisted /home volume -- which is what lets a transfer resume across a
+# reboot, and is also why abandoned sessions need an explicit expiry and a
+# total-size cap: they do not evaporate the way a /tmp file would, and /home
+# also holds ${PRINTER_DATA_DIR}/gcodes.
+#
+# max_staging_size is a hard reservation against DECLARED file sizes, checked
+# when a session is created, so it binds before the bytes arrive.  Set it below
+# the free space you are willing to lose; it is not a free-space probe, because
+# a probe races with every other writer on the volume.
+session_expiry: 86400
+max_staging_size: 2048
+max_sessions: 4
+chunk_size: 4
+max_chunk_size: 16
+
 [aux_api_proxy]
 
 [update_manager]
