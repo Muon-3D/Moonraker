@@ -4,14 +4,20 @@
 #     [aux_api_proxy]
 #
 # ──────────────────────────────────────────────────────────────────────────
-import asyncio, json, logging, re, contextlib
+import asyncio, json, logging, os, re, contextlib
 from pathlib import Path
-from typing import Dict, Any, Callable
+from typing import Dict, Any, Callable, Optional
 from urllib.parse import urlencode
 
-FASTAPI_ROOT = "http://localhost:6789"         #  or "unix:/run/wifi.sock"
+FASTAPI_ROOT = "http://127.0.0.1:6789"         #  loopback-only Aux API bind
 OPENAPI_PATH = "/openapi.json"                 #  FastAPI default
 MOON_PREFIX  = "/server/aux"                   #  Moonraker namespace
+
+# The Aux API rejects every unauthenticated request. The shared secret is
+# reissued into tmpfs on each boot by aux_api_token.service and is readable by
+# the printer_admin group, which the moonraker user belongs to.
+AUX_TOKEN_FILE = Path(os.getenv("AUX_API_TOKEN_FILE", "/run/aux_api/token"))
+AUX_TOKEN_HEADER = "X-Aux-Api-Key"
 
 # Map lower-case OpenAPI keys → canonical HTTP verbs
 HTTP_VERBS = {"get": "GET", "post": "POST", "put": "PUT",
@@ -25,11 +31,38 @@ class AuxAutoProxy:
         self.server      = config.get_server()
         self.http_client = self.server.lookup_component("http_client")
         self.log         = logging.getLogger("wifi_autoproxy")
+        self._token: Optional[str] = None
 
     # Moonraker calls this coroutine right after all components load
     async def component_init(self):
         spec = await self._fetch_spec()
         self._register_from_spec(spec)
+
+    # ---------- Aux API credentials --------------------------------------
+    def _auth_headers(self, headers: Optional[Dict[str, Any]] = None
+                      ) -> Dict[str, Any]:
+        """Add this boot's Aux API token to an outgoing header dict."""
+        merged = dict(headers or {})
+        token = self._aux_token()
+        if token:
+            merged[AUX_TOKEN_HEADER] = token
+        return merged
+
+    def _aux_token(self) -> Optional[str]:
+        # Cached after the first successful read; the token is stable for the
+        # life of a boot, and Moonraker does not outlive one.
+        if self._token is not None:
+            return self._token
+        try:
+            token = AUX_TOKEN_FILE.read_text().strip()
+        except OSError as exc:
+            self.log.error(f"Cannot read Aux API token {AUX_TOKEN_FILE}: {exc}")
+            return None
+        if not token:
+            self.log.error(f"Aux API token {AUX_TOKEN_FILE} is empty")
+            return None
+        self._token = token
+        return token
 
     # ---------- fetch the OpenAPI document (async) ----------------------
     async def _fetch_spec(self) -> Dict[str, Any]:
@@ -40,7 +73,10 @@ class AuxAutoProxy:
 
         url  = f"{FASTAPI_ROOT}{OPENAPI_PATH}"
         self.log.info(f"Fetching OpenAPI from {url}")
-        rsp  = await self.http_client.get(url, connect_timeout=3., request_timeout=6.)
+        rsp  = await self.http_client.get(
+            url, headers=self._auth_headers(),
+            connect_timeout=3., request_timeout=6.
+        )
         rsp.raise_for_status()
         return rsp.json()
 
@@ -111,7 +147,7 @@ class AuxAutoProxy:
                 method          = method,
                 url             = url,
                 body            = body,
-                headers         = headers,
+                headers         = self._auth_headers(headers),
                 connect_timeout = 3.,
                 request_timeout = 8.,
             )
@@ -143,7 +179,8 @@ class AuxAutoProxy:
         resp = await self.http_client.request(
             method=verb,
             url=url,
-            body=webreq.get("body", None)
+            body=webreq.get("body", None),
+            headers=self._auth_headers()
         )
         resp.raise_for_status()
         return resp.json()
@@ -157,7 +194,10 @@ class AuxAutoProxy:
     # ===== Internal aux-api helpers for other Moonraker components =====
     async def get(self, path: str) -> Any:
         url = f"{FASTAPI_ROOT}{path}"
-        resp = await self.http_client.get(url, connect_timeout=3., request_timeout=8.)
+        resp = await self.http_client.get(
+            url, headers=self._auth_headers(),
+            connect_timeout=3., request_timeout=8.
+        )
         resp.raise_for_status()
         with contextlib.suppress(Exception):
             return resp.json()
@@ -185,7 +225,7 @@ class AuxAutoProxy:
             resp = await self.http_client.post(
                 url,
                 body=raw_body,
-                headers=headers,
+                headers=self._auth_headers(headers),
                 connect_timeout=3.0,
                 request_timeout=15.0,
             )
