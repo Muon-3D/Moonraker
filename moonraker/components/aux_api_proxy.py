@@ -200,11 +200,11 @@ class AuxAutoProxy:
         return await self.get("/update/status")
     
     async def ota_check_server(self) -> Any:
-        return await self.post("/update/check_server")
+        return await self.post("/update/check", {"wait": False})
 
     async def ota_start(self, url: str | None = None) -> Any:
         body = {"url": url} if url else {}
-        return await self.post("/update/start", body)
+        return await self.post("/update/install", body)
 
     async def ota_commit(self) -> Any:
         return await self.post("/update/commit", {})

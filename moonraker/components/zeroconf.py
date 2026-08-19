@@ -20,9 +20,11 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Dict,
+    Iterable,
     Iterator,
     List,
     Optional,
+    Set,
     Tuple
 )
 
@@ -35,14 +37,39 @@ if TYPE_CHECKING:
 ZC_SERVICE_TYPE = "_moonraker._tcp.local."
 OCTO_SERVICE_TYPE = "_octoprint._tcp.local."
 OCTO_VERSION = "1.5.0"
+# Upper bound on how long shutdown will wait for an in progress rebind
+ZC_REBIND_CLOSE_TIMEOUT = 5.
+
+def _fmt_addresses(addresses: Iterable[bytes]) -> str:
+    parsed = sorted(str(ipaddress.ip_address(addr)) for addr in addresses)
+    return ", ".join(parsed) if parsed else "none"
 
 class AsyncRunner:
     def __init__(self, ip_version: IPVersion) -> None:
         self.ip_version = ip_version
         self.aiozc: Optional[AsyncZeroconf] = None
+        # python-zeroconf enumerates the host's addresses exactly once, in
+        # Zeroconf.__init__ (InterfaceChoice.All), and joins the multicast
+        # groups for that snapshot.  It offers no API to rebind afterwards, so
+        # an instance created before the network is up stays loopback only for
+        # the life of the process.  Broadcasting updated records is not enough,
+        # they would still be sent over the original sockets.  Track the
+        # address set this instance was constructed against so the whole
+        # instance can be rebuilt when that set changes.
+        self.bound_addresses: Set[bytes] = set()
+        self.rebind_lock = asyncio.Lock()
+        self.closing: bool = False
 
-    async def register_services(self, infos: List[AsyncServiceInfo]) -> None:
+    def needs_rebind(self, addresses: List[bytes]) -> bool:
+        return self.aiozc is None or set(addresses) != self.bound_addresses
+
+    async def register_services(
+        self,
+        infos: List[AsyncServiceInfo],
+        addresses: Optional[List[bytes]] = None
+    ) -> None:
         self.aiozc = AsyncZeroconf(ip_version=self.ip_version)
+        self.bound_addresses = set(addresses or [])
         tasks = [
             self.aiozc.async_register_service(info, allow_name_change=True)
             for info in infos
@@ -50,18 +77,74 @@ class AsyncRunner:
         background_tasks = await asyncio.gather(*tasks)
         await asyncio.gather(*background_tasks)
 
+    async def rebind_services(
+        self, infos: List[AsyncServiceInfo], addresses: List[bytes]
+    ) -> None:
+        if self.closing:
+            return
+        async with self.rebind_lock:
+            if self.closing or not self.needs_rebind(addresses):
+                # Superseded by a rebind that completed while this call was
+                # waiting on the lock
+                return
+            logging.info(
+                "Zeroconf: local address set changed, rebinding services.  "
+                f"Previous: {_fmt_addresses(self.bound_addresses)}, "
+                f"current: {_fmt_addresses(addresses)}"
+            )
+            await self._close_instance(infos)
+            try:
+                await self.register_services(infos, addresses)
+            except Exception:
+                logging.exception("Zeroconf: failed to rebind services")
+                await self._close_instance(infos)
+                return
+            if self.closing:
+                # Shutdown began while the new instance was starting up
+                await self._close_instance(infos)
+
     async def unregister_services(self, infos: List[AsyncServiceInfo]) -> None:
-        assert self.aiozc is not None
-        tasks = [self.aiozc.async_unregister_service(info) for info in infos]
-        background_tasks = await asyncio.gather(*tasks)
-        await asyncio.gather(*background_tasks)
-        await self.aiozc.async_close()
+        self.closing = True
+        locked = False
+        try:
+            await asyncio.wait_for(
+                self.rebind_lock.acquire(), ZC_REBIND_CLOSE_TIMEOUT
+            )
+            locked = True
+        except asyncio.TimeoutError:
+            logging.info("Zeroconf: rebind still in progress, closing anyway")
+        try:
+            await self._close_instance(infos)
+        finally:
+            if locked:
+                self.rebind_lock.release()
 
     async def update_services(self, infos: List[AsyncServiceInfo]) -> None:
-        assert self.aiozc is not None
-        tasks = [self.aiozc.async_update_service(info) for info in infos]
+        aiozc = self.aiozc
+        if aiozc is None:
+            return
+        tasks = [aiozc.async_update_service(info) for info in infos]
         background_tasks = await asyncio.gather(*tasks)
         await asyncio.gather(*background_tasks)
+
+    async def _close_instance(self, infos: List[AsyncServiceInfo]) -> None:
+        # Drops the current instance unconditionally and never raises, so that
+        # a subsequent rebind always starts from a known state
+        aiozc = self.aiozc
+        self.aiozc = None
+        self.bound_addresses = set()
+        if aiozc is None:
+            return
+        try:
+            tasks = [aiozc.async_unregister_service(info) for info in infos]
+            background_tasks = await asyncio.gather(*tasks)
+            await asyncio.gather(*background_tasks)
+        except Exception:
+            logging.exception("Zeroconf: error unregistering services")
+        try:
+            await aiozc.async_close()
+        except Exception:
+            logging.exception("Zeroconf: error closing zeroconf instance")
 
 
 class ZeroconfRegistrar:
@@ -159,7 +242,7 @@ class ZeroconfRegistrar:
                 server=f"{server_name}.local.",
             )
             self.service_list.append(self.octo_service_info)
-        await self.runner.register_services(self.service_list)
+        await self.runner.register_services(self.service_list, addresses)
         if self.ssdp_server is not None:
             addr = self.cfg_addr if not self.bound_all else machine.public_ip
             if not addr:
@@ -177,9 +260,20 @@ class ZeroconfRegistrar:
 
     async def _update_service(self, network: Dict[str, Any]) -> None:
         if self.bound_all:
-            addresses = [x for x in self._extract_ip_addresses(network)]
-            self.service_info.addresses = addresses
-            await self.runner.update_services(self.service_list)
+            try:
+                addresses = [x for x in self._extract_ip_addresses(network)]
+                for info in self.service_list:
+                    info.addresses = addresses
+                if self.runner.needs_rebind(addresses):
+                    # New sockets are required, the current zeroconf instance
+                    # is bound to a stale set of local addresses
+                    await self.runner.rebind_services(
+                        self.service_list, addresses
+                    )
+                else:
+                    await self.runner.update_services(self.service_list)
+            except Exception:
+                logging.exception("Zeroconf: error processing network update")
 
     def _extract_ip_addresses(self, network: Dict[str, Any]) -> Iterator[bytes]:
         for ifname, ifinfo in network.items():

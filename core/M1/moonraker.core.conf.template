@@ -50,6 +50,23 @@ binary: ${AVOID_EXCLUDED_ZONE_BINARY}
 
 [aux_api_proxy]
 
+# KAN-162: start the bed ramp when a job is queued instead of at the top
+# of PRINT_START.  This turns on the 170W bed heater with no human input,
+# so the component itself defaults to disabled -- enabling it is an
+# explicit, per-model decision that has to be visible right here.
+[preheat_on_queue]
+enable: True
+# Cancel the preheat if no print has started within this many seconds.
+# Deliberately below klipper's [idle_timeout] default of 600s (no
+# [idle_timeout] section is defined for the M1, so the default applies)
+# so that this component gets to issue a targeted "M140 S0" before
+# klipper's blunt TURN_OFF_HEATERS/M84 backstop fires.
+timeout: 480
+# first_layer_bed_temp values outside this range are treated as
+# implausible and ignored.  The bed is never preheated on a guess.
+min_bed_temp: 40
+max_bed_temp: 120
+
 [update_manager]
 refresh_interval: 168
 enable_auto_refresh: True
