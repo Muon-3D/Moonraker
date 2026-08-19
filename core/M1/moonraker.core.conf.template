@@ -1,5 +1,9 @@
 [server]
-host: 0.0.0.0
+# KAN-68: bind loopback only. Nginx on :80 is the single network front door and
+# the only place client authentication is enforced (see fluidd.nginx.template).
+# Binding 0.0.0.0 here would put an unauthenticated operator API for a machine
+# with 200 C+ heaters and moving axes on the customer LAN.
+host: 127.0.0.1
 port: 7125
 max_upload_size: 1024
 klippy_uds_address: ${PRINTER_ADMIN_DIR}/comms/klippy.sock
@@ -11,25 +15,30 @@ config_defaults_path: ${KLIPPER_DEFAULT_CONFIGS_DIR}
 config_custom_config_path: /home/printer_data/devmode_custom_config
 
 [authorization]
-force_logins: false
+# KAN-68 / KAN-191. Authentication is enforced at the nginx front door, which
+# validates a paired-client credential (KAN-190) before proxying to this port.
+# Moonraker is not reachable from the network at all (host: 127.0.0.1 above),
+# so the trusted range below only covers that proxy hop.
+#
+# NOTE on force_logins: authorization.py:883 only honours it when
+# len(self.users) > 1, and _API_KEY_USER_ always occupies one slot, so on a
+# device with no human user created this setting is inert on its own. It is set
+# here as defence in depth, not as the control -- the control is that nothing
+# but nginx can reach this socket.
+force_logins: true
 cors_domains:
     *://my.fluidd.xyz
     *://*.local
     *://*.lan
     *://localhost:100 #Access for MuonUI Local Service
     *://localhost:5173 #Acces for MuonUI Dev Server
-    *://* #TODO TEMP FOR DEVLEOPMENT - INSECURE
 trusted_clients:
-    10.0.0.0/8
+    # Loopback only: the nginx front door (:80 Fluidd, :100 MuonUI) and the
+    # muon-link remote proxy, which terminates remote sessions onto 127.0.0.1:80.
+    # RFC1918 ranges deliberately removed -- a LAN client reaches Moonraker only
+    # through nginx, where it must present a paired-client credential.
     127.0.0.0/8
-    169.254.0.0/16
-    172.16.0.0/12
-    192.168.0.0/16
-    FE80::/10
     ::1/128
-    0.0.0.0/0 #TODO TEMP FOR DEVLEOPMENT - INSECURE
-    ::/0 #TODO TEMP FOR DEVLEOPMENT - INSECURE
-    
 
 [octoprint_compat]
 
