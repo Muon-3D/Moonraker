@@ -918,6 +918,23 @@ class FileManager:
         finfo = await self._process_uploaded_file(upload_info)
         await self.gcode_metadata.parse_metadata(
             upload_info['filename'], finfo).wait()
+        # --- MUON, KAN-193 / invariant I5 -----------------------------------
+        # .ufp is the one ingress where the staged file is not the file that
+        # gets printed: _process_uploaded_file moves nothing for UFP (:1022-1025),
+        # and the .gcode is produced by the metadata script during the
+        # parse_metadata above.  So this line is the first instant at which the
+        # file the printer would execute exists, and therefore the first instant
+        # it can be guarded.  (The old monkeypatch ran the binary *before*
+        # _run_extract_metadata, against a .gcode path that did not yet exist.)
+        if upload_info['unzip_ufp']:
+            guard = self.server.lookup_component("gcode_preprocessor", None)
+            if guard is None:
+                logging.error(
+                    "[file_manager] no gcode_preprocessor component: extracted "
+                    "UFP G-code is unguarded"
+                )
+            else:
+                await guard.process_path(upload_info['dest_path'])
         started: bool = False
         queued: bool = False
         if upload_info['start_print']:
@@ -958,6 +975,38 @@ class FileManager:
     async def _process_uploaded_file(self,
                                      upload_info: Dict[str, Any]
                                      ) -> Dict[str, Any]:
+        # --- MUON, KAN-193 / invariant I5 -----------------------------------
+        # Run the G-code safety postprocessor on the STAGED file, before the
+        # shutil.move below publishes it into the gcodes root.  This has to
+        # happen here and not on the metadata path, for two reasons:
+        #
+        #   * the move at :1030-1031 is what makes the file visible and
+        #     startable.  parse_metadata -- where the old monkeypatch hooked --
+        #     only runs afterwards, at :919-920, so there was a real window in
+        #     which unprocessed G-code sat at its final path.
+        #   * parse_metadata short-circuits at :2569-2573 whenever
+        #     _has_valid_data() matches a known file's size and mtime, so a
+        #     re-upload or a resumed transfer skipped the postprocessor
+        #     entirely.  Nothing on the metadata path can be relied on as a
+        #     safety control; this call is not on it.
+        #
+        # Raised deliberately OUTSIDE the try below: a guard failure is not an
+        # "Unable to save file" I/O error and must keep its own message and
+        # status.  finalize_upload's except clause (:846-851) still removes the
+        # staged file, so a rejected upload leaves nothing behind.
+        if (
+            upload_info['root'] == "gcodes"
+            and not upload_info['unzip_ufp']
+            and upload_info['ext'] in VALID_GCODE_EXTS
+        ):
+            guard = self.server.lookup_component("gcode_preprocessor", None)
+            if guard is None:
+                logging.error(
+                    "[file_manager] no gcode_preprocessor component: G-code is "
+                    "being published unguarded"
+                )
+            else:
+                await guard.process_path(upload_info['tmp_file_path'])
         try:
             if upload_info['dir_path']:
                 cur_path = self.file_paths[upload_info['root']]

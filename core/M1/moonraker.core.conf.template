@@ -70,7 +70,16 @@ subscriptions:
     #todo add ciruclar screen
 
 [gcode_preprocessor]
+# KAN-193 / invariant I5.  This section is a safety control, not a feature: if
+# it is absent the component never loads, and both enforcement points in
+# file_manager.py and klippy_apis.py degrade to a logged error while G-code
+# reaches Klipper without ever passing avoid_excluded_zone.
+# tests/test_gcode_guard.py asserts the section is present and names a binary.
 binary: ${AVOID_EXCLUDED_ZONE_BINARY}
+# Bound on a single postprocessor run.  Before KAN-193 there was no timeout at
+# all, so a postprocessor that hung hung the upload -- and, via start_print, the
+# print request -- indefinitely.
+timeout: 120
 
 [aux_api_proxy]
 
