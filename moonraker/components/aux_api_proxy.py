@@ -113,7 +113,11 @@ class AuxAutoProxy:
                 body            = body,
                 headers         = headers,
                 connect_timeout = 3.,
-                request_timeout = 8.,
+                # Wi-Fi association + 4-way handshake + DHCP routinely runs
+                # 8-30s on this board, so an 8s budget here turned successful
+                # connects into a 500. aux_api bounds its own nmcli call well
+                # below this, so it always answers before we give up.
+                request_timeout = 60.,
             )
             resp.raise_for_status()
 
