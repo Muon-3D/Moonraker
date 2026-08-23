@@ -57,6 +57,19 @@ class AuxAutoProxy:
             self._openapi_handler
         )
 
+        # MUON, DEV-4: developer mode must be visible on the panel *and* in the
+        # interface.  SEC-2 has just taken every /server/aux/* path off the
+        # network, and that includes reading the dev_mode state, so publish the
+        # state somewhere that is not on the floor.  GET only, no request body
+        # forwarded, and it calls Aux through the internal helper rather than
+        # re-exporting the route -- so this can never become a way to *change*
+        # the mode, whatever Aux grows later.
+        self.server.register_endpoint(
+            "/server/muon/dev_mode",
+            ["GET"],
+            self._dev_mode_status_handler
+        )
+
         for fast_path, path_item in spec.get("paths", {}).items():
             # Paths with {...} are handled by the generic /proxy endpoint
             if _PATH_PARAM_RE.search(fast_path):
@@ -151,6 +164,18 @@ class AuxAutoProxy:
     async def _openapi_handler(self, webreq):
         # return exactly the JSON you fetched from FastAPI
         return self._spec
+
+    # ---------- read-only developer-mode state (DEV-4) ------------------
+    async def _dev_mode_status_handler(self, webreq):
+        state = await self.get("/dev_mode")
+        if not isinstance(state, dict):
+            raise self.server.error(
+                "Aux returned an unreadable dev_mode state", 502
+            )
+        # `enabled` only. Aux also returns core_cfg, but that is a filesystem
+        # path and this endpoint is readable from the LAN; DEV-4 needs the
+        # banner, not the path. The panel reads the full state over loopback.
+        return {"enabled": bool(state.get("enabled", False))}
     
 
 

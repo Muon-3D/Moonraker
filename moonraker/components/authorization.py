@@ -21,6 +21,7 @@ from tornado.web import HTTPError
 from libnacl.sign import Signer, Verifier
 from ..utils import json_wrapper as jsonw
 from ..common import RequestType, TransportType, SqlTableDefinition, UserInfo
+from .. import muon_floor
 
 # Annotation imports
 from typing import (
@@ -822,7 +823,18 @@ class Authorization:
                 logging.info(
                     f"Trusted Connection Detected, IP: {ip}")
                 self.trusted_users[ip] = {
-                    "user": UserInfo(TRUSTED_USER, "", curtime),
+                    # MUON, SEC-3: record *what may you do* in the field
+                    # Moonraker already carries for it, rather than modelling
+                    # the role a second time somewhere else.  trusted_clients
+                    # is loopback-only (core/M1/moonraker.core.conf.template),
+                    # so a trusted connection is one from the printer's own
+                    # panel.  Note the floor does not consult this -- it reads
+                    # the address directly -- so a stamped role can never open
+                    # a floor surface.
+                    "user": UserInfo(
+                        TRUSTED_USER, "", curtime,
+                        groups=[muon_floor.role_for_address(ip)]
+                    ),
                     "expires_at": exp_time
                 }
                 return self.trusted_users[ip]["user"]

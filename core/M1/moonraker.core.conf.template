@@ -45,10 +45,22 @@ config_custom_config_path: /home/printer_data/devmode_custom_config
 # device with no human user created this setting is inert on its own. It is set
 # as defence in depth, not as the control.
 force_logins: true
+# WEB-8. The `*://*` development entry that used to end this list is deleted,
+# not commented: a commented-out wildcard is one uncomment away from handing
+# every page on the internet a driveable printer, and it reads as a suggestion.
+#
+# `*://my.fluidd.xyz` and `*://*.lan` go with it. We ship Fluidd in the image,
+# so trusting the hosted copy buys a customer nothing while letting any page
+# served from that domain drive the machine; and `.lan` is a suffix no Muon
+# address uses (WEB-1: `muon3d.local` and `app.muon3d.com`, nothing else).
+#
+# The two localhost entries are not wildcards and are not reachable from the
+# network -- a page can only be served from them by a process already on the
+# device -- so they stay: :100 is the panel's own vhost, :5173 the MuonUI dev
+# server.
 cors_domains:
-    *://my.fluidd.xyz
     *://*.local
-    *://*.lan
+    *://app.muon3d.com
     *://localhost:100 #Access for MuonUI Local Service
     *://localhost:5173 #Acces for MuonUI Dev Server
 trusted_clients:
