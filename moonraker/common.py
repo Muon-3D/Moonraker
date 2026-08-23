@@ -17,6 +17,7 @@ from abc import ABCMeta, abstractmethod
 from .utils import Sentinel
 from .utils import json_wrapper as jsonw
 from .utils.exceptions import ServerError, AgentError
+from . import muon_floor
 
 # Annotation imports
 from typing import (
@@ -188,7 +189,14 @@ class UserInfo:
     source: str = "moonraker"
     jwt_secret: Optional[str] = None
     jwk_id: Optional[str] = None
-    groups: List[str] = dataclasses.field(default_factory=lambda: ["admin"])
+    # MUON, SEC-3: upstream defaults this to ["admin"] and nothing in Moonraker
+    # ever reads it, so every authenticated user is an administrator.  Default
+    # to the least privilege we have instead.  authorization.py stamps the real
+    # role on at authentication time and muon_floor.py is what reads it, so the
+    # role is modelled in this field once rather than derived in two places.
+    groups: List[str] = dataclasses.field(
+        default_factory=lambda: [muon_floor.NETWORK_ROLE]
+    )
 
     def as_tuple(self) -> Tuple[Any, ...]:
         return dataclasses.astuple(self)
@@ -227,6 +235,12 @@ class APIDefinition:
         ip_addr: Optional[IPAddress] = None,
         user: Optional[UserInfo] = None
     ) -> Coroutine:
+        # MUON, SEC-2: the one place every transport converges.  The HTTP
+        # handler, JsonRPC.execute_method and InternalTransport.call_method all
+        # arrive here, so a deny placed here covers the websocket's post-upgrade
+        # JSON-RPC calls -- which authenticate once and are never matched
+        # against a path again -- as well as plain HTTP.  See muon_floor.py.
+        muon_floor.check_floor(self.endpoint, transport, ip_addr)
         return self.callback(
             WebRequest(self.endpoint, args, request_type, transport, ip_addr, user)
         )

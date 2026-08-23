@@ -23,6 +23,7 @@ from inotify_simple import flags as iFlags
 from ...utils import source_info
 from ...utils import json_wrapper as jsonw
 from ...common import RequestType, TransportType
+from ... import muon_config_guard
 
 # Annotation imports
 from typing import (
@@ -590,6 +591,49 @@ class FileManager:
                     f"root '{root}'")
         return root, dest_path
 
+    def _guard_calibration_write(self, path: str, filename: str) -> None:
+        # --- MUON, CFG-2 / CFG-3 --------------------------------------------
+        # The calibration root is the one writable input to Klipper's config.
+        # Klipper's own check is a blacklist -- it refuses only keys core
+        # already defines -- so a section core does not mention, such as
+        # [verify_heater extruder], is accepted and persistently disables
+        # thermal-runaway protection.  Refuse the write instead, against an
+        # allowlist of what calibration is actually for.  See
+        # moonraker/muon_config_guard.py.
+        #
+        # Every .cfg in the root is covered, not just calibration.cfg by name:
+        # the file Klipper reads is fixed today, but a guard keyed on one
+        # filename would be a rename away from being bypassed.
+        if not filename.lower().endswith(".cfg"):
+            return
+        try:
+            size = os.path.getsize(path)
+        except OSError as e:
+            raise self.server.error(
+                f"Unable to read '{filename}' for validation: {e}", 500
+            ) from e
+        if size > muon_config_guard.MAX_GUARDED_BYTES:
+            raise self.server.error(
+                f"'{filename}' is {size} bytes; the calibration layer holds "
+                f"calibration results, which are kilobytes. Refused unread.",
+                413,
+            )
+        try:
+            text = pathlib.Path(path).read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            raise self.server.error(
+                f"Unable to read '{filename}' for validation: {e}", 500
+            ) from e
+        found = muon_config_guard.violations(text)
+        if found:
+            logging.warning(
+                "[file_manager] refused a calibration write to %s: %s",
+                filename, "; ".join(found[:8])
+            )
+            raise self.server.error(
+                muon_config_guard.rejection_message(filename, found), 403
+            )
+
     async def _handle_file_move_copy(self,
                                      web_request: WebRequest
                                      ) -> Dict[str, Any]:
@@ -601,6 +645,10 @@ class FileManager:
         if dest_root not in self.full_access_roots:
             raise self.server.error(
                 f"Destination path is read-only: {dest_root}")
+        if dest_root == muon_config_guard.GUARDED_ROOT and os.path.isfile(source_path):
+            # MUON, CFG-2: otherwise the allowlist on upload is bypassed by
+            # uploading to gcodes and moving the file into place.
+            self._guard_calibration_write(source_path, os.path.basename(dest_path))
         self.check_reserved_path(source_path, False)
         self.check_reserved_path(dest_path, True)
         async with self.sync_lock:
@@ -1007,6 +1055,16 @@ class FileManager:
                 )
             else:
                 await guard.process_path(upload_info['tmp_file_path'])
+        # --- MUON, CFG-2 / CFG-3 --------------------------------------------
+        # Validated on the STAGED file, before the shutil.move below publishes
+        # it, for the same reason the G-code guard above is here: the move is
+        # what makes the file the one Klipper will read.  Raised outside the
+        # try below so finalize_upload's except clause removes the staged file
+        # and a refused write leaves nothing behind.
+        if upload_info['root'] == muon_config_guard.GUARDED_ROOT:
+            self._guard_calibration_write(
+                upload_info['tmp_file_path'], upload_info['filename']
+            )
         try:
             if upload_info['dir_path']:
                 cur_path = self.file_paths[upload_info['root']]
