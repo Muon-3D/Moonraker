@@ -114,11 +114,23 @@ class OtaDeploy(BaseDeploy):
                         last_progress = pct
                         last_state = st
 
-                    # If backend reports explicit error+failed, surface immediately
+                    # If backend reports explicit error+failed, stop polling.
+                    #
+                    # This used to notify and raise here. The raise landed in
+                    # this loop's own `except Exception` a few lines down,
+                    # which treats it as a lost-contact retry -- and because
+                    # `consecutive_errors` is reset to 0 after every successful
+                    # status fetch, it never reached MAX_CONSECUTIVE_ERRORS.
+                    # A failed install left the poller spinning forever,
+                    # re-announcing the failure on every pass and never
+                    # returning to the caller. The stall detector could not
+                    # save it either: raising skipped over it every time.
+                    #
+                    # Breaking hands the same status to the post-loop handler,
+                    # which emits the identical message and raises for real.
                     err_msg = self._terminal_error_message(self._status)
                     if err_msg and st == "failed":
-                        self.notify_status(f"✖ OTA failed: {err_msg}", is_complete=True)
-                        raise self.server.error(err_msg)
+                        break
 
                     # If we see 'committing', we know reboot is imminent—announce before leaving
                     if st == "committing" and not reboot_announced:
