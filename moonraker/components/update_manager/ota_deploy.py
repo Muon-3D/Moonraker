@@ -9,7 +9,7 @@ from typing import Any, Dict, Optional, cast
 from .base_deploy import BaseDeploy
 
 POLL_SECS = 0.75
-PROGRESS_IDLE_TIMEOUT = 60.0
+PROGRESS_IDLE_TIMEOUT = 300.0
 MAX_CONSECUTIVE_ERRORS = 5
 
 PROGRESS_ANNOUNCE_STEP = 0.5
@@ -57,6 +57,8 @@ class OtaDeploy(BaseDeploy):
     async def refresh(self) -> None:
         """Fetch current OTA status and cache mapped fields."""
         try:
+            self._warnings = []
+            self._anomalies = []
             await self._aux().ota_check_server()
             s = await self._aux_status()
             self._status = s
@@ -112,15 +114,31 @@ class OtaDeploy(BaseDeploy):
                         last_progress = pct
                         last_state = st
 
-                    # If backend reports explicit error+failed, surface immediately
-                    err_msg = self._status.get("error") or ""
+                    # If backend reports explicit error+failed, stop polling.
+                    #
+                    # This used to notify and raise here. The raise landed in
+                    # this loop's own `except Exception` a few lines down,
+                    # which treats it as a lost-contact retry -- and because
+                    # `consecutive_errors` is reset to 0 after every successful
+                    # status fetch, it never reached MAX_CONSECUTIVE_ERRORS.
+                    # A failed install left the poller spinning forever,
+                    # re-announcing the failure on every pass and never
+                    # returning to the caller. The stall detector could not
+                    # save it either: raising skipped over it every time.
+                    #
+                    # Breaking hands the same status to the post-loop handler,
+                    # which emits the identical message and raises for real.
+                    err_msg = self._terminal_error_message(self._status)
                     if err_msg and st == "failed":
-                        self.notify_status(f"✖ OTA failed: {err_msg}", is_complete=True)
-                        raise self.server.error(err_msg)
+                        break
 
                     # If we see 'committing', we know reboot is imminent—announce before leaving
                     if st == "committing" and not reboot_announced:
                         self.notify_status("⏳ Update installed. Preparing to reboot into the new system…", is_complete=True)
+                        return True
+
+                    if st == "commit_pending":
+                        self.notify_status("✔ Update booted. Commit verification is pending.", is_complete=True)
                         return True
 
                     # Terminal states handled cleanly
@@ -220,7 +238,7 @@ class OtaDeploy(BaseDeploy):
 
         # --- Final messages if we didn’t early-return ---
         st = (self._state or "").lower()
-        err_msg = self._status.get("error") or ""
+        err_msg = self._terminal_error_message(self._status)
 
         if st == "failed" or err_msg:
             if err_msg:
@@ -303,4 +321,21 @@ class OtaDeploy(BaseDeploy):
             self._target = self._current
         self._requires_commit = bool(s.get("requires_commit", False))
         prog = s.get("progress", None)
+        if prog is None and isinstance(s.get("install"), dict):
+            prog = s["install"].get("progress")
         self._progress = float(prog) if isinstance(prog, (int, float)) else None
+
+        check = s.get("check")
+        if isinstance(check, dict):
+            err = check.get("error")
+            if isinstance(err, dict) and err.get("message"):
+                msg = err["message"]
+                if msg not in self._warnings:
+                    self._warnings.append(msg)
+
+    def _terminal_error_message(self, s: Dict[str, Any]) -> str:
+        err_msg = s.get("error") or ""
+        last_error = s.get("last_error")
+        if not err_msg and isinstance(last_error, dict):
+            err_msg = last_error.get("message") or ""
+        return str(err_msg)
