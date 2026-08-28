@@ -19,12 +19,29 @@ HTTP_VERBS = {"get": "GET", "post": "POST", "put": "PUT",
 
 _PATH_PARAM_RE = re.compile(r"\{[^}]+\}")
 
+# ID-3: where the owner's rename is stored. Moonraker's database lives at
+# /home/printer_data/database, which our rugix-ctrl-config recipe persists, so
+# the name survives a reboot and an OS update -- and is cleared by a factory
+# reset, which is the behaviour ID-2 asks for.
+MUON_NAMESPACE = "muon"
+FRIENDLY_NAME_KEY = "friendly_name"
+
+# A rename is a label, not an identifier, so this is about what fits on a
+# 480x480 panel and in a printer list -- not about safety. It is still bounded:
+# an unbounded string here ends up in the database, the panel and every list.
+MAX_NAME_LENGTH = 32
+
 # ──────────────────────────────────────────────────────────────────────────
 class AuxAutoProxy:
     def __init__(self, config):
         self.server      = config.get_server()
         self.http_client = self.server.lookup_component("http_client")
         self.log         = logging.getLogger("wifi_autoproxy")
+        # ID-3: the owner's rename. `muon` rather than a Fluidd-owned
+        # namespace, because the name belongs to the printer and has to
+        # outlive whichever interface set it.
+        self.database    = self.server.lookup_component("database")
+        self.database.register_local_namespace(MUON_NAMESPACE)
 
     # Moonraker calls this coroutine right after all components load
     async def component_init(self):
@@ -68,6 +85,35 @@ class AuxAutoProxy:
             "/server/muon/dev_mode",
             ["GET"],
             self._dev_mode_status_handler
+        )
+
+        # MUON, ID-2/ID-3/ID-4: this printer's name.
+        #
+        # Two halves from two places, joined here:
+        #   * the derived name, SSID and display form come from Aux, which is
+        #     the only component that can read the CM4 hardware serial;
+        #   * the owner's rename lives in Moonraker's own database, because
+        #     ID-3 wants it to survive a reboot and an OS update but *not* a
+        #     factory reset -- and /home/printer_data/database has exactly
+        #     that lifetime.
+        #
+        # Off the floor deliberately. SEC-2 takes /server/aux/* off the
+        # network, and a printer that cannot tell the LAN what it is called
+        # cannot appear in a printer list (ID-4, and WEB-5..7 in phase 3).
+        # Safe to expose because ID-5 makes the name authority-free: every
+        # trust decision uses the fingerprint, never this.
+        self.server.register_endpoint(
+            "/server/muon/identity",
+            ["GET"],
+            self._identity_handler
+        )
+        # The rename. A write, but only ever to Moonraker's database -- it can
+        # never reach Aux, and there is no path from here to the derived
+        # identity, which is a pure function of the serial and not settable.
+        self.server.register_endpoint(
+            "/server/muon/identity/name",
+            ["POST"],
+            self._set_identity_name_handler
         )
 
         for fast_path, path_item in spec.get("paths", {}).items():
@@ -166,6 +212,81 @@ class AuxAutoProxy:
         return self._spec
 
     # ---------- read-only developer-mode state (DEV-4) ------------------
+    async def _identity_handler(self, webreq):
+        """ID-2/ID-3/ID-4: what this printer is called, and what it is.
+
+        `name` is what a person should be shown: the owner's rename if there
+        is one, otherwise the name derived from the hardware serial. `source`
+        says which, so an interface can offer "reset to the default name"
+        without having to guess.
+
+        The derived fields are always reported alongside, because ID-2's
+        promise is that a factory-reset printer comes back as the name on its
+        label -- and that promise is about the derived name, whatever the
+        current override happens to be.
+        """
+        derived = await self.get("/identity")
+        if not isinstance(derived, dict):
+            raise self.server.error("Aux returned an unreadable identity", 502)
+
+        override = await self.database.get_item(
+            MUON_NAMESPACE, FRIENDLY_NAME_KEY, None
+        )
+
+        derived_name = derived.get("name")
+        suffix = derived.get("suffix")
+        return {
+            "name": override or derived_name,
+            "source": "owner" if override else "derived",
+            "derived_name": derived_name,
+            "suffix": suffix,
+            # ID-4. Recomputed here rather than taken from Aux, because the
+            # display form has to follow the override; Aux only knows the
+            # derived half.
+            "display": (
+                f"{(override or derived_name or '').title()} · "
+                f"{(suffix or '').upper()}"
+            ),
+            "ssid": derived.get("ssid"),
+            # ID-1. The trust identifier. Reported for a trust-context
+            # display; it is deliberately not what the name derives from.
+            "fingerprint": derived.get("fingerprint"),
+        }
+
+    async def _set_identity_name_handler(self, webreq):
+        """ID-2: the owner renames the printer.
+
+        Storing an empty name clears the override and the derived name comes
+        back, which is what a "reset to default" control needs.
+        """
+        args = webreq.get_args()
+        name = args.get("name")
+        if name is None:
+            raise self.server.error("A 'name' argument is required", 400)
+        if not isinstance(name, str):
+            raise self.server.error("'name' must be a string", 400)
+
+        name = name.strip()
+        if len(name) > MAX_NAME_LENGTH:
+            raise self.server.error(
+                f"A printer name may be at most {MAX_NAME_LENGTH} characters",
+                400,
+            )
+
+        if name:
+            await self.database.insert_item(
+                MUON_NAMESPACE, FRIENDLY_NAME_KEY, name
+            )
+        else:
+            # delete_item raises when the key is absent; clearing a name that
+            # was never set is not an error.
+            with contextlib.suppress(Exception):
+                await self.database.delete_item(
+                    MUON_NAMESPACE, FRIENDLY_NAME_KEY
+                )
+
+        return await self._identity_handler(webreq)
+
     async def _dev_mode_status_handler(self, webreq):
         state = await self.get("/dev_mode")
         if not isinstance(state, dict):
