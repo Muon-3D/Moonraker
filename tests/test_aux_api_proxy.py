@@ -305,6 +305,11 @@ def test_the_generic_proxy_forwards_allowlisted_verbs(verb: str):
     assert result == {"ok": True}
     assert client.last["method"] == verb
     assert client.last["url"] == "http://localhost:6789/wifi/show/home"
+    # This endpoint takes its path and verb from the caller, so it is the one
+    # most worth proving bounded -- and the only one whose timeouts used to be
+    # inherited from http_client's defaults rather than passed.
+    assert 0 < client.last["request_timeout"] <= 30
+    assert client.last["connect_timeout"] > 0
 
 
 @pytest.mark.parametrize("verb", ["TRACE", "CONNECT", "OPTIONS", "HEAD", "nonsense"])
@@ -522,6 +527,16 @@ def test_load_component_returns_the_proxy():
     assert isinstance(component, AuxAutoProxy)
 
 
-def test_the_backend_address_is_the_local_aux_api():
-    assert aux_api_proxy.FASTAPI_ROOT == "http://localhost:6789"
-    assert aux_api_proxy.MOON_PREFIX == "/server/aux"
+def test_the_backend_address_never_leaves_the_box():
+    """Not the literal, the property.
+
+    Every request this component makes is built by concatenating
+    FASTAPI_ROOT with a path the caller supplies, so if that root ever
+    pointed off-box the generic proxy would become an open relay reachable
+    through Moonraker.
+    """
+    from urllib.parse import urlparse
+
+    host = urlparse(aux_api_proxy.FASTAPI_ROOT).hostname
+    assert host in {"localhost", "127.0.0.1", "::1"}, aux_api_proxy.FASTAPI_ROOT
+    assert aux_api_proxy.MOON_PREFIX.startswith("/")

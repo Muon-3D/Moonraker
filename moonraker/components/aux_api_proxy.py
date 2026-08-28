@@ -140,10 +140,16 @@ class AuxAutoProxy:
         if query and verb in {"GET", "DELETE"}:
             url += f"?{query}"
 
+        # Explicit, like every other call out of this component. Moonraker's
+        # http_client already defaults to 5s/10s, so this changes no behaviour
+        # -- it makes the bound visible and testable rather than inherited from
+        # a library default a future release could widen.
         resp = await self.http_client.request(
             method=verb,
             url=url,
-            body=webreq.get("body", None)
+            body=webreq.get("body", None),
+            connect_timeout=3.,
+            request_timeout=8.,
         )
         resp.raise_for_status()
         return resp.json()

@@ -238,6 +238,12 @@ def test_an_update_run_survives_a_check_error(cmd_helper, no_poll_delay):
         f"a check error was reported to the user as a failure: "
         f"{cmd_helper.responses}"
     )
+    # Paired with a positive one: the negative above also holds if update()
+    # said nothing at all.
+    assert cmd_helper.responses, "the run reported nothing to the user"
+    assert deploy.get_update_status()["warnings"] == [
+        "Could not reach the update server"
+    ]
 
 
 # --------------------------------------------------------------------------
@@ -394,7 +400,14 @@ def test_committing_ends_the_run_before_the_reboot(cmd_helper, no_poll_delay):
     deploy = make_deploy(aux, cmd_helper)
 
     assert asyncio.run(deploy.update()) is True
-    assert any(complete for _, complete in cmd_helper.responses)
+    # The message, not merely "something was marked complete". The generic
+    # post-loop ending is also is_complete=True, so a bare completeness check
+    # passes with the `committing` branch deleted entirely -- which is the one
+    # thing this test is here to pin.
+    assert any(
+        "Preparing to reboot" in msg and complete
+        for msg, complete in cmd_helper.responses
+    ), cmd_helper.responses
 
 
 # --------------------------------------------------------------------------
