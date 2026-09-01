@@ -5,7 +5,6 @@
 #
 # ──────────────────────────────────────────────────────────────────────────
 import asyncio, json, logging, re, contextlib
-from pathlib import Path
 from typing import Dict, Any, Callable
 from urllib.parse import unquote, urlencode
 
