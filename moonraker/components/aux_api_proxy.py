@@ -7,7 +7,7 @@
 import asyncio, json, logging, re, contextlib
 from pathlib import Path
 from typing import Dict, Any, Callable
-from urllib.parse import urlencode
+from urllib.parse import unquote, urlencode
 
 FASTAPI_ROOT = "http://localhost:6789"         #  or "unix:/run/wifi.sock"
 OPENAPI_PATH = "/openapi.json"                 #  FastAPI default
@@ -32,6 +32,30 @@ def _path_pattern(fast_path: str) -> "re.Pattern[str]":
     parts = [re.escape(seg) if not _PATH_PARAM_RE.fullmatch(seg) else "[^/?#]+"
              for seg in fast_path.split("/")]
     return re.compile("^" + "/".join(parts) + "$")
+
+
+def _has_encoded_separator(path: str) -> bool:
+    """True if percent-decoding `path` would introduce a new separator.
+
+    The pattern above excludes the literal bytes / ? # from a parameter
+    segment, but not their percent-encodings. "/wifi/show/..%2f..%2fupdate"
+    is one segment to the regex and four to anything that decodes before
+    routing, so the allowlist would authorise one path and the Aux API
+    would serve another. Decoding once and re-checking closes that; %25 is
+    refused as well, so a double-encoded payload cannot reach a second
+    decoding pass with a separator still hidden in it (KAN-83).
+
+    Encodings that do not change the shape of the path -- %20 in an SSID,
+    say -- are unaffected, which is why this is not simply a ban on '%'.
+    Compared by count rather than by presence, since every legitimate path
+    already contains '/'. A double-encoded "%252f" is allowed through and
+    is correct to allow: one downstream decode yields the literal text
+    "%2f" inside a segment, not a separator.
+    """
+    decoded = unquote(path)
+    if decoded == path:
+        return False
+    return any(decoded.count(c) > path.count(c) for c in "/?#\\")
 
 # ──────────────────────────────────────────────────────────────────────────
 class AuxAutoProxy:
@@ -81,8 +105,21 @@ class AuxAutoProxy:
         for fast_path, path_item in spec.get("paths", {}).items():
             # Paths with {...} are handled by the generic /proxy endpoint
             if _PATH_PARAM_RE.search(fast_path):
+                # Record the verbs the spec publishes for this route, not
+                # just its shape. Without them the proxy accepted any verb
+                # on any allowed path, so a route the Aux API exposes only
+                # for GET could be driven as DELETE or PUT through it --
+                # the static handlers above have always been verb-bound,
+                # and this closes the same gap on the dynamic one (KAN-83).
+                param_verbs = frozenset(
+                    HTTP_VERBS[k] for k in path_item if k in HTTP_VERBS
+                )
+                if not param_verbs:
+                    continue
                 needs_proxy = True
-                self._proxy_allowed.append(_path_pattern(fast_path))
+                self._proxy_allowed.append(
+                    (_path_pattern(fast_path), param_verbs)
+                )
                 continue
 
             verbs = [HTTP_VERBS[k] for k in path_item if k in HTTP_VERBS]
@@ -166,9 +203,17 @@ class AuxAutoProxy:
         # the parameterised routes that could not be registered statically,
         # so matching against exactly those is both the tightest rule and
         # the one that needs no maintenance.
-        if not any(p.match(path) for p in self._proxy_allowed):
+        if _has_encoded_separator(path):
+            self.log.warning("Rejected proxy path %r (encoded separator)", path)
+            raise self.server.error("Invalid proxy path", 400)
+
+        matched = [verbs for p, verbs in self._proxy_allowed if p.match(path)]
+        if not matched:
             self.log.warning("Rejected proxy path %r", path)
             raise self.server.error("Invalid proxy path", 400)
+        if not any(verb in verbs for verbs in matched):
+            self.log.warning("Rejected proxy verb %s on %r", verb, path)
+            raise self.server.error("Invalid proxy method for path", 405)
 
         url   = f"{FASTAPI_ROOT}{path}"
         query = webreq.get("query", None)
