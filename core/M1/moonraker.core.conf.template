@@ -5,6 +5,20 @@ max_upload_size: 1024
 klippy_uds_address: ${PRINTER_ADMIN_DIR}/comms/klippy.sock
 
 [file_manager]
+# KAN-108 note, deliberately not a setting. `enable_config_write_access:
+# False` closes the LAN write path into the calibration root, and an
+# earlier revision of this branch set it. It is not set here: the flag is
+# a blunt instrument that also removes the legitimate ability to write
+# calibration results through the file API, which Fluidd's config editor
+# and any future calibration UI depend on -- and the connectivity work
+# already carries a narrower fix, an allowlist on the write path that
+# keeps the useful half. Two mechanisms for one hole, one of which breaks
+# a shipped feature, is worse than the one that does not.
+#
+# The load-path half of KAN-108 does live in this branch, in Klipper's
+# klippy/configfile.py: the overlay is refused at load however it reached
+# the disk, which is the part a write-path allowlist cannot cover on its
+# own, and which that work explicitly called out as still missing.
 enable_object_processing: True
 check_klipper_config_path: False
 config_defaults_path: ${KLIPPER_DEFAULT_CONFIGS_DIR}

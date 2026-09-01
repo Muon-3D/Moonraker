@@ -5,9 +5,8 @@
 #
 # ──────────────────────────────────────────────────────────────────────────
 import asyncio, json, logging, re, contextlib
-from pathlib import Path
 from typing import Dict, Any, Callable
-from urllib.parse import urlencode
+from urllib.parse import unquote, urlencode
 
 FASTAPI_ROOT = "http://localhost:6789"         #  or "unix:/run/wifi.sock"
 OPENAPI_PATH = "/openapi.json"                 #  FastAPI default
@@ -18,6 +17,44 @@ HTTP_VERBS = {"get": "GET", "post": "POST", "put": "PUT",
               "patch": "PATCH", "delete": "DELETE"}
 
 _PATH_PARAM_RE = re.compile(r"\{[^}]+\}")
+
+
+def _path_pattern(fast_path: str) -> "re.Pattern[str]":
+    """Turn an OpenAPI path into an anchored matcher for the proxy.
+
+    "/wifi/show/{ssid}" becomes ^/wifi/show/[^/?#]+$ -- one path segment per
+    parameter, and no character that could start a query, a fragment or a
+    second path segment. Anchored at both ends, so an absolute URL, a
+    scheme-relative "//host/...", or userinfo smuggled in as "@host/..."
+    cannot match (KAN-83).
+    """
+    parts = [re.escape(seg) if not _PATH_PARAM_RE.fullmatch(seg) else "[^/?#]+"
+             for seg in fast_path.split("/")]
+    return re.compile("^" + "/".join(parts) + "$")
+
+
+def _has_encoded_separator(path: str) -> bool:
+    """True if percent-decoding `path` would introduce a new separator.
+
+    The pattern above excludes the literal bytes / ? # from a parameter
+    segment, but not their percent-encodings. "/wifi/show/..%2f..%2fupdate"
+    is one segment to the regex and four to anything that decodes before
+    routing, so the allowlist would authorise one path and the Aux API
+    would serve another. Decoding once and re-checking closes that; %25 is
+    refused as well, so a double-encoded payload cannot reach a second
+    decoding pass with a separator still hidden in it (KAN-83).
+
+    Encodings that do not change the shape of the path -- %20 in an SSID,
+    say -- are unaffected, which is why this is not simply a ban on '%'.
+    Compared by count rather than by presence, since every legitimate path
+    already contains '/'. A double-encoded "%252f" is allowed through and
+    is correct to allow: one downstream decode yields the literal text
+    "%2f" inside a segment, not a separator.
+    """
+    decoded = unquote(path)
+    if decoded == path:
+        return False
+    return any(decoded.count(c) > path.count(c) for c in "/?#\\")
 
 # ──────────────────────────────────────────────────────────────────────────
 class AuxAutoProxy:
@@ -33,11 +70,14 @@ class AuxAutoProxy:
 
     # ---------- fetch the OpenAPI document (async) ----------------------
     async def _fetch_spec(self) -> Dict[str, Any]:
-        cache = Path("/tmp/fastapi_openapi.json")
-        if cache.exists():
-            self.log.info(f"Loading OpenAPI from {cache}")
-            return json.loads(cache.read_text())
-
+        # KAN-83: this used to read /tmp/fastapi_openapi.json whenever the
+        # file existed. Nothing in the tree ever wrote it, so it bought
+        # nothing and cost a lot: /tmp is world-writable, and the spec read
+        # from it decides which endpoints get registered and proxied, so any
+        # local process could choose the proxy's route table. It also never
+        # invalidated, so an OTA that changed the Aux routes would keep
+        # serving the old ones. The fetch below is a localhost request made
+        # once at startup; there is nothing here worth caching.
         url  = f"{FASTAPI_ROOT}{OPENAPI_PATH}"
         self.log.info(f"Fetching OpenAPI from {url}")
         rsp  = await self.http_client.get(url, connect_timeout=3., request_timeout=6.)
@@ -49,6 +89,10 @@ class AuxAutoProxy:
         needs_proxy = False
 
         self._spec = spec
+        # KAN-83: every path the dynamic proxy is allowed to reach. Built
+        # from the spec rather than hand-written, so it cannot drift from
+        # the routes that actually exist.
+        self._proxy_allowed: list[re.Pattern[str]] = []
 
         # register the raw OpenAPI document
         self.server.register_endpoint(
@@ -60,7 +104,21 @@ class AuxAutoProxy:
         for fast_path, path_item in spec.get("paths", {}).items():
             # Paths with {...} are handled by the generic /proxy endpoint
             if _PATH_PARAM_RE.search(fast_path):
+                # Record the verbs the spec publishes for this route, not
+                # just its shape. Without them the proxy accepted any verb
+                # on any allowed path, so a route the Aux API exposes only
+                # for GET could be driven as DELETE or PUT through it --
+                # the static handlers above have always been verb-bound,
+                # and this closes the same gap on the dynamic one (KAN-83).
+                param_verbs = frozenset(
+                    HTTP_VERBS[k] for k in path_item if k in HTTP_VERBS
+                )
+                if not param_verbs:
+                    continue
                 needs_proxy = True
+                self._proxy_allowed.append(
+                    (_path_pattern(fast_path), param_verbs)
+                )
                 continue
 
             verbs = [HTTP_VERBS[k] for k in path_item if k in HTTP_VERBS]
@@ -134,6 +192,27 @@ class AuxAutoProxy:
         verb  = webreq.get_str("method", "GET").upper()
         if verb not in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
             raise self.server.error("Invalid HTTP verb", 400)
+
+        # KAN-83: `path` was concatenated onto FASTAPI_ROOT with no checks at
+        # all, so a caller could reach any Aux route -- OTA install, the
+        # dev_mode config rewrite, the BMS ship-mode endpoints -- and a value
+        # like "@evil.example/" or "//evil.example/" re-pointed the request
+        # at an arbitrary host, making Moonraker an SSRF pivot speaking from
+        # inside the printer's network. This endpoint exists only to serve
+        # the parameterised routes that could not be registered statically,
+        # so matching against exactly those is both the tightest rule and
+        # the one that needs no maintenance.
+        if _has_encoded_separator(path):
+            self.log.warning("Rejected proxy path %r (encoded separator)", path)
+            raise self.server.error("Invalid proxy path", 400)
+
+        matched = [verbs for p, verbs in self._proxy_allowed if p.match(path)]
+        if not matched:
+            self.log.warning("Rejected proxy path %r", path)
+            raise self.server.error("Invalid proxy path", 400)
+        if not any(verb in verbs for verbs in matched):
+            self.log.warning("Rejected proxy verb %s on %r", verb, path)
+            raise self.server.error("Invalid proxy method for path", 405)
 
         url   = f"{FASTAPI_ROOT}{path}"
         query = webreq.get("query", None)
