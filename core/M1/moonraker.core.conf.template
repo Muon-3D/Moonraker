@@ -5,6 +5,15 @@ max_upload_size: 1024
 klippy_uds_address: ${PRINTER_ADMIN_DIR}/comms/klippy.sock
 
 [file_manager]
+# KAN-108: the "calibration" root is read-only over the file API. It holds
+# calibration.cfg, which Klipper loads as the overlay on top of core.cfg,
+# and it persists across reboots -- so write access here meant any LAN
+# client could park a [verify_heater extruder] block with max_error: 1e9 in
+# it and permanently disable thermal-runaway protection on a 192 W hot end.
+# Klipper still writes the file itself on SAVE_CONFIG; this only closes the
+# network path. The overlay guard in klippy/configfile.py is the other half.
+# This flag gates nothing else -- see file_manager.py, it is read once.
+enable_config_write_access: False
 enable_object_processing: True
 check_klipper_config_path: False
 config_defaults_path: ${KLIPPER_DEFAULT_CONFIGS_DIR}

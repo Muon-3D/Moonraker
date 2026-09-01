@@ -19,6 +19,20 @@ HTTP_VERBS = {"get": "GET", "post": "POST", "put": "PUT",
 
 _PATH_PARAM_RE = re.compile(r"\{[^}]+\}")
 
+
+def _path_pattern(fast_path: str) -> "re.Pattern[str]":
+    """Turn an OpenAPI path into an anchored matcher for the proxy.
+
+    "/wifi/show/{ssid}" becomes ^/wifi/show/[^/?#]+$ -- one path segment per
+    parameter, and no character that could start a query, a fragment or a
+    second path segment. Anchored at both ends, so an absolute URL, a
+    scheme-relative "//host/...", or userinfo smuggled in as "@host/..."
+    cannot match (KAN-83).
+    """
+    parts = [re.escape(seg) if not _PATH_PARAM_RE.fullmatch(seg) else "[^/?#]+"
+             for seg in fast_path.split("/")]
+    return re.compile("^" + "/".join(parts) + "$")
+
 # ──────────────────────────────────────────────────────────────────────────
 class AuxAutoProxy:
     def __init__(self, config):
@@ -33,11 +47,14 @@ class AuxAutoProxy:
 
     # ---------- fetch the OpenAPI document (async) ----------------------
     async def _fetch_spec(self) -> Dict[str, Any]:
-        cache = Path("/tmp/fastapi_openapi.json")
-        if cache.exists():
-            self.log.info(f"Loading OpenAPI from {cache}")
-            return json.loads(cache.read_text())
-
+        # KAN-83: this used to read /tmp/fastapi_openapi.json whenever the
+        # file existed. Nothing in the tree ever wrote it, so it bought
+        # nothing and cost a lot: /tmp is world-writable, and the spec read
+        # from it decides which endpoints get registered and proxied, so any
+        # local process could choose the proxy's route table. It also never
+        # invalidated, so an OTA that changed the Aux routes would keep
+        # serving the old ones. The fetch below is a localhost request made
+        # once at startup; there is nothing here worth caching.
         url  = f"{FASTAPI_ROOT}{OPENAPI_PATH}"
         self.log.info(f"Fetching OpenAPI from {url}")
         rsp  = await self.http_client.get(url, connect_timeout=3., request_timeout=6.)
@@ -49,6 +66,10 @@ class AuxAutoProxy:
         needs_proxy = False
 
         self._spec = spec
+        # KAN-83: every path the dynamic proxy is allowed to reach. Built
+        # from the spec rather than hand-written, so it cannot drift from
+        # the routes that actually exist.
+        self._proxy_allowed: list[re.Pattern[str]] = []
 
         # register the raw OpenAPI document
         self.server.register_endpoint(
@@ -61,6 +82,7 @@ class AuxAutoProxy:
             # Paths with {...} are handled by the generic /proxy endpoint
             if _PATH_PARAM_RE.search(fast_path):
                 needs_proxy = True
+                self._proxy_allowed.append(_path_pattern(fast_path))
                 continue
 
             verbs = [HTTP_VERBS[k] for k in path_item if k in HTTP_VERBS]
@@ -134,6 +156,19 @@ class AuxAutoProxy:
         verb  = webreq.get_str("method", "GET").upper()
         if verb not in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
             raise self.server.error("Invalid HTTP verb", 400)
+
+        # KAN-83: `path` was concatenated onto FASTAPI_ROOT with no checks at
+        # all, so a caller could reach any Aux route -- OTA install, the
+        # dev_mode config rewrite, the BMS ship-mode endpoints -- and a value
+        # like "@evil.example/" or "//evil.example/" re-pointed the request
+        # at an arbitrary host, making Moonraker an SSRF pivot speaking from
+        # inside the printer's network. This endpoint exists only to serve
+        # the parameterised routes that could not be registered statically,
+        # so matching against exactly those is both the tightest rule and
+        # the one that needs no maintenance.
+        if not any(p.match(path) for p in self._proxy_allowed):
+            self.log.warning("Rejected proxy path %r", path)
+            raise self.server.error("Invalid proxy path", 400)
 
         url   = f"{FASTAPI_ROOT}{path}"
         query = webreq.get("query", None)
