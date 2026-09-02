@@ -158,6 +158,23 @@ enable_config_write_access: True
 #   When enabled the configuration folder is writable over the API.  Some
 #   installations, such as those in public areas, may wish to lock out
 #   configuration changes.  The default is True.
+config_custom_config_path:
+#   Muon addition.  Path to the Klipper configuration tree served as the
+#   "config" root -- on the M1, the developer-mode tree holding a writable
+#   copy of core.cfg.  This fork serves the stock configuration folder as
+#   "calibration" instead, so this is the only "config" root there is.
+#   Unset or empty by default, in which case no such root is registered.
+enable_custom_config_write_access: False
+#   Muon addition.  When enabled the "config" root above is writable over
+#   the API.  Separate from enable_config_write_access because the two
+#   cover different trees: that one gates the calibration overlay, which
+#   the Klipper-side calibration guard inspects, while this one gates a
+#   tree containing core.cfg itself -- the thermal limits, force_move and
+#   macro bodies that guard compares the overlay against, and which it
+#   never checks.  Leave it off on any image reachable from an untrusted
+#   network.  The default is False.
+#   Note it must not be set to an empty value: getboolean raises on one
+#   rather than falling back to the default.
 ```
 
 /// Note

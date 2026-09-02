@@ -158,9 +158,7 @@ class FileManager:
         if config_defaults_path is not None:
             self.register_directory("defaults", config_defaults_path,full_access=False)
 
-        custom_config_path = config.get('config_custom_config_path', None, deprecate=False)
-        if custom_config_path is not None:
-            self.register_directory("config", custom_config_path, full_access=True)
+        self._register_custom_config_root(config)
 
         config.get('log_path', None, deprecate=True)
         self.register_data_folder("logs")
@@ -256,6 +254,45 @@ class FileManager:
                 )
             else:
                 self.server.remove_warning("gcode_path")
+
+    def _register_custom_config_root(self, config: ConfigHelper) -> None:
+        """Register the optional second Klipper configuration tree.
+
+        On the Muon M1 this root is the developer-mode tree, and it holds
+        `core.cfg` -- the file the calibration guard compares the
+        operator-writable overlay *against*. Write access to it is therefore
+        write access to `verify_heater`, `min_temp`, `max_power` and every
+        macro body, with none of the overlay's checks applying, over an API
+        that is unauthenticated on the LAN.
+
+        It used to be registered writable unconditionally, so a shipped
+        printer carried that root whether or not developer mode was on. It
+        now needs the image to ask for it.
+
+        Deliberately its own option rather than reusing
+        `enable_config_write_access`. That one gates the `calibration` root,
+        which is the overlay `SAVE_CONFIG` results land in and which the
+        Klipper-side guard does inspect; this one gates a tree the guard
+        never looks at. The two protect different things, so one flag would
+        mean choosing between them. See Muon KAN-291.
+
+        The boolean is read before the path check so that setting it alone
+        is not reported as an unparsed option (confighelper warns, and will
+        eventually fail, for options nothing reads). Note it must not be
+        left empty: `getboolean` raises on an empty value rather than
+        falling back to the default, so an image wiring this through a
+        template has to substitute a real true/false.
+        """
+        writable = config.getboolean("enable_custom_config_write_access", False)
+        custom_config_path = config.get(
+            'config_custom_config_path', None, deprecate=False
+        )
+        # Empty as well as unset. A blank value is not None, so the original
+        # check let `os.path.abspath("")` through -- which is the process
+        # working directory, registered and served as a network root.
+        if not custom_config_path:
+            return
+        self.register_directory("config", custom_config_path, full_access=writable)
 
     def register_data_folder(
         self, folder_name: str, full_access: bool = False
