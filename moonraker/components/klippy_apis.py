@@ -138,6 +138,29 @@ class KlippyAPI(APITransport):
         # XXX - validate that file is on disk
         if filename[0] == '/':
             filename = filename[1:]
+        # --- MUON, KAN-193 / invariant I5 -----------------------------------
+        # The authoritative G-code safety gate.  It verifies the safety marker
+        # against the bytes actually on disk and re-runs the postprocessor if
+        # the marker is missing or stale, so it does not care how the file got
+        # there.  That is what makes it the only gate covering the non-upload
+        # ingress routes -- move, copy, SD card, SSH, a dev-mode config swap --
+        # which reach the file list purely through the filesystem walk in
+        # get_file_list (file_manager.py:1039-1058).
+        #
+        # It lives here, in the real method, rather than in a wrapper: the
+        # previous monkeypatch replaced this bound method with a
+        # (filename, user=None) signature that could not accept
+        # job_queue.py:139-141's start_print(filename, wait_klippy_started=True,
+        # user=job.user), and job_queue.py:142 catches only server.error, so a
+        # queued job start raised TypeError out of the queue worker.
+        guard = self.server.lookup_component("gcode_preprocessor", None)
+        if guard is None:
+            logging.error(
+                "[klippy_apis] no gcode_preprocessor component: starting "
+                "'%s' without a G-code safety check", filename
+            )
+        else:
+            await guard.ensure_verified(filename)
         # Escape existing double quotes in the file name
         filename = filename.replace("\"", "\\\"")
         script = f'SDCARD_PRINT_FILE FILENAME="{filename}"'
