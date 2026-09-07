@@ -306,7 +306,7 @@ def test_the_generic_proxy_forwards_allowlisted_verbs(verb: str):
 
     assert result == {"ok": True}
     assert client.last["method"] == verb
-    assert client.last["url"] == "http://localhost:6789/wifi/show/home"
+    assert client.last["url"] == "http://127.0.0.1:6789/wifi/show/home"
     # This endpoint takes its path and verb from the caller, so it is the one
     # most worth proving bounded -- and the only one whose timeouts used to be
     # inherited from http_client's defaults rather than passed.
@@ -384,7 +384,7 @@ def test_an_operation_without_one_gets_a_query_string_instead():
     handler = server.handler_for("/server/aux/wifi/scan")
     asyncio.run(handler(FakeWebRequest("GET", {"rescan": "1"})))
 
-    assert client.last["url"] == "http://localhost:6789/wifi/scan?rescan=1"
+    assert client.last["url"] == "http://127.0.0.1:6789/wifi/scan?rescan=1"
     assert client.last["body"] is None
 
 
@@ -441,18 +441,18 @@ def test_the_ota_wrappers_target_the_canonical_update_routes():
     proxy, _server, client = make_proxy()
 
     asyncio.run(proxy.ota_status())
-    assert client.last["url"] == "http://localhost:6789/update/status"
+    assert client.last["url"] == "http://127.0.0.1:6789/update/status"
 
     asyncio.run(proxy.ota_check_server())
-    assert client.last["url"] == "http://localhost:6789/update/check"
+    assert client.last["url"] == "http://127.0.0.1:6789/update/check"
     assert json.loads(client.last["body"]) == {"wait": False}
 
     asyncio.run(proxy.ota_start())
-    assert client.last["url"] == "http://localhost:6789/update/install"
+    assert client.last["url"] == "http://127.0.0.1:6789/update/install"
     assert json.loads(client.last["body"]) == {}
 
     asyncio.run(proxy.ota_commit())
-    assert client.last["url"] == "http://localhost:6789/update/commit"
+    assert client.last["url"] == "http://127.0.0.1:6789/update/commit"
 
 
 def test_ota_start_passes_a_bundle_url_when_it_is_given_one():
