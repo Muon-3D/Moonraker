@@ -187,7 +187,12 @@ SPEC: Dict[str, Any] = {
 }
 
 SPEC_WITH_PARAMS: Dict[str, Any] = {
-    "paths": dict(SPEC["paths"], **{"/wifi/show/{ssid}": {"get": {}}}),
+    "paths": dict(SPEC["paths"], **{
+        "/wifi/show/{ssid}": {"get": {}},
+        # Published for three verbs, so the per-route verb set KAN-83 records
+        # can be told apart from a blanket "any verb" allowance.
+        "/wifi/profile/{name}": {"get": {}, "put": {}, "delete": {}},
+    }),
 }
 
 
@@ -258,7 +263,16 @@ def test_an_empty_spec_still_registers_only_the_openapi_route():
 
     proxy._register_from_spec({"paths": {}})
 
-    assert server.paths() == ["/server/aux/openapi.json"]
+    # /server/muon/dev_mode is registered unconditionally, not from the spec:
+    # SEC-2 took every /server/aux/* path off the network including the
+    # dev-mode status read, and DEV-4 still requires developer mode to be
+    # visible in the interface, so it is published off the floor. It is GET
+    # only and forwards no body, which is what stops it becoming a way to
+    # *change* the mode.
+    assert server.paths() == [
+        "/server/aux/openapi.json",
+        "/server/muon/dev_mode",
+    ]
 
 
 # --------------------------------------------------------------------------
@@ -296,17 +310,19 @@ def test_a_spec_without_them_does_not_register_the_generic_proxy():
 # The generic proxy's verb allowlist
 # --------------------------------------------------------------------------
 
-@pytest.mark.parametrize("verb", ["GET", "POST", "PUT", "PATCH", "DELETE"])
-def test_the_generic_proxy_forwards_allowlisted_verbs(verb: str):
+@pytest.mark.parametrize("verb", ["GET", "PUT", "DELETE"])
+def test_the_generic_proxy_forwards_verbs_the_route_publishes(verb: str):
     proxy, _server, client = make_proxy()
     proxy._register_from_spec(SPEC_WITH_PARAMS)
 
-    webreq = FakeWebRequest(args={"path": "/wifi/show/home", "method": verb})
+    webreq = FakeWebRequest(
+        args={"path": "/wifi/profile/home", "method": verb}
+    )
     result = asyncio.run(proxy._handle_dynamic_proxy(webreq))
 
     assert result == {"ok": True}
     assert client.last["method"] == verb
-    assert client.last["url"] == "http://127.0.0.1:6789/wifi/show/home"
+    assert client.last["url"] == "http://127.0.0.1:6789/wifi/profile/home"
     # This endpoint takes its path and verb from the caller, so it is the one
     # most worth proving bounded -- and the only one whose timeouts used to be
     # inherited from http_client's defaults rather than passed.
@@ -350,14 +366,16 @@ def test_a_query_string_is_only_appended_for_verbs_that_take_one():
     proxy._register_from_spec(SPEC_WITH_PARAMS)
 
     asyncio.run(proxy._handle_dynamic_proxy(FakeWebRequest(
-        args={"path": "/wifi/scan", "method": "GET", "query": "rescan=1"}
+        args={"path": "/wifi/profile/home", "method": "GET",
+              "query": "rescan=1"}
     )))
-    assert client.last["url"].endswith("/wifi/scan?rescan=1")
+    assert client.last["url"].endswith("/wifi/profile/home?rescan=1")
 
     asyncio.run(proxy._handle_dynamic_proxy(FakeWebRequest(
-        args={"path": "/wifi/connect", "method": "POST", "query": "rescan=1"}
+        args={"path": "/wifi/profile/home", "method": "PUT",
+              "query": "rescan=1"}
     )))
-    assert client.last["url"].endswith("/wifi/connect")
+    assert client.last["url"].endswith("/wifi/profile/home")
 
 
 # --------------------------------------------------------------------------
@@ -598,3 +616,68 @@ def test_every_call_out_carries_this_boots_aux_api_token(tmp_path, monkeypatch):
 
     asyncio.run(proxy.post("/update/commit", {}))
     assert client.last["headers"][aux_api_proxy.AUX_TOKEN_HEADER] == "s3cret"
+
+
+# --------------------------------------------------------------------------
+# KAN-83: what the generic proxy will and will not reach
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("verb", ["POST", "PATCH"])
+def test_a_verb_the_route_does_not_publish_is_refused(verb: str):
+    """405, and nothing leaves the process.
+
+    The allowlist records a verb set per route, not just a shape. Before
+    KAN-83 the verb was only checked against the generic
+    {GET,POST,PUT,PATCH,DELETE} set, so a route published for GET alone could
+    be driven as DELETE or PUT.
+    """
+    proxy, _server, client = make_proxy()
+    proxy._register_from_spec(SPEC_WITH_PARAMS)
+
+    webreq = FakeWebRequest(args={"path": "/wifi/show/home", "method": verb})
+    with pytest.raises(FakeServerError) as excinfo:
+        asyncio.run(proxy._handle_dynamic_proxy(webreq))
+
+    assert excinfo.value.status_code == 405
+    assert client.calls == [], "a refused verb still reached the Aux API"
+
+
+@pytest.mark.parametrize("path", [
+    "/update/install",              # privileged, and never parameterised
+    "/bms/ship_mode/enable",        # not in the spec at all
+    "/wifi/scan",                   # concrete: it has its own static handler
+    "@evil.example/wifi/scan",      # host pivot via userinfo
+    "//evil.example/wifi/scan",     # host pivot via protocol-relative path
+    "/wifi/show/..%2f..%2fupdate%2finstall",   # encoded separators
+    "/wifi/show/%2e%2e%2fupdate",              # encoded dot-segments
+])
+def test_a_path_outside_the_published_parameterised_routes_is_refused(path):
+    """400, and nothing leaves the process.
+
+    `path` used to be concatenated onto FASTAPI_ROOT unchecked, so any Aux
+    route was reachable and a userinfo or protocol-relative value re-pointed
+    the request at an arbitrary host -- an SSRF pivot speaking from inside the
+    printer's network.
+    """
+    proxy, _server, client = make_proxy()
+    proxy._register_from_spec(SPEC_WITH_PARAMS)
+
+    webreq = FakeWebRequest(args={"path": path, "method": "GET"})
+    with pytest.raises(FakeServerError) as excinfo:
+        asyncio.run(proxy._handle_dynamic_proxy(webreq))
+
+    assert excinfo.value.status_code == 400
+    assert client.calls == [], f"{path!r} reached the Aux API"
+
+
+def test_a_percent_encoded_value_that_is_not_a_separator_still_works():
+    """This is not a ban on '%'. An SSID with a space is legitimate."""
+    proxy, _server, client = make_proxy()
+    proxy._register_from_spec(SPEC_WITH_PARAMS)
+
+    asyncio.run(proxy._handle_dynamic_proxy(FakeWebRequest(
+        args={"path": "/wifi/show/my%20network", "method": "GET"}
+    )))
+
+    assert client.last["url"].endswith("/wifi/show/my%20network")
+
