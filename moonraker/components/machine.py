@@ -1617,8 +1617,14 @@ SYSTEMD_UNIT = \
 # systemd service file for moonraker
 [Unit]
 Description=API Server for Klipper SV%d
-Requires=network-online.target
-After=network-online.target
+# Not network-online.target: moonraker binds and serves before a route exists,
+# and a wait-online timeout must not take the API down with it.  Kept in sync
+# with recipes/klipper_moonraker_fluidd/files/moonraker/moonraker.service.template
+# in MuonOS, so bumping SERVICE_VERSION cannot silently reinstate the old deps.
+Wants=network.target
+After=network.target
+StartLimitIntervalSec=10min
+StartLimitBurst=60
 
 [Install]
 WantedBy=multi-user.target
@@ -1631,7 +1637,7 @@ RemainAfterExit=yes
 EnvironmentFile=%s
 ExecStart=%s $MOONRAKER_ARGS
 Restart=always
-RestartSec=10
+RestartSec=2
 """  # noqa: E122
 
 TEMPLATE_NAME = "password_request.html"
