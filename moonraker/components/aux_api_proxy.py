@@ -129,7 +129,7 @@ class AuxAutoProxy:
         # KAN-83: every path the dynamic proxy is allowed to reach. Built
         # from the spec rather than hand-written, so it cannot drift from
         # the routes that actually exist.
-        self._proxy_allowed: list[re.Pattern[str]] = []
+        self._proxy_allowed: list[tuple[re.Pattern[str], frozenset[str]]] = []
 
         # register the raw OpenAPI document
         self.server.register_endpoint(
