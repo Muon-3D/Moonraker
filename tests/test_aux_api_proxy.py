@@ -26,8 +26,10 @@ class-scoped `event_loop` fixture that newer releases no longer support.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -469,7 +471,11 @@ def test_a_post_body_that_is_already_a_string_is_sent_unchanged():
     asyncio.run(proxy.post("/thing", "raw text"))
 
     assert client.last["body"] == "raw text"
-    assert client.last["headers"] is None
+    # KAN-25: every call out is wrapped by _auth_headers, so this is always a
+    # dict. `is None` would mean the wrapper had been bypassed -- which is the
+    # regression worth catching here. What the dict *contains* when a token
+    # exists is pinned by test_every_call_out_carries_this_boots_aux_api_token.
+    assert isinstance(client.last["headers"], dict)
 
 
 # --------------------------------------------------------------------------
@@ -540,3 +546,55 @@ def test_the_backend_address_never_leaves_the_box():
     host = urlparse(aux_api_proxy.FASTAPI_ROOT).hostname
     assert host in {"localhost", "127.0.0.1", "::1"}, aux_api_proxy.FASTAPI_ROOT
     assert aux_api_proxy.MOON_PREFIX.startswith("/")
+
+
+# --------------------------------------------------------------------------
+# Requirements this component inherits from elsewhere
+# --------------------------------------------------------------------------
+
+def test_the_aux_api_is_reached_over_loopback_by_address_not_by_name():
+    """KAN-68 binds the Aux API to loopback; this pins that we reach it there.
+
+    Asserted as the requirement rather than as whatever FASTAPI_ROOT happens
+    to say today. The host must be a loopback *address*: a name is
+    resolver-dependent -- it can answer ::1, and a search domain or an edited
+    hosts file can move it off the loopback interface entirely -- so a
+    hostname would not be the bind KAN-68 asks for even on a day it works.
+    """
+    host = urlsplit(aux_api_proxy.FASTAPI_ROOT).hostname
+    assert host is not None, "FASTAPI_ROOT must carry a host"
+    # A hostname raises ValueError here, which is the point: names are not
+    # addresses, and only an address can be checked for being loopback.
+    assert ipaddress.ip_address(host).is_loopback, (
+        f"Aux API must be reached over loopback by address, got {host!r}"
+    )
+
+
+def test_every_call_out_carries_this_boots_aux_api_token(tmp_path, monkeypatch):
+    """KAN-25: the Aux API authenticates, so an outgoing call must be signed.
+
+    Asserted as the requirement -- the token header is actually present on the
+    way out -- not merely that a headers dict is tolerated. Covers the static
+    handler, the generic proxy and the internal get/post helpers, because a
+    single unsigned path is a way round the authentication.
+    """
+    token_file = tmp_path / "aux_token"
+    token_file.write_text("s3cret" + chr(10))
+    monkeypatch.setattr(aux_api_proxy, "AUX_TOKEN_FILE", token_file)
+
+    proxy, server, client = make_proxy()
+    proxy._register_from_spec(SPEC_WITH_PARAMS)
+
+    asyncio.run(server.handler_for("/server/aux/wifi/scan")(FakeWebRequest()))
+    assert client.last["headers"][aux_api_proxy.AUX_TOKEN_HEADER] == "s3cret"
+
+    asyncio.run(proxy._handle_dynamic_proxy(FakeWebRequest(
+        args={"path": "/wifi/show/home", "method": "GET"}
+    )))
+    assert client.last["headers"][aux_api_proxy.AUX_TOKEN_HEADER] == "s3cret"
+
+    asyncio.run(proxy.get("/update/status"))
+    assert client.last["headers"][aux_api_proxy.AUX_TOKEN_HEADER] == "s3cret"
+
+    asyncio.run(proxy.post("/update/commit", {}))
+    assert client.last["headers"][aux_api_proxy.AUX_TOKEN_HEADER] == "s3cret"
