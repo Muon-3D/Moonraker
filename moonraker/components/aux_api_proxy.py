@@ -62,6 +62,8 @@ def _has_encoded_separator(path: str) -> bool:
     if decoded == path:
         return False
     return any(decoded.count(c) > path.count(c) for c in "/?#\\")
+
+
 # ID-3: where the owner's rename is stored. Moonraker's database lives at
 # /home/printer_data/database, which our rugix-ctrl-config recipe persists, so
 # the name survives a reboot and an OS update -- and is cleared by a factory
@@ -155,9 +157,10 @@ class AuxAutoProxy:
         )
 
         # MUON, DEV-4: developer mode must be visible on the panel *and* in the
-        # interface.  SEC-2 has just taken every /server/aux/* path off the
-        # network, and that includes reading the dev_mode state, so publish the
-        # state somewhere that is not on the floor.  GET only, no request body
+        # interface.  SEC-2 keeps /server/aux/dev_mode on the floor, and
+        # `is_floor_endpoint` matches that prefix and everything under it, so
+        # *reading* the state is denied to the network as well as setting it.
+        # Publish the state somewhere that is not on the floor.  GET only, no request body
         # forwarded, and it calls Aux through the internal helper rather than
         # re-exporting the route -- so this can never become a way to *change*
         # the mode, whatever Aux grows later.
@@ -177,9 +180,10 @@ class AuxAutoProxy:
         #     factory reset -- and /home/printer_data/database has exactly
         #     that lifetime.
         #
-        # Off the floor deliberately. SEC-2 takes /server/aux/* off the
-        # network, and a printer that cannot tell the LAN what it is called
-        # cannot appear in a printer list (ID-4, and WEB-5..7 in phase 3).
+        # Off the floor deliberately: a printer that cannot tell the LAN what
+        # it is called cannot appear in a printer list (ID-4, and WEB-5..7 in
+        # phase 3). /server/muon has never been on the floor, so this does not
+        # depend on what SEC-2's scope happens to be.
         # Safe to expose because ID-5 makes the name authority-free: every
         # trust decision uses the fingerprint, never this.
         self.server.register_endpoint(
