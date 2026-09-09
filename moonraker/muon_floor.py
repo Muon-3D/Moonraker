@@ -55,14 +55,33 @@ from .utils.exceptions import ServerError
 # endpoint, not against a URL, so the RPC method names derived from these
 # endpoints are covered by the same entry.
 FLOOR_PREFIXES = (
-    # Aux holds passwordless sudo for nmcli and rugix-ctrl.  It binds loopback,
-    # but aux_api_proxy re-exports its entire OpenAPI document under this
-    # prefix, which puts it back on the network.  Includes the developer-mode
-    # toggle (DEV-1) and the /server/aux/proxy escape hatch.
-    "/server/aux",
-    # Update install/rollback/recover.  A caller who can move the printer
-    # between OS versions can move it to one without these controls.
-    "/machine/update",
+    # The developer-mode toggle, and nothing else.
+    #
+    # `SEC-2` as amended keeps on the floor only what an owner must not be able
+    # to consent away, because the consequence is not theirs to undo. `DEV-3`
+    # is that: enabling developer mode blows a CM4 one-time-programmable fuse,
+    # reversible in software and permanent in hardware, and it is what answers
+    # "was this machine ever unlocked?" in a warranty dispute years later. An
+    # owner may choose to open the rest of this surface. They cannot unblow a
+    # fuse, so that choice is not theirs to make.
+    #
+    # The rest of /server/aux, and all of /machine/update, left the floor with
+    # that amendment: open at Level 0 (the shipped default), denied at Level 1
+    # once `SEC-8` lands. Level 0 is a subtraction from this tuple and needs
+    # nothing else -- the entry below keeps using the same address check it
+    # always has.
+    #
+    # THIS NARROWING DEPENDS ON KAN-83 AND MUST NOT BE BACKPORTED WITHOUT IT.
+    # The old entry was the whole "/server/aux" prefix, and its comment gave
+    # the reason: aux_api_proxy re-exports Aux's entire OpenAPI document, and
+    # /server/aux/proxy forwarded an arbitrary `path` argument to Aux with no
+    # checks. Flooring only the toggle while that hatch is open reaches the
+    # toggle straight through the hatch. KAN-83 closed it: _handle_dynamic_proxy
+    # now matches `path` against _proxy_allowed, which is built only from routes
+    # whose Aux path contains `{...}`. /dev_mode has no path parameters, so it
+    # is a static endpoint and the proxy cannot address it. On any commit
+    # predating KAN-83 this tuple must stay as it was.
+    "/server/aux/dev_mode",
 )
 
 # SEC-3: Moonraker answers *who are you*; we answer *what may you do*.
