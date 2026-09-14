@@ -46,8 +46,17 @@ LOOPBACK = ipaddress.ip_address("127.0.0.1")
 class TestWhatIsOnTheFloor:
     """The membership of FLOOR_PREFIXES is the decision, so pin it directly.
 
-    SEC-2 as amended keeps only what an owner cannot consent away. Everything
-    else is governed by SEC-8's levels, which is policy rather than floor.
+    Two different reasons put an entry here, and conflating them is how one gets
+    removed by someone who read the other's justification:
+
+    * SEC-2 floors what an owner cannot consent away, because the consequence is
+      permanent. That is the developer-mode toggle.
+    * KAN-350 floors the mutating battery routes because nothing else holds
+      them -- ``require_bms_authority`` is an empty body (BMS-21) -- and
+      ``trusted_clients`` no longer answers 401 to a LAN caller.
+
+    Everything else is governed by SEC-8's levels, which is policy rather than
+    floor.
     """
 
     def test_the_developer_mode_toggle_is_floored(self):
@@ -55,8 +64,65 @@ class TestWhatIsOnTheFloor:
         # hardware, so no setting may open it and no level may relax it.
         assert is_floor_endpoint("/server/aux/dev_mode")
 
-    def test_the_floor_is_only_the_toggle(self):
-        assert FLOOR_PREFIXES == ("/server/aux/dev_mode",)
+    def test_the_floor_is_the_toggle_and_the_battery_commands(self):
+        """Pinned as an exact tuple, so adding or dropping one is a failure here
+        rather than a discovery in the field."""
+        assert FLOOR_PREFIXES == (
+            "/server/aux/dev_mode",
+            "/server/aux/bms/mode",
+            "/server/aux/bms/charge",
+            "/server/aux/bms/standby",
+            "/server/aux/bms/fault",
+            "/server/aux/bms/ship",
+        )
+
+    @pytest.mark.parametrize(
+        "endpoint",
+        [
+            "/server/aux/bms/mode",
+            "/server/aux/bms/charge",
+            # The one the `charge` entry has to cover by segment boundary. If
+            # this fails, the power limit is reachable anonymously on the LAN
+            # while the route beside it is not.
+            "/server/aux/bms/charge/power",
+            "/server/aux/bms/standby",
+            "/server/aux/bms/fault/clear",
+            "/server/aux/bms/ship",
+        ],
+    )
+    def test_every_mutating_battery_route_is_floored(self, endpoint: str):
+        """All six of the routes BMS_GUARD covers in the Aux API.
+
+        This is the list from ``require_bms_authority``'s own docstring. It is
+        spelled out as full endpoints rather than derived from FLOOR_PREFIXES,
+        because deriving the expectation from the thing under test passes under
+        any value of it.
+        """
+        assert is_floor_endpoint(endpoint)
+
+    @pytest.mark.parametrize(
+        "endpoint",
+        [
+            "/server/aux/bms/link",
+            "/server/aux/bms/status",
+            "/server/aux/bms/snapshot",
+            "/server/aux/bms/capabilities",
+        ],
+    )
+    def test_battery_telemetry_stays_open(self, endpoint: str):
+        """Read-only pack state is not authority, and Fluidd needs it.
+
+        The symptom if this breaks is subtler than a 403 in a console:
+        ``/bms/link`` is what a UI polls to decide whether the battery exists,
+        so flooring it makes a LAN client draw a printer with no battery.
+        """
+        assert not is_floor_endpoint(endpoint)
+
+    def test_the_bms_prefix_as_a_whole_is_not_floored(self):
+        """The mistake this guards is one entry of ``/server/aux/bms``, which
+        looks tidier and takes the telemetry with it."""
+        assert "/server/aux/bms" not in FLOOR_PREFIXES
+        assert not is_floor_endpoint("/server/aux/bms")
 
     @pytest.mark.parametrize(
         "endpoint",
@@ -103,6 +169,29 @@ class TestWhoIsAllowedThrough:
     def test_a_network_caller_reaches_everything_off_the_floor(self):
         check_floor("/server/aux/wifi/current", HTTP, LAN)
         check_floor("/machine/update/status", HTTP, LAN)
+
+    def test_ship_mode_is_denied_to_a_lan_caller(self):
+        """The case KAN-350 exists for.
+
+        Once ``trusted_clients`` covers the LAN, Moonraker no longer answers 401
+        here, so this 403 is the only thing between a browser on the customer's
+        network and a command that powers the battery down.
+        """
+        with pytest.raises(ServerError) as excinfo:
+            check_floor("/server/aux/bms/ship", HTTP, LAN)
+        assert excinfo.value.status_code == 403
+
+    def test_a_lan_caller_still_reads_battery_telemetry(self):
+        """Fluidd on the LAN draws the battery, so this must not be collateral
+        damage from the entries above."""
+        check_floor("/server/aux/bms/link", HTTP, LAN)
+        check_floor("/server/aux/bms/status", HTTP, LAN)
+
+    def test_the_panel_still_drives_the_battery(self):
+        """The panel is the caller these routes are FOR. If this fails, the
+        battery controls on the touchscreen go dead."""
+        check_floor("/server/aux/bms/ship", HTTP, LOOPBACK)
+        check_floor("/server/aux/bms/standby", HTTP, LOOPBACK)
 
     def test_an_addressless_transport_is_denied_not_waved_through(self):
         """Fail-closed. MQTT carries no address, and `None` must read as remote

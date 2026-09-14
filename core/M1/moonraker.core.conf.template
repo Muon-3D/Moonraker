@@ -42,17 +42,42 @@ config_custom_config_path: /home/printer_data/devmode_custom_config
 # which replaces any value the caller supplied, so the address cannot be forged
 # through nginx.
 #
-# The consequence is what we want: with only loopback trusted,
-#   - MuonUI on the panel reaches nginx :100 over localhost   -> 127.0.0.1 -> trusted
-#   - muon-link terminates remote sessions onto 127.0.0.1:80  -> 127.0.0.1 -> trusted
-#   - a browser on the LAN reaching :80                       -> its own IP  -> 401
-# so an unpaired device on the same network can read nothing and control
-# nothing, which is the Tier 1 acceptance criterion.
+# The consequence is that this list decides, by address, who reaches Moonraker
+# without signing in:
+#   - MuonUI on the panel reaches nginx :100 over localhost   -> 127.0.0.1
+#   - muon-link terminates remote sessions onto 127.0.0.1:80  -> 127.0.0.1
+#   - a browser on the LAN or the hotspot reaching :80        -> its own address
 #
-# Because the proxy hop is transparent, a LAN client that authenticates must do
-# so with a credential rather than by address. Fluidd over the LAN therefore
-# depends on the paired-client credential (KAN-190/KAN-191); until that lands,
-# LAN Fluidd gets 401 by design.
+# SEC-1. THE LAN AND THE HOTSPOT ARE NOW TRUSTED, AND THIS IS THE POINT.
+#
+# This list held loopback alone until 2026-09-13, and the effect was that Fluidd
+# over the LAN answered 401 -- a login page on a printer that has no accounts and
+# no way to make one. The hotspot is the path a customer takes before the printer
+# is on their network, so that login page was the first thing a new owner met.
+#
+# `SEC-1` says Level 0 Open is the shipped default and that Fluidd works on the
+# LAN and the hotspot with no sign-in. This is that clause, implemented.
+#
+# WHAT MAKES THIS SAFE ENOUGH TO SHIP, AND WHAT IT IS NOT
+#
+# Trusting an address grants everything Moonraker exposes to that address, so the
+# surfaces an owner must not be able to open had to stop being reachable first.
+# They are held by the floor (moonraker/muon_floor.py), which checks the address
+# and not this list: the developer-mode toggle, which blows a fuse, and the five
+# destructive battery commands, one of which is ship mode. A LAN caller is
+# trusted here and still refused there.
+#
+# Only private and link-local space is listed. That is deliberate and it is not
+# cosmetic: nginx listens on [::]:80 and this printer holds a globally routable
+# IPv6 address with no NAT in front of it, so a trusted-client list carrying a
+# global range would publish the machine to the internet. A caller from a global
+# address still gets 401.
+#
+# THE `unless configured` HALF IS NOT BUILT. An owner who wants a sign-in has no
+# way to ask for one, and creating a Moonraker user does not produce one either:
+# a trusted client bypasses login entirely, so the account would be ignored. That
+# switch is `SEC-8` Level 1 (KAN-25), and until it exists this file is the whole
+# policy.
 #
 # NOTE on force_logins: authorization.py:883 only honours it when
 # len(self.users) > 1, and _API_KEY_USER_ always occupies one slot, so on a
@@ -80,6 +105,27 @@ cors_domains:
 trusted_clients:
     127.0.0.0/8
     ::1/128
+# The customer's own network, whatever it turns out to be. All three RFC1918
+# ranges, because a printer is sold into a house and cannot know which one the
+# router uses.
+    10.0.0.0/8
+    172.16.0.0/12
+    192.168.0.0/16
+# The hotspot. NetworkManager's `method=shared` hands out 10.42.0.0/24, which
+# 10.0.0.0/8 already covers -- listed for nobody's benefit but the reader's, so
+# that removing the RFC1918 lines does not silently take the onboarding path with
+# it.
+    10.42.0.0/24
+# A client that reached the printer with no DHCP server in the way: 169.254/16 is
+# IPv4 link-local and fe80::/10 its IPv6 equivalent. A laptop plugged into a
+# printer on a bench with no router is the case.
+    169.254.0.0/16
+    fe80::/10
+# IPv6 unique local addresses -- the ULA the printer holds alongside its global
+# one. A browser on the same LAN often prefers IPv6, and an entry list that
+# covers only IPv4 private space produces a 401 that depends on which address
+# family the browser happened to choose.
+    fc00::/7
 
 [octoprint_compat]
 

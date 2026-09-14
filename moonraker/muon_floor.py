@@ -55,7 +55,8 @@ from .utils.exceptions import ServerError
 # endpoint, not against a URL, so the RPC method names derived from these
 # endpoints are covered by the same entry.
 FLOOR_PREFIXES = (
-    # The developer-mode toggle, and nothing else.
+    # The developer-mode toggle. It was the only entry here until KAN-350 added
+    # the battery commands below, for a different reason -- see there.
     #
     # `SEC-2` as amended keeps on the floor only what an owner must not be able
     # to consent away, because the consequence is not theirs to undo. `DEV-3`
@@ -82,6 +83,52 @@ FLOOR_PREFIXES = (
     # is a static endpoint and the proxy cannot address it. On any commit
     # predating KAN-83 this tuple must stay as it was.
     "/server/aux/dev_mode",
+    # KAN-350. The battery commands that change pack state.
+    #
+    # These are here for a different reason from the toggle above, and the
+    # difference is worth keeping straight. The toggle is floored because the
+    # consequence is not the owner's to undo -- a blown fuse stays blown. These
+    # are floored because *nothing else holds them*: ``require_bms_authority``
+    # in the Aux API is an empty function body (``BMS-21``), so until KAN-25
+    # lands, this tuple is the whole of their access control.
+    #
+    # They did not need to be here while ``trusted_clients`` held loopback
+    # alone, because Moonraker answered 401 before reaching any of them. KAN-350
+    # opens that list to the LAN and the hotspot so that Fluidd works with no
+    # sign-in (``SEC-1``), which removes the 401 -- and these entries are what
+    # make that safe to ship. Do not remove them while ``BMS-21`` is open.
+    "/server/aux/bms/mode",
+    # Covers /bms/charge and /bms/charge/power both: ``is_floor_endpoint``
+    # matches on a path-segment boundary, so this one entry is both routes while
+    # still not matching a sibling that merely starts with the same letters.
+    "/server/aux/bms/charge",
+    # Standby is the one of these a base user could reasonably be given -- it is
+    # power saving, not a destructive command. It stays floored anyway, because
+    # nobody has measured whether ``SET_STANDBY_ENABLE`` removes power from the
+    # compute module. If it does, a caller who enables it over the network
+    # strands the printer, and the machine cannot then be asked to undo it. Open
+    # it when that measurement exists, and not before.
+    "/server/aux/bms/standby",
+    "/server/aux/bms/fault",
+    # Ship mode. Additionally refused by the Aux client unless
+    # BMS_ENABLE_SHIP_COMMAND=1 (KAN-130), so this is the second of two locks
+    # rather than the only one. Listed because a defence that depends on an
+    # environment variable staying unset is not one to leave alone on the route
+    # that powers the pack down.
+    "/server/aux/bms/ship",
+)
+
+#: The battery routes deliberately NOT floored. Telemetry discloses pack state,
+#: not authority, and both UIs need it: ``/bms/link`` is what the panel polls to
+#: decide whether the subsystem is alive at all, so flooring it would make a LAN
+#: Fluidd report the battery as missing rather than as present. Named here so
+#: that a later edit collapsing the entries above into a single
+#: ``"/server/aux/bms"`` prefix is recognisable as the mistake it would be.
+BMS_TELEMETRY_LEFT_OPEN = (
+    "/server/aux/bms/link",
+    "/server/aux/bms/status",
+    "/server/aux/bms/snapshot",
+    "/server/aux/bms/capabilities",
 )
 
 # SEC-3: Moonraker answers *who are you*; we answer *what may you do*.
