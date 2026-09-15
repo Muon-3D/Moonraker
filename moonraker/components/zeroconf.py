@@ -215,7 +215,41 @@ class ZeroconfRegistrar:
             if not host:
                 host = self.cfg_addr
             host_addr = ipaddress.ip_address(self.cfg_addr)
-            addresses = [host_addr.packed]
+            if host_addr.is_loopback:
+                # Publish the service records and no address record at all.
+                #
+                # This branch advertises the BIND address, which is sound for
+                # 192.168.x.y and wrong for a loopback bind: the record says
+                # "<server>.local is 127.0.0.1", it goes out of every real
+                # interface, and it carries the cache-flush bit -- so a client
+                # that resolves the name is told to replace what it holds and
+                # then loads its own port 80.
+                #
+                # It is also a name fight. On a systemd host the system mDNS
+                # responder already owns and defends <hostname>.local, which is
+                # what `server` here defaults to, and it publishes the real
+                # address. Two publishers, one name, contradictory rdata.
+                # Upstream hit exactly this in #284 -- "would typically return
+                # '127.0.1.1' which would then cause an avahi-daemon conflict
+                # to be detected. Avahi would then revoke it's record breaking
+                # the hostname.local resolution" -- and #288 fixed it for the
+                # scan path. `bound_all` and this else branch arrived
+                # afterwards and reintroduced it for a non-wildcard bind.
+                #
+                # An empty list is the correct answer rather than a hedge: the
+                # SRV target still names `server`, the system responder still
+                # answers for it with addresses that are actually reachable,
+                # and there is exactly one publisher per name. The NSEC that
+                # ServiceInfo still emits is owned by the instance label, not
+                # by `server`, so it denies nothing anyone queries.
+                #
+                # Guessing a real address here instead would be worse: a
+                # loopback bind means this process is deliberately not on the
+                # network, and the addresses it could advertise are the system
+                # responder's to publish.
+                addresses = []
+            else:
+                addresses = [host_addr.packed]
         zc_service_name = f"{instance_name} @ {host}.{ZC_SERVICE_TYPE}"
         server_name = self.mdns_name or instance_name.lower()
         self.service_info = AsyncServiceInfo(
