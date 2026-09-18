@@ -1,6 +1,11 @@
 # MUON -- the floor.  Surfaces denied over the network in every mode.
 #
-# SPEC SEC-2 / SEC-3 / DEV-1 (docs/connectivity/SPEC.md in the MuonOS repo).
+# SPEC SEC-2 / SEC-3 (docs/connectivity/SPEC.md in the MuonOS repo).
+#
+# `DEV-1` used to be enforced here too. It is not any more -- KAN-371 moved the
+# developer-mode gate to `dev_mode_consent` in the Aux API, which tests presence
+# rather than address. The long comment on FLOOR_PREFIXES below is the argument;
+# read it before adding the toggle back.
 #
 # Why this lives here and not only in the nginx vhost
 # ---------------------------------------------------
@@ -14,8 +19,8 @@
 #      Every JSON-RPC call afterwards rides an already-open socket and is never
 #      matched against a path again.  ``MoonrakerApp.register_endpoint``
 #      registers an RPC method for every HTTP endpoint
-#      (components/application.py:381-382), so ``/server/aux/dev_mode`` is also
-#      reachable as ``server.aux.post_dev_mode`` over that socket.  A path
+#      (components/application.py:381-382), so ``/server/aux/bms/ship`` is also
+#      reachable as ``server.aux.post_bms_ship`` over that socket.  A path
 #      allowlist in nginx does not constrain it.
 #   2. ``aux_api_proxy`` registers a generic ``/server/aux/proxy`` endpoint
 #      (components/aux_api_proxy.py:78-81) that takes an arbitrary ``path``
@@ -30,15 +35,26 @@
 # caller's address.  One check there covers HTTP, the websocket, the HTTP
 # JSON-RPC bridge and MQTT at once.
 #
-# What makes "local" trustworthy
-# ------------------------------
+# What makes "local" trustworthy, and how far that goes
+# -----------------------------------------------------
 # Moonraker runs Tornado with ``xheaders=True`` (components/application.py:315)
 # and both vhosts set ``proxy_set_header X-Real-IP $remote_addr``, so the nginx
 # hop is transparent: Moonraker sees the real client address and a LAN client
 # cannot forge loopback through nginx.  The panel reaches Moonraker over
-# 127.0.0.1 (the MuonUI vhost listens on loopback only), so loopback means
-# "physically at the machine" and everything else means "over the network".
+# 127.0.0.1 (the MuonUI vhost listens on loopback only).
 # tests/test_trusted_clients.py pins both halves of that.
+#
+# What this check therefore means is "the request originated on this device",
+# and that is the claim to rely on.  It is NOT the same as "a person is
+# standing at the printer", and the difference is not hypothetical: muon-link
+# terminates a remote session onto 127.0.0.1:80, so the gateway is a second
+# loopback consumer and a remote operator reaching the machine through it
+# arrives here indistinguishable from the panel.  ``SEC-3`` records exactly
+# this, and ``GATE-2`` is the work that is supposed to close it.  Until GATE-2
+# exists, do not put anything on this floor whose justification is physical
+# presence -- that is the mistake KAN-371 corrected for the developer-mode
+# toggle.  The entries that remain are justified by "no other check holds
+# them" (BMS-21), which an on-device origin does answer.
 #
 # The floor is deliberately not configurable.  SEC-2 says these surfaces are
 # denied "in every mode, with no setting that opens them", so there is no
@@ -55,34 +71,48 @@ from .utils.exceptions import ServerError
 # endpoint, not against a URL, so the RPC method names derived from these
 # endpoints are covered by the same entry.
 FLOOR_PREFIXES = (
-    # The developer-mode toggle. It was the only entry here until KAN-350 added
-    # the battery commands below, for a different reason -- see there.
+    # THE DEVELOPER-MODE TOGGLE IS NO LONGER HERE. Read this before putting it
+    # back, because the reason it left is not "the fuse matters less".
     #
-    # `SEC-2` as amended keeps on the floor only what an owner must not be able
-    # to consent away, because the consequence is not theirs to undo. `DEV-3`
-    # is that: enabling developer mode blows a CM4 one-time-programmable fuse,
-    # reversible in software and permanent in hardware, and it is what answers
-    # "was this machine ever unlocked?" in a warranty dispute years later. An
-    # owner may choose to open the rest of this surface. They cannot unblow a
-    # fuse, so that choice is not theirs to make.
+    # What the entry did: it denied "/server/aux/dev_mode" and everything under
+    # it to any caller that was not loopback, on the grounds that `DEV-3` blows
+    # a one-time-programmable fuse and an owner cannot unblow one. The intent
+    # was "a person has to be at the machine". The mechanism was "this request
+    # arrived from 127.0.0.1", which is a different statement, and the distance
+    # between the two is what made this the wrong place for the gate:
     #
-    # The rest of /server/aux, and all of /machine/update, left the floor with
-    # that amendment: open at Level 0 (the shipped default), denied at Level 1
-    # once `SEC-8` lands. Level 0 is a subtraction from this tuple and needs
-    # nothing else -- the entry below keeps using the same address check it
-    # always has.
+    #   * Loopback is not presence. muon-link terminates a *remote* session
+    #     onto 127.0.0.1:80, so an operator on the other side of the world
+    #     already presents as loopback here. `SEC-3` names `GATE-2` as what is
+    #     meant to keep "loopback means the panel" true, and `GATE-2` is not
+    #     built. The floor was not delivering presence to begin with.
+    #   * It denied far more than the irreversible half. Reading the state,
+    #     reading the waiver, opening a consent challenge, restoring defaults,
+    #     taking a backup and *leaving* developer mode are all under this
+    #     prefix, and none of them blows anything. `DEV-5` calls "restore safe
+    #     configuration" a single action; this made it unreachable from the
+    #     only interface that offers it.
+    #   * The alternative it named does not exist. Fluidd told a LAN caller the
+    #     mode "can only be changed at the printer"; MuonUI carries a read-only
+    #     indicator and no toggle, so there was no control at the printer to
+    #     change it with.
     #
-    # THIS NARROWING DEPENDS ON KAN-83 AND MUST NOT BE BACKPORTED WITHOUT IT.
-    # The old entry was the whole "/server/aux" prefix, and its comment gave
-    # the reason: aux_api_proxy re-exports Aux's entire OpenAPI document, and
-    # /server/aux/proxy forwarded an arbitrary `path` argument to Aux with no
-    # checks. Flooring only the toggle while that hatch is open reaches the
-    # toggle straight through the hatch. KAN-83 closed it: _handle_dynamic_proxy
-    # now matches `path` against _proxy_allowed, which is built only from routes
-    # whose Aux path contains `{...}`. /dev_mode has no path parameters, so it
-    # is a static endpoint and the proxy cannot address it. On any commit
-    # predating KAN-83 this tuple must stay as it was.
-    "/server/aux/dev_mode",
+    # What replaced it is a stronger gate in a better place: `dev_mode_consent`
+    # in the Aux API. Enabling needs the acknowledged current waiver *and* a
+    # single-use, TTL-bounded challenge that only the hardware can confirm, and
+    # every inconclusive answer -- absent backend, unreachable backend, unknown
+    # backend name -- is a refusal rather than a bypass. A network caller cannot
+    # manufacture that from loopback or from anywhere else. Leaving developer
+    # mode stays ungated in both places on purpose: recovery must not depend on
+    # a working knob, a reachable operator, or an attacker's cooperation.
+    #
+    # THE STANDING DEPENDENCY, now the whole of `DEV-3`'s protection:
+    # `KnobConfirmationBackend` must keep refusing until the knob/DSI firmware
+    # is wired to it. Its docstring says "Do not 'temporarily' make this return
+    # True". That sentence used to cost a defence-in-depth layer; it now costs
+    # the only one. tests/test_muon_floor.py pins the membership below and
+    # recipes/aux_api's test_dev_mode_consent.py pins the gate that took over.
+    #
     # KAN-350. The battery commands that change pack state.
     #
     # These are here for a different reason from the toggle above, and the
