@@ -62,6 +62,10 @@ class FakeAux:
         self.statuses = list(statuses or [])
         self.calls: List[str] = []
         self.fail_with: Optional[Exception] = None
+        # Separate from `fail_with`, which breaks the status reads. A printer
+        # that refuses an install answers /update/status perfectly well; it is
+        # only POST /update/install that 409s.
+        self.start_error: Optional[Exception] = None
 
     async def ota_status(self) -> Dict[str, Any]:
         self.calls.append("ota_status")
@@ -81,6 +85,8 @@ class FakeAux:
 
     async def ota_start(self) -> Dict[str, Any]:
         self.calls.append("ota_start")
+        if self.start_error is not None:
+            raise self.start_error
         return {}
 
     async def ota_commit(self) -> Dict[str, Any]:
@@ -481,3 +487,113 @@ def test_warnings_are_copied_so_callers_cannot_mutate_internal_state(cmd_helper)
     deploy.get_update_status()["warnings"].append("injected")
 
     assert "injected" not in deploy._warnings
+
+
+# --------------------------------------------------------------------------
+# KAN-216: the surface has to say why, and must not claim what did not happen
+# --------------------------------------------------------------------------
+
+COMMIT_PENDING_STATUS: Dict[str, Any] = {
+    "state": "commit_pending",
+    "current_version": "2.0.0",
+    "requires_commit": True,
+    "update_available": True,
+    "target_version": "2.1.0",
+}
+
+
+def test_an_uncommitted_system_is_explained_to_the_user(cmd_helper):
+    """`requires_commit` alone reaches no client, so it is said in prose.
+
+    Fluidd models an update as git_repo | web | zip | OSPackage and has no
+    field for this. `warnings` is the one part of the status document it
+    renders as text.
+    """
+    deploy = make_deploy(FakeAux(), cmd_helper)
+
+    deploy._map_status(COMMIT_PENDING_STATUS)
+
+    warnings = deploy.get_update_status()["warnings"]
+    assert ota_deploy.COMMIT_PENDING_WARNING in warnings
+    # Both halves, because they pull in opposite directions: the refusal
+    # invites a restart and a restart is what discards the update.
+    assert "roll it back" in ota_deploy.COMMIT_PENDING_WARNING
+    assert "no new update can be installed" in ota_deploy.COMMIT_PENDING_WARNING
+
+
+def test_a_committed_system_is_not_warned_about(cmd_helper):
+    """The negative control: this must not fire on an ordinary printer."""
+    deploy = make_deploy(FakeAux(), cmd_helper)
+
+    deploy._map_status({
+        "state": "idle",
+        "current_version": "2.0.0",
+        "requires_commit": False,
+        "update_available": False,
+    })
+
+    assert deploy.get_update_status()["warnings"] == []
+
+
+def test_the_commit_warning_is_not_repeated_by_the_poller(cmd_helper):
+    """_map_status runs once per poll, and only refresh() clears _warnings."""
+    deploy = make_deploy(FakeAux(), cmd_helper)
+
+    deploy._map_status(COMMIT_PENDING_STATUS)
+    deploy._map_status(COMMIT_PENDING_STATUS)
+    deploy._map_status(COMMIT_PENDING_STATUS)
+
+    warnings = deploy.get_update_status()["warnings"]
+    assert warnings.count(ota_deploy.COMMIT_PENDING_WARNING) == 1
+
+
+def test_a_refused_install_is_never_announced_as_started(cmd_helper, no_poll_delay):
+    """The defect this ticket was filed for.
+
+    `update()` used to notify "Starting OS image update" before calling
+    ota_start, with that call outside any try. A refusal left the claim
+    standing as the only line under a dialog Fluidd titles "Updates finished",
+    so the UI asserted the update had begun at the moment it was declined.
+    """
+    aux = FakeAux([COMMIT_PENDING_STATUS])
+    aux.start_error = FakeServerError(
+        "refusing to install while the running system requires commit", 409
+    )
+    deploy = make_deploy(aux, cmd_helper)
+
+    with pytest.raises(FakeServerError):
+        asyncio.run(deploy.update())
+
+    announced = [msg for msg, _ in cmd_helper.responses]
+    assert not any("Starting OS image update" in msg for msg in announced), (
+        f"the UI was told the update started after it was refused: {announced}"
+    )
+
+
+def test_a_refused_install_tells_the_user_the_reason(cmd_helper, no_poll_delay):
+    """Paired with the negative above, which also holds if nothing was said."""
+    aux = FakeAux([COMMIT_PENDING_STATUS])
+    aux.start_error = FakeServerError(
+        "refusing to install while the running system requires commit", 409
+    )
+    deploy = make_deploy(aux, cmd_helper)
+
+    with pytest.raises(FakeServerError):
+        asyncio.run(deploy.update())
+
+    assert any(
+        "requires commit" in msg and is_complete
+        for msg, is_complete in cmd_helper.responses
+    ), f"the refusal was not reported to the user: {cmd_helper.responses}"
+
+
+def test_an_accepted_install_still_announces_the_start(cmd_helper, no_poll_delay):
+    """Moving the announcement must not lose it on the path that works."""
+    aux = FakeAux([{"state": "idle", "current_version": "2.0.0"}])
+    deploy = make_deploy(aux, cmd_helper)
+
+    assert asyncio.run(deploy.update()) is True
+
+    assert any("Starting OS image update" in msg
+               for msg, _ in cmd_helper.responses)
+    assert "ota_start" in aux.calls
