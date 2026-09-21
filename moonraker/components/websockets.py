@@ -16,6 +16,7 @@ from ..common import (
     TransportType,
 )
 from ..utils import ServerError, parse_ip_address
+from ..utils.real_ip import validate_real_ip_header
 
 # Annotation imports
 from typing import (
@@ -320,6 +321,7 @@ class WebSocket(WebSocketHandler, BaseRemoteConnection):
 
     # Check Authorized User
     async def prepare(self) -> None:
+        validate_real_ip_header(self.request.headers)
         max_conns = self.settings["max_websocket_connections"]
         if self.__class__.connection_count >= max_conns:
             raise self.server.error(
@@ -468,6 +470,7 @@ class BridgeSocket(WebSocketHandler):
 
     # Check Authorized User
     async def prepare(self) -> None:
+        validate_real_ip_header(self.request.headers)
         max_conns = self.settings["max_websocket_connections"]
         if WebSocket.connection_count >= max_conns:
             raise self.server.error(

@@ -24,6 +24,7 @@ from tornado.http1connection import HTTP1Connection
 from tornado.httpserver import HTTPServer
 from tornado.log import access_log
 from ..utils import ServerError, source_info, parse_ip_address
+from ..utils.real_ip import validate_real_ip_header
 from ..common import (
     JsonRPC,
     WebRequest,
@@ -495,6 +496,7 @@ class AuthorizedRequestHandler(tornado.web.RequestHandler):
             _set_cors_headers(self)
 
     async def prepare(self) -> None:
+        validate_real_ip_header(self.request.headers)
         auth: AuthComp = self.server.lookup_component('authorization', None)
         if auth is not None:
             origin: Optional[str] = self.request.headers.get("Origin")
@@ -552,6 +554,7 @@ class AuthorizedFileHandler(tornado.web.StaticFileHandler):
             _set_cors_headers(self)
 
     async def prepare(self) -> None:
+        validate_real_ip_header(self.request.headers)
         auth: AuthComp = self.server.lookup_component('authorization', None)
         if auth is not None:
             origin: Optional[str] = self.request.headers.get("Origin")
@@ -1094,6 +1097,9 @@ class RedirectHandler(AuthorizedRequestHandler):
 class WelcomeHandler(tornado.web.RequestHandler):
     def initialize(self) -> None:
         self.server: Server = self.settings['server']
+
+    async def prepare(self) -> None:
+        validate_real_ip_header(self.request.headers)
 
     async def get(self) -> None:
         summary: List[str] = []
