@@ -27,6 +27,24 @@ enable_object_processing: True
 check_klipper_config_path: False
 config_defaults_path: ${KLIPPER_DEFAULT_CONFIGS_DIR}
 config_custom_config_path: /home/printer_data/devmode_custom_config
+# KAN-371. Read this as "the developer-mode tree may be edited WHILE DEVELOPER
+# MODE IS ON", not as "this root is writable". The root named above is the
+# developer-mode clone, and file_manager adds or drops write access to match
+# the live state of the mode -- so with this True and developer mode off, the
+# root is still read-only.
+#
+# It has to be set for developer mode to do anything at all. KAN-291 made the
+# grant opt-in, for a good reason, and no image then opted in -- so a printer
+# somebody had deliberately unlocked still served its configuration files
+# padlocked and read-only in Fluidd, which is the whole of what developer mode
+# is for.
+#
+# Leaving it False looks like the safe choice and is the broken one: nothing
+# else in the image opens this tree, so False ships developer mode inert. The
+# exposure KAN-291 closed stays closed by the mode being off, which is the
+# condition that actually describes it. A literal True is required -- getboolean
+# raises on an empty value rather than falling back to the default.
+enable_custom_config_write_access: True
 
 [authorization]
 # KAN-68 / KAN-191.
