@@ -44,6 +44,49 @@ def _path_pattern(fast_path: str) -> "re.Pattern[str]":
     return re.compile("^" + "/".join(parts) + "$")
 
 
+def _aux_error_message(resp: Any) -> Optional[str]:
+    """The Aux API's own explanation of a failed response, if it gave one.
+
+    Every error on the Aux API's OTA routes is shaped by
+    `update_routes._http_error` as
+
+        {"detail": {"code": "invalid_state", "message": "<why>"}}
+
+    and `raise_for_status()` with no argument throws all of that away: Tornado's
+    HTTPError carries only the reason phrase, so a refusal the Aux API took
+    care to explain reaches Fluidd as the bare word "Conflict". That is
+    unfixable in a client, because the client is never sent the body.
+
+    The body has not gone anywhere -- http_client fetches with
+    `raise_error=False` and keeps `resp.body` whatever the status -- so this is
+    a read of something already in hand, not a second request.
+
+    Returns None when there is nothing better to say, which leaves
+    `raise_for_status()`'s own message in place. Three shapes are handled
+    because the Aux API uses all three: FastAPI's own validation errors are a
+    LIST of detail objects, `HTTPException(detail="...")` is a plain string,
+    and the Muon routes use the dict above.
+    """
+    try:
+        payload = resp.json()
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    detail = payload.get("detail")
+    if isinstance(detail, str):
+        return detail.strip() or None
+    if isinstance(detail, dict):
+        message = detail.get("message")
+        return message.strip() or None if isinstance(message, str) else None
+    if isinstance(detail, list):
+        # FastAPI validation errors: take the first one that names itself.
+        for item in detail:
+            if isinstance(item, dict) and isinstance(item.get("msg"), str):
+                return item["msg"].strip() or None
+    return None
+
+
 def _has_encoded_separator(path: str) -> bool:
     """True if percent-decoding `path` would introduce a new separator.
 
@@ -285,7 +328,7 @@ class AuxAutoProxy:
                 # below this, so it always answers before we give up.
                 request_timeout=60.,
             )
-            resp.raise_for_status()
+            resp.raise_for_status(_aux_error_message(resp))
 
             # Return JSON or raw
             with contextlib.suppress(Exception):
@@ -343,7 +386,7 @@ class AuxAutoProxy:
             connect_timeout=3.,
             request_timeout=8.,
         )
-        resp.raise_for_status()
+        resp.raise_for_status(_aux_error_message(resp))
         return resp.json()
 
     async def _openapi_handler(self, webreq):
@@ -445,7 +488,7 @@ class AuxAutoProxy:
             url, headers=self._auth_headers(),
             connect_timeout=3., request_timeout=8.
         )
-        resp.raise_for_status()
+        resp.raise_for_status(_aux_error_message(resp))
         with contextlib.suppress(Exception):
             return resp.json()
         return resp.content
@@ -475,7 +518,7 @@ class AuxAutoProxy:
             connect_timeout=3.0,
             request_timeout=15.0,
         )
-        resp.raise_for_status()
+        resp.raise_for_status(_aux_error_message(resp))
         try:
             return resp.json()
         except Exception:
