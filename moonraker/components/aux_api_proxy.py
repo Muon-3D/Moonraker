@@ -4,14 +4,18 @@
 #     [aux_api_proxy]
 #
 # ──────────────────────────────────────────────────────────────────────────
-import asyncio, json, logging, os, re, contextlib
+import json
+import logging
+import os
+import re
+import contextlib
 from pathlib import Path
 from typing import Dict, Any, Callable, Optional
 from urllib.parse import unquote, urlencode
 
-FASTAPI_ROOT = "http://127.0.0.1:6789"         #  loopback-only Aux API bind
-OPENAPI_PATH = "/openapi.json"                 #  FastAPI default
-MOON_PREFIX  = "/server/aux"                   #  Moonraker namespace
+FASTAPI_ROOT = "http://127.0.0.1:6789"  # loopback-only Aux API bind
+OPENAPI_PATH = "/openapi.json"  # FastAPI default
+MOON_PREFIX = "/server/aux"  # Moonraker namespace
 
 # The Aux API rejects every unauthenticated request. The shared secret is
 # reissued into tmpfs on each boot by aux_api_token.service and is readable by
@@ -77,16 +81,18 @@ FRIENDLY_NAME_KEY = "friendly_name"
 MAX_NAME_LENGTH = 32
 
 # ──────────────────────────────────────────────────────────────────────────
+
+
 class AuxAutoProxy:
     def __init__(self, config):
-        self.server      = config.get_server()
+        self.server = config.get_server()
         self.http_client = self.server.lookup_component("http_client")
-        self.log         = logging.getLogger("wifi_autoproxy")
+        self.log = logging.getLogger("wifi_autoproxy")
         self._token: Optional[str] = None
         # ID-3: the owner's rename. `muon` rather than a Fluidd-owned
         # namespace, because the name belongs to the printer and has to
         # outlive whichever interface set it.
-        self.database    = self.server.lookup_component("database")
+        self.database = self.server.lookup_component("database")
         self.database.register_local_namespace(MUON_NAMESPACE)
 
     # Moonraker calls this coroutine right after all components load
@@ -130,9 +136,9 @@ class AuxAutoProxy:
         # invalidated, so an OTA that changed the Aux routes would keep
         # serving the old ones. The fetch below is a localhost request made
         # once at startup; there is nothing here worth caching.
-        url  = f"{FASTAPI_ROOT}{OPENAPI_PATH}"
+        url = f"{FASTAPI_ROOT}{OPENAPI_PATH}"
         self.log.info(f"Fetching OpenAPI from {url}")
-        rsp  = await self.http_client.get(
+        rsp = await self.http_client.get(
             url, headers=self._auth_headers(),
             connect_timeout=3., request_timeout=6.
         )
@@ -160,7 +166,8 @@ class AuxAutoProxy:
         # interface.  SEC-2 keeps /server/aux/dev_mode on the floor, and
         # `is_floor_endpoint` matches that prefix and everything under it, so
         # *reading* the state is denied to the network as well as setting it.
-        # Publish the state somewhere that is not on the floor.  GET only, no request body
+        # Publish the state somewhere that is not on the floor. GET only, with no
+        # request body
         # forwarded, and it calls Aux through the internal helper rather than
         # re-exporting the route -- so this can never become a way to *change*
         # the mode, whatever Aux grows later.
@@ -239,42 +246,44 @@ class AuxAutoProxy:
     # ---------- factory for fixed-path handlers -------------------------
     def _make_static_handler(self, fast_path: str) -> Callable:
         async def handler(webreq):
-            method = webreq.get_action()           # e.g. "POST"
-            args   = dict(webreq.get_args())       # all params
-            url    = f"{FASTAPI_ROOT}{fast_path}"
+            method = webreq.get_action()  # e.g. "POST"
+            args = dict(webreq.get_args())  # all params
+            url = f"{FASTAPI_ROOT}{fast_path}"
 
             # Look up in your cached spec whether this op has a requestBody
-            op       = self._spec["paths"][fast_path].get(method.lower(), {})
+            op = self._spec["paths"][fast_path].get(method.lower(), {})
             has_body = "requestBody" in op
 
             # Build URL + body + headers
             if has_body:
                 # JSON endpoint → serialize into the body
-                body    = json.dumps(args or {})
+                body = json.dumps(args or {})
                 headers = {"Content-Type": "application/json"}
             else:
                 # No JSON expected → preserve as query
                 if args:
                     url += "?" + urlencode(args, doseq=True)
                 # Tornado wants a non-None POST body, even if empty
-                body    = "" if method in ("POST","PUT","PATCH") else None
+                body = "" if method in ("POST", "PUT", "PATCH") else None
                 headers = {}
 
             # Debug log
-            self.log.debug(f"Proxying → {method} {url!r}  headers={headers!r} body={body!r}")
+            self.log.debug(
+                f"Proxying → {method} {url!r} headers={headers!r} body={body!r}"
+            )
 
             # Forward
             resp = await self.http_client.request(
-                method          = method,
-                url             = url,
-                body            = body,
-                headers         = self._auth_headers(headers),
-                connect_timeout = 3.,
+                method=method,
+                url=url,
+                body=body,
+                headers=self._auth_headers(headers),
+                connect_timeout=3.,
                 # Wi-Fi association + 4-way handshake + DHCP routinely runs
                 # 8-30s on this board, so an 8s budget here turned successful
                 # connects into a 500. aux_api bounds its own nmcli call well
                 # below this, so it always answers before we give up.
-                request_timeout = 60.,
+                request_timeout=60.,
             )
             resp.raise_for_status()
 
@@ -283,16 +292,16 @@ class AuxAutoProxy:
                 return resp.json()
             return webreq.create_raw_response(
                 resp.content,
-                code    = resp.status_code,
-                headers = resp.headers,
+                code=resp.status_code,
+                headers=resp.headers,
             )
 
         return handler
 
     # ---------- generic proxy for paths containing {...} ----------------
     async def _handle_dynamic_proxy(self, webreq):
-        path  = webreq.get_str("path")                   # e.g. /wifi/show/mySSID
-        verb  = webreq.get_str("method", "GET").upper()
+        path = webreq.get_str("path")  # e.g. /wifi/show/mySSID
+        verb = webreq.get_str("method", "GET").upper()
         if verb not in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
             raise self.server.error("Invalid HTTP verb", 400)
 
@@ -317,7 +326,7 @@ class AuxAutoProxy:
             self.log.warning("Rejected proxy verb %s on %r", verb, path)
             raise self.server.error("Invalid proxy method for path", 405)
 
-        url   = f"{FASTAPI_ROOT}{path}"
+        url = f"{FASTAPI_ROOT}{path}"
         query = webreq.get("query", None)
         if query and verb in {"GET", "DELETE"}:
             url += f"?{query}"
@@ -427,7 +436,6 @@ class AuxAutoProxy:
         # path and this endpoint is readable from the LAN; DEV-4 needs the
         # banner, not the path. The panel reads the full state over loopback.
         return {"enabled": bool(state.get("enabled", False))}
-    
 
 
     # ===== Internal aux-api helpers for other Moonraker components =====
@@ -443,41 +451,40 @@ class AuxAutoProxy:
         return resp.content
 
     async def post(self, path: str, body: Any | None = None) -> Any:
-            url = f"{FASTAPI_ROOT}{path}"
+        url = f"{FASTAPI_ROOT}{path}"
 
-            # Prepare body + headers the way Moonraker's http_client expects
-            headers = None
-            raw_body = None
+        # Prepare body + headers the way Moonraker's http_client expects.
+        headers = None
+        raw_body: str | bytes | bytearray | None = None
 
-            if isinstance(body, (dict, list)):
-                import json as _json
-                raw_body = _json.dumps(body)
-                headers = {"Content-Type": "application/json"}
-            elif isinstance(body, (bytes, bytearray)):
-                raw_body = body
-            elif isinstance(body, str):
-                raw_body = body
-            else:
-                # Tornado wants a non-None body for POST/PUT/PATCH; empty string is fine
-                raw_body = ""
+        if isinstance(body, (dict, list)):
+            raw_body = json.dumps(body)
+            headers = {"Content-Type": "application/json"}
+        elif isinstance(body, (bytes, bytearray)):
+            raw_body = body
+        elif isinstance(body, str):
+            raw_body = body
+        else:
+            # Tornado wants a non-None body for POST/PUT/PATCH; empty string is fine.
+            raw_body = ""
 
-            resp = await self.http_client.post(
-                url,
-                body=raw_body,
-                headers=self._auth_headers(headers),
-                connect_timeout=3.0,
-                request_timeout=15.0,
-            )
-            resp.raise_for_status()
-            try:
-                return resp.json()
-            except Exception:
-                return resp.content
+        resp = await self.http_client.post(
+            url,
+            body=raw_body,
+            headers=self._auth_headers(headers),
+            connect_timeout=3.0,
+            request_timeout=15.0,
+        )
+        resp.raise_for_status()
+        try:
+            return resp.json()
+        except Exception:
+            return resp.content
 
     # OTA convenience wrappers
     async def ota_status(self) -> Any:
         return await self.get("/update/status")
-    
+
     async def ota_check_server(self) -> Any:
         return await self.post("/update/check", {"wait": False})
 
@@ -487,7 +494,6 @@ class AuxAutoProxy:
 
     async def ota_commit(self) -> Any:
         return await self.post("/update/commit", {})
-        
 
 # Moonraker entry-point
 def load_component(config):
