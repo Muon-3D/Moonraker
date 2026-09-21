@@ -25,6 +25,16 @@ ETA_MIN_DPCT = 1.0  # require >=1.0% movement to trust ETA
 ETA_SMOOTHING = 0.25  # 0..1, higher = more responsive, lower = steadier
 ETA_MAX_JUMP_SECS = 45.0   # clamp per-update ETA change (seconds)
 
+# Shown whenever the Aux API reports `requires_commit`, which means the running
+# system is an update Rugix has not committed: the active boot group is not the
+# default one. Two consequences, and the user is told both because they pull in
+# opposite directions -- "no new update can be installed" invites a restart, and
+# a restart is exactly what throws this one away.
+COMMIT_PENDING_WARNING = (
+    "This printer is running an update that has not been committed yet. "
+    "Restarting now would roll it back, and no new update can be installed "
+    "until this one is committed."
+)
 
 class OtaDeploy(BaseDeploy):
     """
@@ -74,9 +84,28 @@ class OtaDeploy(BaseDeploy):
 
     async def update(self) -> bool:
         """Start an image update with progress and a preemptive reboot notice."""
-        self.notify_status("Starting OS image update… device may reboot.")
         aux = self._aux()
-        await aux.ota_start()
+        # Announced only once the Aux API has ACCEPTED the install, and the
+        # refusal is announced too.
+        #
+        # This used to say "Starting OS image update" BEFORE asking, with the
+        # call outside any try. `start_install` refuses a printer whose running
+        # system is uncommitted, and the refusal then left that sentence
+        # standing as the only line under a dialog Fluidd titles "Updates
+        # finished" -- the UI asserting the update had begun at the moment it
+        # was declined. A user who reads that reasonably power-cycles the
+        # printer, which is the one action that discards the running slot.
+        #
+        # The exception is re-raised unchanged: update_manager still has to
+        # report the failure to the client. This only makes sure the dialog
+        # says which way it went.
+        try:
+            await aux.ota_start()
+        except Exception as e:
+            self.notify_status(f"✖ Could not start the update: {e}",
+                               is_complete=True)
+            raise
+        self.notify_status("Starting OS image update… device may reboot.")
 
         last_progress: Optional[float] = None
         last_announced_pct: Optional[float] = None
@@ -370,6 +399,23 @@ class OtaDeploy(BaseDeploy):
         else:
             self._target = self._current
         self._requires_commit = bool(s.get("requires_commit", False))
+        if self._requires_commit:
+            # `warnings` is the only field of this status document that a
+            # client renders as prose. Fluidd models an update as
+            # git_repo | web | zip | OSPackage, none of which has a notion of
+            # an uncommitted system, so `requires_commit` above is published
+            # and read by nobody: the UPDATE button is offered in a state the
+            # Aux API is known to refuse, and pressing it is the only way to
+            # find out.
+            #
+            # Saying it here needs no client change and puts the sentence in
+            # the row the user is already looking at. Both halves matter: the
+            # refusal is the visible one, but the rollback is the one that
+            # loses work, and nothing else on the printer mentions it today
+            # (MuonUI renders `status.rollback`, which the Aux API does not
+            # yet produce -- MuonOS#233).
+            if COMMIT_PENDING_WARNING not in self._warnings:
+                self._warnings.append(COMMIT_PENDING_WARNING)
         prog = s.get("progress", None)
         if prog is None and isinstance(s.get("install"), dict):
             prog = s["install"].get("progress")

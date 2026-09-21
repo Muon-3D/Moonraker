@@ -681,3 +681,194 @@ def test_a_percent_encoded_value_that_is_not_a_separator_still_works():
 
     assert client.last["url"].endswith("/wifi/show/my%20network")
 
+
+
+# --------------------------------------------------------------------------
+# KAN-216: the Aux API's explanation survives the proxy
+# --------------------------------------------------------------------------
+#
+# These drive the module-level `_aux_error_message` directly. That is not a
+# convenience: the rest of this file builds an AuxAutoProxy, and its
+# constructor has needed a `database` component since ID-3 landed, which the
+# fake server here does not provide -- so 42 of the 44 tests in this file
+# error in __init__ before reaching their subject, on `master` as much as on
+# this branch. Testing a free function keeps this coverage out of that hole.
+
+class FakeJsonResponse:
+    """Only the part of HttpResponse that _aux_error_message touches.
+
+    `json()` raising is the realistic failure: Moonraker's HttpResponse parses
+    `self._result` on demand, and an error page that is not JSON -- nginx's
+    502, say -- raises rather than returning None.
+    """
+
+    def __init__(self, payload: Any = None, raises: bool = False) -> None:
+        self._payload = payload
+        self._raises = raises
+
+    def json(self) -> Any:
+        if self._raises:
+            raise ValueError("not JSON")
+        return self._payload
+
+
+def test_the_aux_apis_own_message_is_recovered():
+    """The shape every OTA route uses: update_routes._http_error."""
+    resp = FakeJsonResponse({
+        "detail": {
+            "code": "invalid_state",
+            "message": "refusing to install while the running system requires commit",
+        }
+    })
+
+    assert aux_api_proxy._aux_error_message(resp) == (
+        "refusing to install while the running system requires commit"
+    )
+
+
+def test_a_plain_string_detail_is_recovered():
+    """HTTPException(detail="...") -- FastAPI's own default shape."""
+    resp = FakeJsonResponse({"detail": "printer is busy"})
+
+    assert aux_api_proxy._aux_error_message(resp) == "printer is busy"
+
+
+def test_a_validation_error_list_is_recovered():
+    """FastAPI answers a 422 with a LIST of detail objects, not a dict."""
+    resp = FakeJsonResponse({
+        "detail": [
+            {"loc": ["body", "url"], "msg": "field required", "type": "value_error"}
+        ]
+    })
+
+    assert aux_api_proxy._aux_error_message(resp) == "field required"
+
+
+@pytest.mark.parametrize("payload", [
+    None,                                   # no body at all
+    {},                                     # JSON, no detail
+    {"detail": {}},                         # detail, no message
+    {"detail": {"message": "   "}},         # message, but only whitespace
+    {"detail": {"message": 42}},            # message, wrong type
+    {"detail": []},                         # empty validation list
+    {"detail": [{"loc": ["body"]}]},        # validation entry with no msg
+    {"detail": ""},                         # empty string detail
+    ["not", "an", "object"],                # JSON, but not a document
+])
+def test_nothing_better_to_say_leaves_the_default_message_alone(payload):
+    """None means "do not override", not "the message is None".
+
+    raise_for_status(None) keeps Tornado's own reason phrase, so every shape
+    this cannot read degrades to exactly the behaviour before this change --
+    never to a blank or a crash on an already-failing request.
+    """
+    assert aux_api_proxy._aux_error_message(FakeJsonResponse(payload)) is None
+
+
+def test_a_body_that_is_not_json_is_not_an_error():
+    """An error page from something in front of the Aux API.
+
+    This function only ever runs on a request that has already failed, so
+    raising here would replace a useful failure with a confusing one.
+    """
+    assert aux_api_proxy._aux_error_message(
+        FakeJsonResponse(raises=True)
+    ) is None
+
+
+# The wiring, not just the helper. `get` and `post` are driven UNBOUND against
+# a stub self, because AuxAutoProxy.__init__ is what breaks the rest of this
+# file -- the method bodies themselves are fine to exercise. The response is a
+# REAL HttpResponse carrying a REAL tornado HTTPError, so this pins the
+# integration with Moonraker's own raise_for_status rather than a fake of it.
+
+class _StubProxySelf:
+    """Only what get()/post() touch on self."""
+
+    def __init__(self, response: Any) -> None:
+        self.http_client = _StubHttpClient(response)
+
+    def _auth_headers(self, headers: Optional[Dict[str, Any]] = None
+                      ) -> Dict[str, Any]:
+        return dict(headers or {})
+
+
+class _StubHttpClient:
+    def __init__(self, response: Any) -> None:
+        self._response = response
+
+    async def get(self, *args: Any, **kwargs: Any) -> Any:
+        return self._response
+
+    async def post(self, *args: Any, **kwargs: Any) -> Any:
+        return self._response
+
+
+def _refused_response() -> Any:
+    from tornado.httpclient import HTTPError as TornadoHTTPError
+    from tornado.httputil import HTTPHeaders
+
+    from moonraker.components.http_client import HttpResponse
+
+    body = json.dumps({
+        "detail": {
+            "code": "invalid_state",
+            "message": "refusing to install while the running system requires commit",
+        }
+    }).encode()
+    # message=None is the real shape: tornado fills in the reason phrase, which
+    # is where the bare word "Conflict" came from.
+    error = TornadoHTTPError(409)
+    return HttpResponse(
+        "http://127.0.0.1:6789/update/install",
+        "http://127.0.0.1:6789/update/install",
+        409, body, HTTPHeaders(), error,
+    )
+
+
+def test_post_raises_with_the_aux_apis_message_not_the_reason_phrase():
+    """The defect, end to end through the real method.
+
+    Before this change the assertion below held the string "Conflict": the
+    body was dropped by raise_for_status() and no client could recover it.
+    """
+    from moonraker.utils import ServerError
+
+    stub = _StubProxySelf(_refused_response())
+
+    with pytest.raises(ServerError) as excinfo:
+        asyncio.run(AuxAutoProxy.post(stub, "/update/install", {}))
+
+    assert "requires commit" in str(excinfo.value)
+    # The status code still has to be the Aux API's, not a flattened 500 --
+    # update_manager and the clients branch on it.
+    assert excinfo.value.status_code == 409
+
+
+def test_get_raises_with_the_aux_apis_message_too():
+    """Same path, the other verb: /update/status is a GET."""
+    from moonraker.utils import ServerError
+
+    stub = _StubProxySelf(_refused_response())
+
+    with pytest.raises(ServerError) as excinfo:
+        asyncio.run(AuxAutoProxy.get(stub, "/update/status"))
+
+    assert "requires commit" in str(excinfo.value)
+
+
+def test_a_successful_response_is_returned_and_not_raised():
+    """The negative control: nothing above may turn a 200 into an error."""
+    from tornado.httputil import HTTPHeaders
+
+    from moonraker.components.http_client import HttpResponse
+
+    ok = HttpResponse(
+        "http://127.0.0.1:6789/update/status",
+        "http://127.0.0.1:6789/update/status",
+        200, json.dumps({"state": "idle"}).encode(), HTTPHeaders(), None,
+    )
+
+    assert asyncio.run(AuxAutoProxy.get(_StubProxySelf(ok), "/update/status")) == {
+        "state": "idle"
+    }
