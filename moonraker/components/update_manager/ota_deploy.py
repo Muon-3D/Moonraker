@@ -20,10 +20,11 @@ REBOOT_SAFETY_BAND = 1.0        # start “near end” at (REBOOT_NOTICE_PCT - b
 NEAR_END_MIN_SLEEP = 0.2        # tighten polling near the end
 REBOOT_PRENOTICE_SECS = 2.5     # if ETA < this, announce reboot now
 
-ETA_WINDOW_SECS   = 30.0   # history used for slope fit
-ETA_MIN_DPCT      = 1.0    # require >=1.0% movement to trust ETA
-ETA_SMOOTHING     = 0.25   # 0..1, higher = more responsive, lower = steadier
+ETA_WINDOW_SECS = 30.0  # history used for slope fit
+ETA_MIN_DPCT = 1.0  # require >=1.0% movement to trust ETA
+ETA_SMOOTHING = 0.25  # 0..1, higher = more responsive, lower = steadier
 ETA_MAX_JUMP_SECS = 45.0   # clamp per-update ETA change (seconds)
+
 
 class OtaDeploy(BaseDeploy):
     """
@@ -72,7 +73,7 @@ class OtaDeploy(BaseDeploy):
             self._save_state()
 
     async def update(self) -> bool:
-        """Start an image update; adaptive polling with spinner/bar/ETA and preemptive reboot notice."""
+        """Start an image update with progress and a preemptive reboot notice."""
         self.notify_status("Starting OS image update… device may reboot.")
         aux = self._aux()
         await aux.ota_start()
@@ -87,9 +88,7 @@ class OtaDeploy(BaseDeploy):
         # ETA over a short rolling window (keeps it responsive)
         progress_history: list[tuple[float, float]] = []  # [(time, pct)]
 
-        # Spinner + progress bar
-        spinner = ['|', '/', '-', '\\']
-        spin_idx = 0
+        # Progress bar
         bar_len = 20
 
         smoothed_eta_secs: Optional[float] = None
@@ -132,13 +131,20 @@ class OtaDeploy(BaseDeploy):
                     if err_msg and st == "failed":
                         break
 
-                    # If we see 'committing', we know reboot is imminent—announce before leaving
+                    # A committing update will reboot imminently, so announce first.
                     if st == "committing" and not reboot_announced:
-                        self.notify_status("⏳ Update installed. Preparing to reboot into the new system…", is_complete=True)
+                        self.notify_status(
+                            "⏳ Update installed. Preparing to reboot into the new "
+                            "system…",
+                            is_complete=True,
+                        )
                         return True
 
                     if st == "commit_pending":
-                        self.notify_status("✔ Update booted. Commit verification is pending.", is_complete=True)
+                        self.notify_status(
+                            "✔ Update booted. Commit verification is pending.",
+                            is_complete=True,
+                        )
                         return True
 
                     # Terminal states handled cleanly
@@ -149,18 +155,23 @@ class OtaDeploy(BaseDeploy):
                     if st == "installing" and pct is not None:
                         # Maintain short ETA window (15s)
                         progress_history.append((now, pct))
-                        progress_history = [(t, p) for (t, p) in progress_history if now - t <= 15.0]
+                        progress_history = [
+                            (t, p) for t, p in progress_history if now - t <= 15.0
+                        ]
 
                         # Compute ETA if possible
                         eta_secs: Optional[float] = None
 
                         # keep last N seconds of samples
                         progress_history.append((now, pct))
-                        progress_history = [(t, p) for (t, p) in progress_history if now - t <= ETA_WINDOW_SECS]
+                        progress_history = [
+                            (t, p)
+                            for t, p in progress_history
+                            if now - t <= ETA_WINDOW_SECS
+                        ]
 
                         if len(progress_history) >= 3:
-                            # linear regression of pct over time → slope (pct/sec)
-                            import math
+                            # Linear regression of pct over time → slope (pct/sec).
                             n = len(progress_history)
                             sum_t = sum(t for t, _ in progress_history)
                             sum_p = sum(p for _, p in progress_history)
@@ -168,8 +179,11 @@ class OtaDeploy(BaseDeploy):
                             sum_tp = sum(t*p for t, p in progress_history)
                             denom = (n * sum_tt - sum_t * sum_t)
                             if denom != 0:
-                                slope = (n * sum_tp - sum_t * sum_p) / denom  # % per second
-                                moved = progress_history[-1][1] - progress_history[0][1]
+                                slope = (n * sum_tp - sum_t * sum_p) / denom
+                                moved = (
+                                    progress_history[-1][1]
+                                    - progress_history[0][1]
+                                )
                                 if slope > 0 and moved >= ETA_MIN_DPCT:
                                     remaining = max(0.0, 100.0 - pct)
                                     inst_eta = remaining / slope
@@ -178,54 +192,84 @@ class OtaDeploy(BaseDeploy):
                                         smoothed_eta_secs = inst_eta
                                     else:
                                         prev = smoothed_eta_secs
-                                        candidate = prev * (1.0 - ETA_SMOOTHING) + inst_eta * ETA_SMOOTHING
+                                        candidate = (
+                                            prev * (1.0 - ETA_SMOOTHING)
+                                            + inst_eta * ETA_SMOOTHING
+                                        )
                                         # clamp per-update jump
-                                        delta = max(-ETA_MAX_JUMP_SECS, min(ETA_MAX_JUMP_SECS, candidate - prev))
+                                        delta = max(
+                                            -ETA_MAX_JUMP_SECS,
+                                            min(ETA_MAX_JUMP_SECS, candidate - prev),
+                                        )
                                         smoothed_eta_secs = prev + delta
                                     eta_secs = smoothed_eta_secs
 
-                        # PREEMPTIVE REBOOT NOTICE: if ETA says reboot is < X seconds away,
-                        # announce now so the line lands before Moonraker goes down.
-                        if eta_secs is not None and eta_secs <= REBOOT_PRENOTICE_SECS and not reboot_announced:
+                        # Announce before Moonraker goes down when reboot is near.
+                        if (
+                            eta_secs is not None
+                            and eta_secs <= REBOOT_PRENOTICE_SECS
+                            and not reboot_announced
+                        ):
                             reboot_announced = True
-                            self.notify_status("⏳ Update installed. Preparing to reboot into the new system…", is_complete=True)
+                            self.notify_status(
+                                "⏳ Update installed. Preparing to reboot into the new "
+                                "system…",
+                                is_complete=True,
+                            )
                             return True
 
-                        # Secondary threshold safety: if we actually hit ≥ REBOOT_NOTICE_PCT, announce too.
+                        # Also announce once the reboot threshold is reached.
                         if pct >= REBOOT_NOTICE_PCT and not reboot_announced:
                             reboot_announced = True
-                            self.notify_status("⏳ Update installed. Preparing to reboot into the new system…", is_complete=True)
+                            self.notify_status(
+                                "⏳ Update installed. Preparing to reboot into the new "
+                                "system…",
+                                is_complete=True,
+                            )
                             return True
 
                         # Otherwise, keep logging styled progress (throttled)
-                        if (last_announced_pct is None) or (pct - last_announced_pct >= PROGRESS_ANNOUNCE_STEP):
-                            spin_char = spinner[spin_idx % len(spinner)]
-                            spin_idx += 1
+                        if (
+                            last_announced_pct is None
+                            or pct - last_announced_pct >= PROGRESS_ANNOUNCE_STEP
+                        ):
                             filled_len = int(bar_len * pct / 100)
                             bar = "█" * filled_len + "·" * (bar_len - filled_len)
 
                             eta_str = ""
                             if eta_secs is not None and eta_secs > 5:
                                 mins, secs = divmod(int(eta_secs), 60)
-                                eta_str = f" (≈{mins}m {secs:02d}s)" if mins > 0 else f" (≈{secs}s)"
+                                eta_str = (
+                                    f" (≈{mins}m {secs:02d}s)"
+                                    if mins > 0
+                                    else f" (≈{secs}s)"
+                                )
 
                             self.notify_status(f"Installing {bar} {pct:5.1f}%{eta_str}")
                             last_announced_pct = pct
 
                     # Stall detection (covers long gaps or comms loss)
-                    if asyncio.get_event_loop().time() - last_change_time > PROGRESS_IDLE_TIMEOUT:
-                        self._warnings.append("No progress reported for a while; assuming reboot or stall.")
+                    if (
+                        asyncio.get_event_loop().time() - last_change_time
+                        > PROGRESS_IDLE_TIMEOUT
+                    ):
+                        self._warnings.append(
+                            "No progress reported for a while; assuming reboot "
+                            "or stall."
+                        )
                         break
 
-                    # Near-end: tighten polling so we don’t miss the reboot window
-                    if (last_progress is not None) and (last_progress >= (REBOOT_NOTICE_PCT - REBOOT_SAFETY_BAND)):
+                    # Tighten polling near the end to avoid missing the reboot window.
+                    if (
+                        last_progress is not None
+                        and last_progress >= REBOOT_NOTICE_PCT - REBOOT_SAFETY_BAND
+                    ):
                         await asyncio.sleep(min(NEAR_END_MIN_SLEEP, POLL_SECS))
                     else:
                         await asyncio.sleep(POLL_SECS)
 
                 except Exception as e:
-                    # Don’t emit anything here—Moonraker may go down with the reboot.
-                    # Just do bounded retries; if we were near end, we likely already pre-announced.
+                    # Keep retries bounded; Moonraker may go down with the reboot.
                     consecutive_errors += 1
                     if consecutive_errors > MAX_CONSECUTIVE_ERRORS:
                         self._warnings.append(f"Lost contact with OTA service: {e}")
@@ -248,11 +292,17 @@ class OtaDeploy(BaseDeploy):
             raise self.server.error(err_msg or "OTA failed")
 
         if st == "installing":
-            # We didn’t pre-announce but stopped (stall/timeout); be transparent:
-            self.notify_status("⏳ Update still in progress… device may reboot soon.", is_complete=False)
+            # We did not pre-announce but stopped (stall/timeout); be transparent.
+            self.notify_status(
+                "⏳ Update still in progress… device may reboot soon.",
+                is_complete=False,
+            )
         else:
             # idle/committing, or we timed out after good progress
-            self.notify_status("✔ Update initiated. The device may reboot to finish installation.", is_complete=True)
+            self.notify_status(
+                "✔ Update initiated. The device may reboot to finish installation.",
+                is_complete=True,
+            )
 
         return True
 
@@ -314,7 +364,7 @@ class OtaDeploy(BaseDeploy):
         # Map AUX API → fields the UI uses
         self._state = (s.get("state") or "").lower()
         self._current = s.get("current_version") or self._current
-        # Only show target when update_available, else keep current to avoid false “update”
+        # Show the target only when an update is available.
         if s.get("update_available"):
             self._target = s.get("target_version") or self._target
         else:

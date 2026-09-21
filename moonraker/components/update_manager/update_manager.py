@@ -96,8 +96,12 @@ class UpdateManager:
         self.updaters: Dict[str, BaseDeploy] = {}
         if config.getboolean('enable_system_updates', True):
             self.updaters['system'] = PackageDeploy(config)
-        self._enable_moonraker_updates = config.getboolean('enable_moonraker_updates', True)
-        self._enable_klipper_updates   = config.getboolean('enable_klipper_updates', True)
+        self._enable_moonraker_updates = config.getboolean(
+            'enable_moonraker_updates', True
+        )
+        self._enable_klipper_updates = config.getboolean(
+            'enable_klipper_updates', True
+        )
 
         if self._enable_moonraker_updates:
             mcfg = self.app_config["moonraker"]
@@ -533,7 +537,7 @@ class UpdateManager:
                 self.cmd_helper.clear_update_info()
         return "ok"
 
-    def _handle_commit(self, web_request: WebRequest) -> str:
+    async def _handle_commit(self, web_request: WebRequest) -> str:
         if self.kconn.is_printing():
             raise self.server.error("Commit Refused: Klippy is printing")
         app: str = web_request.get_str('name')
@@ -542,6 +546,7 @@ class UpdateManager:
             raise self.server.error(f"Updater {app} not available", 404)
         if not hasattr(updater, "commit"):
             raise self.server.error(f"Updater {app} does not support commit", 400)
+
         async def _run():
             async with self.cmd_request_lock:
                 self.cmd_helper.set_update_info(f"commit_{app}", id(web_request))

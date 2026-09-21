@@ -176,7 +176,7 @@ class FileManager:
 
         config_defaults_path = config.get('config_defaults_path', None, deprecate=False)
         if config_defaults_path is not None:
-            self.register_directory("defaults", config_defaults_path,full_access=False)
+            self.register_directory("defaults", config_defaults_path, full_access=False)
 
         self._register_custom_config_root(config)
 
@@ -224,7 +224,7 @@ class FileManager:
         if klipper_path is not None:
             self.reserved_paths.pop("klipper", None)
             self.add_reserved_path("klipper", klipper_path)
-            #HACK, dont want or need example configs
+            # HACK, dont want or need example configs
             # example_cfg_path = os.path.join(klipper_path, "config")
             # self.register_directory("config_examples", example_cfg_path)
             docs_path = os.path.join(klipper_path, "docs")
