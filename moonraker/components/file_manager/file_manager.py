@@ -58,6 +58,11 @@ if TYPE_CHECKING:
     _T = TypeVar("_T")
 
 VALID_GCODE_EXTS = ['.gcode', '.g', '.gco', '.ufp', '.nc']
+# MUON, KAN-371. The second Klipper configuration tree -- the developer-mode
+# one -- and how often its write grant is re-checked against the live state of
+# developer mode. See FileManager._refresh_custom_config_access.
+CUSTOM_CONFIG_ROOT = "config"
+CUSTOM_CONFIG_REFRESH_TIME = 30.
 METADATA_SCRIPT = os.path.abspath(os.path.join(
     os.path.dirname(__file__), "metadata.py"))
 WATCH_FLAGS = iFlags.CREATE | iFlags.DELETE | iFlags.MODIFY \
@@ -147,6 +152,20 @@ class FileManager:
         self.server.register_event_handler(
             "server:klippy_identified", self._update_fixed_paths)
 
+        # MUON, KAN-371. The `config` root's write access follows developer
+        # mode; these hold the decision between refreshes. Set before
+        # _register_custom_config_root runs, which reads the option into the
+        # first of them.
+        self._custom_config_write_allowed = False
+        self._custom_config_registered = False
+        self._custom_config_timer = self.event_loop.register_timer(
+            self._refresh_custom_config_access)
+        # Aux restarts Klipper when the mode is toggled, so this fires within a
+        # second or two of the change. The timer beside it covers the case
+        # where Klipper never comes back -- see the method.
+        self.server.register_event_handler(
+            "server:klippy_ready", self._on_klippy_ready_refresh_config_access)
+
         # Register Data Folders
         secrets: Secrets = self.server.load_component(config, "secrets")
         self.add_reserved_path("secrets", secrets.get_secrets_file(), False)
@@ -157,7 +176,7 @@ class FileManager:
 
         config_defaults_path = config.get('config_defaults_path', None, deprecate=False)
         if config_defaults_path is not None:
-            self.register_directory("defaults", config_defaults_path,full_access=False)
+            self.register_directory("defaults", config_defaults_path, full_access=False)
 
         self._register_custom_config_root(config)
 
@@ -205,7 +224,7 @@ class FileManager:
         if klipper_path is not None:
             self.reserved_paths.pop("klipper", None)
             self.add_reserved_path("klipper", klipper_path)
-            #HACK, dont want or need example configs
+            # HACK, dont want or need example configs
             # example_cfg_path = os.path.join(klipper_path, "config")
             # self.register_directory("config_examples", example_cfg_path)
             docs_path = os.path.join(klipper_path, "docs")
@@ -283,8 +302,24 @@ class FileManager:
         left empty: `getboolean` raises on an empty value rather than
         falling back to the default, so an image wiring this through a
         template has to substitute a real true/false.
+
+        KAN-371 changed what the option MEANS, and the distinction matters to
+        anyone reading an image's moonraker.conf. `True` no longer says "this
+        root is writable"; it says "this root MAY BECOME writable, while
+        developer mode is on". The grant itself is applied by
+        `_refresh_custom_config_access` and tracks the live state of the mode.
+
+        Why it had to become dynamic: this root *is* the developer-mode tree,
+        so its writability is not an independent question from developer mode
+        -- it is the same question. A static `False` locked the configuration
+        files on a printer that had been deliberately unlocked, which is the
+        opposite of what developer mode is for, and a static `True` handed the
+        LAN a writable `core.cfg` on a printer that had not been. Neither
+        static answer is right, because the thing being asked about moves.
         """
-        writable = config.getboolean("enable_custom_config_write_access", False)
+        self._custom_config_write_allowed = config.getboolean(
+            "enable_custom_config_write_access", False
+        )
         custom_config_path = config.get(
             'config_custom_config_path', None, deprecate=False
         )
@@ -293,7 +328,100 @@ class FileManager:
         # working directory, registered and served as a network root.
         if not custom_config_path:
             return
-        self.register_directory("config", custom_config_path, full_access=writable)
+        # Registered read-only. Nothing here asks Aux whether developer mode is
+        # on, because component construction is not an async context and a
+        # blocking call to another service during startup is how a slow Aux
+        # turns into a Moonraker that never finishes starting. The first
+        # refresh runs from `component_init` instead. Starting closed is also
+        # the right direction to be wrong in for the two seconds in between.
+        if self.register_directory(
+            CUSTOM_CONFIG_ROOT, custom_config_path, full_access=False
+        ):
+            self._custom_config_registered = True
+
+    async def _refresh_custom_config_access(self, eventtime: float = 0.) -> float:
+        """Make the `config` root's write access match developer mode.
+
+        Returns the next timer event time so this can serve as the periodic
+        callback directly; the return value is ignored on the event-driven
+        calls.
+
+        WHY POLL AT ALL, given the event below. Developer mode is toggled in
+        the Aux API, which restarts Klipper -- so `server:klippy_ready` is a
+        precise and immediate signal, and it is registered. It is not a
+        sufficient one: a developer-mode configuration that Klipper refuses to
+        load never reaches ready, and that is exactly the state in which an
+        operator most needs the editor to work in order to fix the file. An
+        event-only implementation locks the configuration files precisely when
+        they are broken. The timer is the floor under that.
+
+        FAILURE IS NOT A STATE CHANGE. If Aux cannot be reached, the last known
+        answer stands. Revoking on a blip would make the editor flicker to
+        read-only mid-edit and lose the save; asserting the grant on a blip
+        would open the root on a printer nobody unlocked. Neither is worth the
+        tidiness of a definite answer, and the state we start from is closed.
+        """
+        if not self._custom_config_registered:
+            return eventtime + CUSTOM_CONFIG_REFRESH_TIME
+        if not self._custom_config_write_allowed:
+            # The image has not opted in at all. Nothing to track, and no
+            # reason to ask Aux about it every 30 seconds.
+            return eventtime + CUSTOM_CONFIG_REFRESH_TIME
+        try:
+            aux: Any = self.server.lookup_component("aux_api_proxy")
+            state = await aux.get("/dev_mode")
+            enabled = state.get("enabled") if isinstance(state, dict) else None
+            if not isinstance(enabled, bool):
+                raise ValueError(f"unreadable dev_mode state: {state!r}")
+        except Exception:
+            logging.debug(
+                "file_manager: could not read developer-mode state; leaving "
+                "the 'config' root as it is", exc_info=True
+            )
+            return eventtime + CUSTOM_CONFIG_REFRESH_TIME
+        self._apply_custom_config_access(enabled)
+        return eventtime + CUSTOM_CONFIG_REFRESH_TIME
+
+    def _apply_custom_config_access(self, writable: bool) -> None:
+        """Add or drop the grant, and tell clients when it moved.
+
+        Split out from the read so the decision can be driven in a test without
+        an Aux API, an event loop or a server.
+        """
+        currently = CUSTOM_CONFIG_ROOT in self.full_access_roots
+        if currently == writable:
+            return
+        root_path = self.file_paths.get(CUSTOM_CONFIG_ROOT, "")
+        if writable:
+            self.full_access_roots.add(CUSTOM_CONFIG_ROOT)
+            # Picks up the filesystem watch that a read-only root does not get,
+            # so edits made over SSH show up in the browser too.
+            self.fs_observer.add_root_watch(CUSTOM_CONFIG_ROOT, root_path)
+        else:
+            self.full_access_roots.discard(CUSTOM_CONFIG_ROOT)
+        logging.info(
+            "file_manager: developer mode is %s; the 'config' root is now %s",
+            "on" if writable else "off", "writable" if writable else "read-only"
+        )
+        if self.server.is_running():
+            # `permissions` in every file listing is derived from
+            # full_access_roots, and it is what draws the padlock in Fluidd.
+            # Without this the icons stay wrong until the page is reloaded.
+            self._sched_changed_event(
+                "root_update", CUSTOM_CONFIG_ROOT, root_path, immediate=True
+            )
+
+    async def component_init(self) -> None:
+        # MUON, KAN-371. First evaluation of the `config` root's write grant,
+        # then the periodic one. Awaited rather than left to the timer so a
+        # printer that is already in developer mode when Moonraker starts --
+        # the ordinary case, since the mode outlives a reboot -- does not serve
+        # one refresh interval of read-only listings first.
+        await self._refresh_custom_config_access()
+        self._custom_config_timer.start(delay=CUSTOM_CONFIG_REFRESH_TIME)
+
+    async def _on_klippy_ready_refresh_config_access(self) -> None:
+        await self._refresh_custom_config_access()
 
     def register_data_folder(
         self, folder_name: str, full_access: bool = False
@@ -1287,6 +1415,7 @@ class FileManager:
             handle.cancel()
 
     def close(self) -> None:
+        self._custom_config_timer.stop()
         for hdl in self.scheduled_notifications.values():
             hdl.cancel()
         self.scheduled_notifications.clear()

@@ -144,9 +144,10 @@ class GCodePreprocessorComponent:
         self.server = config.get_server()
 
         # Read our Rust binary path
-        self.binary = config.get("binary", None)
-        if not self.binary:
+        binary = config.get("binary", None)
+        if not binary:
             raise self.server.error("gcode_preprocessor: missing 'binary' setting")
+        self.binary: str = binary
 
         # The old implementation ran the binary with no timeout at all, so a
         # postprocessor that hung hung the upload -- and, through start_print,
@@ -358,17 +359,21 @@ class GCodePreprocessorComponent:
 
     async def _invoke_preprocessor(self, file_path: str) -> None:
         """Run the binary on ``file_path``, bounded by ``self.timeout``."""
-        kwargs = {}
         if hasattr(os, "setsid"):
             # Own process group so a hung postprocessor that has forked can be
             # reaped whole rather than leaving orphans holding the file.
-            kwargs["start_new_session"] = True
-        proc = await asyncio.create_subprocess_exec(
-            self.binary, file_path,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            **kwargs
-        )
+            proc = await asyncio.create_subprocess_exec(
+                self.binary, file_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+        else:
+            proc = await asyncio.create_subprocess_exec(
+                self.binary, file_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
         try:
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(), timeout=self.timeout
