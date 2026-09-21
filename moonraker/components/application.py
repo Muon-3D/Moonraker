@@ -1098,6 +1098,9 @@ class WelcomeHandler(tornado.web.RequestHandler):
     def initialize(self) -> None:
         self.server: Server = self.settings['server']
 
+    async def prepare(self) -> None:
+        validate_real_ip_header(self.request.headers)
+
     async def get(self) -> None:
         summary: List[str] = []
         auth: AuthComp = self.server.lookup_component("authorization", None)

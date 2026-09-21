@@ -12,6 +12,7 @@ from tornado.web import Application, HTTPError
 from moonraker.components.application import (
     AuthorizedFileHandler,
     AuthorizedRequestHandler,
+    WelcomeHandler,
 )
 from moonraker.components.websockets import BridgeSocket, WebSocket
 from moonraker.utils.real_ip import validate_real_ip_header
@@ -94,6 +95,7 @@ class RealIPHeaderPolicyTests(unittest.TestCase):
         handlers = (
             AuthorizedRequestHandler,
             AuthorizedFileHandler,
+            WelcomeHandler,
             WebSocket,
             BridgeSocket,
         )
