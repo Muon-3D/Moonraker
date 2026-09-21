@@ -46,35 +46,67 @@ LOOPBACK = ipaddress.ip_address("127.0.0.1")
 class TestWhatIsOnTheFloor:
     """The membership of FLOOR_PREFIXES is the decision, so pin it directly.
 
-    Two different reasons put an entry here, and conflating them is how one gets
-    removed by someone who read the other's justification:
+    One reason now puts an entry here: **nothing else holds it.**
+    ``require_bms_authority`` is an empty body (BMS-21) and ``trusted_clients``
+    no longer answers 401 to a LAN caller, so for the mutating battery routes
+    this tuple is the whole of their access control (KAN-350).
 
-    * SEC-2 floors what an owner cannot consent away, because the consequence is
-      permanent. That is the developer-mode toggle.
-    * KAN-350 floors the mutating battery routes because nothing else holds
-      them -- ``require_bms_authority`` is an empty body (BMS-21) -- and
-      ``trusted_clients`` no longer answers 401 to a LAN caller.
+    The *other* reason -- SEC-2 flooring what an owner cannot consent away --
+    used to put the developer-mode toggle here and no longer does. KAN-371 moved
+    that gate to ``dev_mode_consent`` in the Aux API, which asks whether a person
+    confirmed at the hardware rather than whether the packet came from 127.0.0.1.
+    Keep the two reasons apart: an entry whose justification is physical presence
+    does not belong on a check that muon-link's loopback termination already
+    satisfies.
 
     Everything else is governed by SEC-8's levels, which is policy rather than
     floor.
     """
 
-    def test_the_developer_mode_toggle_is_floored(self):
-        # DEV-3: enabling blows a one-time-programmable fuse. Permanent in
-        # hardware, so no setting may open it and no level may relax it.
-        assert is_floor_endpoint("/server/aux/dev_mode")
-
-    def test_the_floor_is_the_toggle_and_the_battery_commands(self):
+    def test_the_floor_is_the_battery_commands(self):
         """Pinned as an exact tuple, so adding or dropping one is a failure here
         rather than a discovery in the field."""
         assert FLOOR_PREFIXES == (
-            "/server/aux/dev_mode",
             "/server/aux/bms/mode",
             "/server/aux/bms/charge",
             "/server/aux/bms/standby",
             "/server/aux/bms/fault",
             "/server/aux/bms/ship",
         )
+
+    @pytest.mark.parametrize(
+        "endpoint",
+        [
+            # The toggle itself. Enabling is gated by the waiver plus a redeemed
+            # consent challenge in the Aux API; disabling is ungated on purpose,
+            # because recovery must not depend on a working knob.
+            "/server/aux/dev_mode",
+            # The waiver text, so a client can show what it is asking consent to.
+            "/server/aux/dev_mode/waiver",
+            # The consent ceremony. Opening a challenge from the network is the
+            # point of it: the network asks, the hardware confirms.
+            "/server/aux/dev_mode/consent",
+            "/server/aux/dev_mode/consent/abc123",
+            # DEV-5: "restore safe configuration" is a single action, and these
+            # are it. Flooring them put the recovery path out of reach of the
+            # only interface that offers it.
+            "/server/aux/dev_mode/refresh",
+            "/server/aux/dev_mode/backup",
+        ],
+    )
+    def test_every_developer_mode_route_is_reachable_from_the_network(
+        self, endpoint: str
+    ):
+        """KAN-371. Spelled out as full endpoints rather than derived from
+        FLOOR_PREFIXES, because deriving the expectation from the thing under
+        test passes under any value of it.
+
+        If this fails, the reported symptom is back: a printer already in
+        developer mode, a dead toggle captioned "can only be changed at the
+        printer", and no Restore/Backup actions -- on a machine whose panel
+        carries no toggle to change it at.
+        """
+        assert not is_floor_endpoint(endpoint)
 
     @pytest.mark.parametrize(
         "endpoint",
@@ -143,32 +175,48 @@ class TestWhatIsOnTheFloor:
         assert not is_floor_endpoint(endpoint)
 
     def test_a_prefix_matches_on_a_segment_boundary_not_a_substring(self):
-        """`/server/aux/dev_mode_other` is a different endpoint and must not be
-        caught by the toggle's entry. The implementation checks equality or
+        """`/server/aux/bms/ship_status` is a different endpoint and must not be
+        caught by ship mode's entry. The implementation checks equality or
         prefix + "/", which is what makes that true; assert it so a later
         `startswith` shortcut cannot silently widen the floor."""
-        assert is_floor_endpoint("/server/aux/dev_mode")
-        assert is_floor_endpoint("/server/aux/dev_mode/anything")
-        assert not is_floor_endpoint("/server/aux/dev_mode_other")
+        assert is_floor_endpoint("/server/aux/bms/ship")
+        assert is_floor_endpoint("/server/aux/bms/ship/anything")
+        assert not is_floor_endpoint("/server/aux/bms/ship_status")
 
 
 class TestWhoIsAllowedThrough:
     def test_a_network_caller_is_denied_a_floor_surface(self):
         with pytest.raises(ServerError) as excinfo:
-            check_floor("/server/aux/dev_mode", HTTP, LAN)
+            check_floor("/server/aux/bms/mode", HTTP, LAN)
         assert excinfo.value.status_code == 403
 
-    def test_the_panel_reaches_the_toggle(self):
-        # Loopback is the panel: the MuonUI vhost listens on loopback only.
-        check_floor("/server/aux/dev_mode", HTTP, LOOPBACK)
+    def test_the_panel_reaches_a_floor_surface(self):
+        # Loopback is on-device: the MuonUI vhost listens on loopback only.
+        check_floor("/server/aux/bms/mode", HTTP, LOOPBACK)
 
     def test_a_component_to_component_call_is_not_a_network_caller(self):
         # update_manager driving an OTA through aux_api_proxy, for instance.
-        check_floor("/server/aux/dev_mode", INTERNAL, None)
+        check_floor("/server/aux/bms/mode", INTERNAL, None)
 
     def test_a_network_caller_reaches_everything_off_the_floor(self):
         check_floor("/server/aux/wifi/current", HTTP, LAN)
         check_floor("/machine/update/status", HTTP, LAN)
+
+    def test_a_lan_caller_can_leave_developer_mode(self):
+        """KAN-371, and the half of it that is not a policy judgement.
+
+        Disabling developer mode puts the OEM configuration back and blows
+        nothing. ``set_dev_mode`` gates only the enable direction, in its own
+        words, because "getting *out* of Developer Mode must not depend on a
+        working knob, a reachable operator, or an attacker's cooperation". The
+        floor used to contradict that by denying the route in both directions.
+        """
+        check_floor("/server/aux/dev_mode", HTTP, LAN)
+
+    def test_a_lan_caller_can_restore_defaults_and_take_a_backup(self):
+        """DEV-5. The single action, from the interface that offers it."""
+        check_floor("/server/aux/dev_mode/refresh", HTTP, LAN)
+        check_floor("/server/aux/dev_mode/backup", HTTP, LAN)
 
     def test_ship_mode_is_denied_to_a_lan_caller(self):
         """The case KAN-350 exists for.
@@ -197,7 +245,7 @@ class TestWhoIsAllowedThrough:
         """Fail-closed. MQTT carries no address, and `None` must read as remote
         rather than as "no evidence it is remote"."""
         with pytest.raises(ServerError):
-            check_floor("/server/aux/dev_mode", HTTP, None)
+            check_floor("/server/aux/bms/ship", HTTP, None)
 
 
 class TestAddressClassification:

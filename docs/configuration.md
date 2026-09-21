@@ -165,14 +165,21 @@ config_custom_config_path:
 #   "calibration" instead, so this is the only "config" root there is.
 #   Unset or empty by default, in which case no such root is registered.
 enable_custom_config_write_access: False
-#   Muon addition.  When enabled the "config" root above is writable over
-#   the API.  Separate from enable_config_write_access because the two
-#   cover different trees: that one gates the calibration overlay, which
-#   the Klipper-side calibration guard inspects, while this one gates a
-#   tree containing core.cfg itself -- the thermal limits, force_move and
-#   macro bodies that guard compares the overlay against, and which it
-#   never checks.  Leave it off on any image reachable from an untrusted
-#   network.  The default is False.
+#   Muon addition.  When enabled the "config" root above MAY BECOME
+#   writable over the API -- and does, exactly while developer mode is on.
+#   It is not a plain "this root is writable" switch.  The root IS the
+#   developer-mode tree, so Moonraker asks the Aux API whether the mode is
+#   on and adds or drops the write grant to match, re-checking whenever
+#   Klipper reaches ready and every 30 seconds.  With this False the root
+#   is read-only in every mode.
+#   Separate from enable_config_write_access because the two cover
+#   different trees: that one gates the calibration overlay, which the
+#   Klipper-side calibration guard inspects, while this one gates a tree
+#   containing core.cfg itself -- the thermal limits, force_move and macro
+#   bodies that guard compares the overlay against, and which it never
+#   checks.  That is why the grant follows the mode rather than simply
+#   being left on: a printer nobody unlocked never exposes it.
+#   The default is False.
 #   Note it must not be set to an empty value: getboolean raises on one
 #   rather than falling back to the default.
 ```
