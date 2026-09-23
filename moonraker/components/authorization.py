@@ -22,6 +22,7 @@ from libnacl.sign import Signer, Verifier
 from ..utils import json_wrapper as jsonw
 from ..common import RequestType, TransportType, SqlTableDefinition, UserInfo
 from .. import muon_floor
+from .. import muon_onlink
 
 # Annotation imports
 from typing import (
@@ -213,7 +214,15 @@ class Authorization:
                     f"[authorization]: Invalid domain name '{val}' "
                     "in option 'trusted_clients'")
 
+        # MUON, SEC-1: a browser on the LAN often arrives from its global IPv6
+        # address, which no static entry above can cover without opening the
+        # printer to the internet. See muon_onlink.py.
+        self.onlink_prefixes: Optional[muon_onlink.OnlinkPrefixes] = None
+        if config.getboolean('trust_onlink_ipv6', False):
+            self.onlink_prefixes = muon_onlink.OnlinkPrefixes()
+
         t_clients = "\n".join(
+            (["on-link IPv6 prefixes"] if self.onlink_prefixes else []) +
             [str(ip) for ip in self.trusted_ips] +
             [str(rng) for rng in self.trusted_ranges] +
             self.trusted_domains)
@@ -790,6 +799,8 @@ class Authorization:
         for rng in self.trusted_ranges:
             if ip in rng:
                 return True
+        if self.onlink_prefixes is not None and self.onlink_prefixes.contains(ip):
+            return True
         if self.trusted_domains:
             if ip in self.fqdn_cache:
                 fqdn: str = self.fqdn_cache[ip]["domain"]
