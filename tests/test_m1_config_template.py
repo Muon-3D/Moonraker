@@ -29,6 +29,15 @@ def test_m1_image_enables_the_gateway_token_component_for_root_only():
     assert not config.has_option("muon_gateway", "allowed_uids")
 
 
+def test_m1_image_lets_the_lan_start_an_account_link_through_loopback():
+    """ADR 0018 route 3: the LAN may start a link; the panel confirms it."""
+    config = configparser.ConfigParser(interpolation=None)
+    config.read(TEMPLATE, encoding="utf-8")
+
+    assert config.has_section("muon_link")
+    assert config.get("muon_link", "admin_address") == "127.0.0.1:7131"
+
+
 def test_m1_image_trusts_the_lan_it_is_on_over_ipv6():
     """SEC-1: `.local` resolves to the printer's global IPv6 address, so without
     this a browser on the LAN gets 401 and a sign-in page on an open printer."""

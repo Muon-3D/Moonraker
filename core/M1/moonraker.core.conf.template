@@ -195,6 +195,11 @@ timeout: 120
 [muon_gateway]
 socket_path: /home/printer_admin/comms/muon-gateway.sock
 
+# ADR 0018 route 3: a LAN client may start an account link and read how it
+# stands. It can never confirm one; that happens at the panel.
+[muon_link]
+admin_address: 127.0.0.1:7131
+
 # KAN-162: start the bed ramp when a job is queued instead of at the top
 # of PRINT_START.  This turns on the 170W bed heater with no human input,
 # so the component itself defaults to disabled -- enabling it is an
