@@ -89,7 +89,20 @@ enable_custom_config_write_access: True
 # cosmetic: nginx listens on [::]:80 and this printer holds a globally routable
 # IPv6 address with no NAT in front of it, so a trusted-client list carrying a
 # global range would publish the machine to the internet. A caller from a global
-# address still gets 401.
+# address still gets 401 -- unless that address is on the printer's own LAN, which
+# is what trust_onlink_ipv6 below is for.
+#
+# trust_onlink_ipv6 (a Muon option, moonraker/muon_onlink.py). `<host>.local`
+# resolves to the printer's global IPv6 address, browsers prefer it, and most
+# home networks hand out no ULA, so the browser talks from its own global address
+# and met a sign-in page here: boxwood and walnut both did this on 2026-09-22,
+# 200 over IPv4 and 401 over `.local`. This option trusts a caller inside a
+# prefix the printer routes directly on-link (no gateway, /48 or longer, read
+# from the kernel every 30 s, so it follows an ISP prefix change). An internet
+# host cannot complete a TCP handshake from inside that prefix, so this is the
+# LAN and nothing wider. IPv6 only, so muon-link's 192.0.2.1 sentinel stays
+# out of reach (GATE-2(g)).
+trust_onlink_ipv6: true
 #
 # THE `unless configured` HALF IS NOT BUILT. An owner who wants a sign-in has no
 # way to ask for one, and creating a Moonraker user does not produce one either:
