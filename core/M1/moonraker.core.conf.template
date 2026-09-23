@@ -173,6 +173,15 @@ timeout: 120
 
 [aux_api_proxy]
 
+# GATE-2 / ADR 0002 option E. muon-link forwards a paired client's requests
+# with X-Real-IP 192.0.2.1, which trusted_clients deliberately does not list,
+# so without a token Moonraker refuses them all. This component mints a
+# single-use, five-second token bound to that address, for uid 0 only
+# (SO_PEERCRED). The path must match MUON_LINK_MOONRAKER_TOKEN_SOCKET in
+# MuonOS's muon-link.service; a MuonOS test compares the two.
+[muon_gateway]
+socket_path: /home/printer_admin/comms/muon-gateway.sock
+
 # KAN-162: start the bed ramp when a job is queued instead of at the top
 # of PRINT_START.  This turns on the 170W bed heater with no human input,
 # so the component itself defaults to disabled -- enabling it is an
