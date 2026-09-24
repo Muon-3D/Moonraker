@@ -16,6 +16,30 @@ def test_m1_image_opts_into_writes_for_the_developer_mode_config_root():
     assert config.getboolean("file_manager", "enable_custom_config_write_access")
 
 
+def test_m1_image_runs_first_run_setup_with_the_spec_settings():
+    """KAN-203, spec 02 §2: without the section the component never loads, and
+    the panel and the phone have no setup state to render."""
+    config = configparser.ConfigParser(interpolation=None)
+    config.read(TEMPLATE, encoding="utf-8")
+
+    assert config.has_section("muon_setup")
+    assert dict(config.items("muon_setup")) == {
+        "languages": "en, de, fr, es, it",
+        "hotspot_off_delay": "900",
+        "driver_lease": "30",
+        "join_timeout": "45",
+        "ready_manifest": "/usr/share/muon/setup/ready.json",
+    }
+    # muon_setup classifies hotspot callers by this subnet, and they only get
+    # that far if trusted_clients lets them in without a sign-in.
+    trusted = config.get("authorization", "trusted_clients").split()
+    phone = ipaddress.ip_address("10.42.0.37")
+    assert any(
+        phone in ipaddress.ip_network(entry, strict=False)
+        for entry in trusted if "." in entry
+    )
+
+
 def test_m1_image_enables_the_gateway_token_component_for_root_only():
     """GATE-2: without it every request muon-link forwards is refused."""
     config = configparser.ConfigParser(interpolation=None)

@@ -146,6 +146,13 @@ FLOOR_PREFIXES = (
     # environment variable staying unset is not one to leave alone on the route
     # that powers the pack down.
     "/server/aux/bms/ship",
+    # KAN-203, 07 S11. Throws away the owner's setup answers and puts the
+    # printer back on its first-run screen. It is for development and support
+    # at the machine, and no network caller has a use for it. Not justified by
+    # presence, per the rule above: any on-device caller may reset. muon_setup
+    # refuses non-panel callers as well, so this is the second of two locks. It
+    # is the one that also covers the websocket and MQTT paths.
+    "/server/muon/setup/reset",
 )
 
 #: The battery routes deliberately NOT floored. Telemetry discloses pack state,
