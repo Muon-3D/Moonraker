@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Dict, Any, Callable, Optional
 from urllib.parse import unquote, urlencode
 
+from tornado.httpclient import HTTPClientError
+
 from ..utils import ServerError
 
 FASTAPI_ROOT = "http://127.0.0.1:6789"  # loopback-only Aux API bind
@@ -112,6 +114,14 @@ def _raise_for_aux_status(resp: Any) -> None:
     except Exception as exc:
         setattr(exc, "aux_code", _aux_error_code(resp))
         raise
+
+
+def _not_answering(exc: ServerError) -> bool:
+    """A timeout (599), or a 500 that no HTTP response stands behind."""
+    if exc.status_code == 599:
+        return True
+    return exc.status_code == 500 and not isinstance(
+        exc.__cause__, HTTPClientError)
 
 
 def _has_encoded_separator(path: str) -> bool:
@@ -494,13 +504,17 @@ class AuxAutoProxy:
 
         While Aux is not answering -- late at boot, or restarting -- they say
         503, which a client should retry, instead of the 500 a refused
-        connection turns into, which reads as a fault. http_client reports a
-        connection that failed as 500 and a timeout as 599.
+        connection turns into, which reads as a fault (02 §7).
+
+        Only "not answering" becomes 503. http_client reports a timeout as 599
+        and a failed connection as 500 with no HTTP error behind it; a 500
+        that Aux really answered carries Tornado's HTTPClientError as its
+        cause, and keeps its status.
         """
         try:
             return await self.get(path)
         except ServerError as exc:
-            if exc.status_code in (500, 599):
+            if _not_answering(exc):
                 raise self.server.error(
                     f"The Aux API is not answering yet ({path})", 503
                 ) from exc

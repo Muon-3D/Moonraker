@@ -378,6 +378,33 @@ def test_an_aux_refusal_is_not_turned_into_503():
     assert excinfo.value.status_code == 404
 
 
+def test_a_real_aux_500_keeps_its_status_but_a_timeout_is_503():
+    """02 §7: http_client reports both a refused connection and a genuine
+    Aux 500 as 500. Only the first is "not answering"; the genuine one has
+    Tornado's HTTPClientError behind it."""
+    from tornado.httpclient import HTTPClientError
+
+    from moonraker.utils import ServerError
+
+    class AuxFault(FakeResponse):
+        def raise_for_status(self, message: Optional[str] = None) -> None:
+            raise ServerError("Internal Server Error", 500) from HTTPClientError(500)
+
+    class TimedOut(FakeResponse):
+        def raise_for_status(self, message: Optional[str] = None) -> None:
+            raise ServerError("Timeout", 599) from HTTPClientError(599)
+
+    _proxy, server, _client = make_proxy(FakeHttpClient(AuxFault()))
+    with pytest.raises(ServerError) as excinfo:
+        asyncio.run(server.handler_for("/server/muon/identity")(FakeWebRequest()))
+    assert excinfo.value.status_code == 500
+
+    _proxy, server, _client = make_proxy(FakeHttpClient(TimedOut()))
+    with pytest.raises(FakeServerError) as fake:
+        asyncio.run(server.handler_for("/server/muon/identity")(FakeWebRequest()))
+    assert fake.value.status_code == 503
+
+
 def test_the_identity_is_the_derived_name_until_the_owner_renames_it():
     """What the endpoint said before MR-9, pinned: the owner's rename wins,
     the derived half is always reported, and the display form follows the
