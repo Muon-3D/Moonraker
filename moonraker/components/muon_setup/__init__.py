@@ -24,16 +24,17 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import datetime
 import logging
 import os
 import re
+import secrets
 import socket
 import time
 from typing import (
     TYPE_CHECKING, Any, Awaitable, Callable, Dict, FrozenSet, List, Optional,
     Set, Tuple
 )
+from urllib.parse import urlencode
 
 from . import caller, clock, language, manifest, model, name, region
 from .model import DONE, FINISH, HIDDEN, PENDING, SKIPPED
@@ -50,16 +51,26 @@ STATE_KEY = "state"
 INTERNAL_KEY = "internal"
 
 DEFAULT_READY_MANIFEST = "/usr/share/muon/setup/ready.json"
-#: Where the completion marker is read: OS-7's route (MuonOS#313), then the
-#: one MuonOS#174 carries. Both answer {"complete": bool, ...}.
-MARKER_READS = ("/setup/complete", "/setup")
+#: OS-7's completion marker (MuonOS#313, 02 §4). The only marker route: #174's
+#: `/setup` is replaced by it, and H1 never reads a marker written there.
+MARKER_PATH = "/setup/complete"
 DEFAULT_LANGUAGES = "en, de, fr, es, it"
+
+#: Wi-Fi profiles that say nothing about earlier use (01 §7): the hotspot's
+#: own, and the one every M1-dev image bakes in (MuonOS layers/output-dev.toml).
+IGNORED_WIFI_PROFILES = frozenset({"ap0-con", "Muon3D_Dev"})
 
 #: How long GET waits at boot for the migration check before it answers.
 STARTUP_WAIT = 10.0
-#: How often to retry the migration check while Aux is not answering.
+#: The most scanned SSIDs asked about one by one on images without
+#: GET /wifi/saved (each is one `nmcli connection show`).
+WIFI_SHOW_LIMIT = 30
+#: How often to retry the migration check while it cannot decide.
 MIGRATION_RETRY = 3.0
-#: How often to retry writing the completion marker while Aux is down.
+#: How long "can't tell yet" from the Wi-Fi scan or muon-link may hold the
+#: decision. Aux not answering holds it for as long as that lasts.
+MIGRATION_UNSURE_LIMIT = 600.0
+#: How often to retry writing or clearing the marker while Aux is down.
 MARKER_RETRY = 30.0
 #: 02 §6: poll the hotspot's station count every 2 s while setup runs.
 POLL_ACTIVE = 2.0
@@ -75,7 +86,11 @@ ENDONYMS = {
 _LANGUAGE_RE = re.compile(r"^[a-z]{2,3}(-[A-Z][a-z]{3})?(-[A-Z]{2})?$")
 _CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
-DRIVER_KINDS = ("panel", "phone", "web")
+#: 02 §5.11. `app` is the Muon3D phone app (KAN-399), on the hotspot or LAN.
+DRIVER_KINDS = ("panel", "phone", "web", "app")
+
+#: A migration signal that cannot say yet (01 §7), as distinct from "no".
+UNSURE = "unsure"
 
 Handler = Callable[["WriteContext"], Awaitable[Optional[Dict[str, Any]]]]
 OpRunner = Callable[["OpHandle"], Awaitable[None]]
@@ -90,9 +105,14 @@ class AuxMissing(Exception):
 
 
 class AuxRefused(Exception):
-    def __init__(self, status: int, message: str) -> None:
+    """Aux answered with a 4xx. `code` is its `detail.code`, when it gave one
+    (02 §1: the 409 and 422 mappings need it)."""
+
+    def __init__(self, status: int, message: str,
+                 code: Optional[str] = None) -> None:
         super().__init__(message)
         self.status = status
+        self.code = code
 
 
 class WriteContext:
@@ -187,9 +207,13 @@ class MuonSetup:
         self.read_only_version: Optional[Any] = None
         self._resolved = asyncio.Event()
         self._lock = asyncio.Lock()
+        #: `marker_written` / `marker_by`: the marker's POST reached Aux, and
+        #: with which `by`. `marker_clear_pending`: a reset's DELETE has not
+        #: yet. `tz_source`: who set the time zone (02 §6 `clock`).
         self._internal: Dict[str, Any] = {
-            "marker_written": False, "auto_off_at": None, "tz_source": None,
+            "marker_written": False, "tz_source": None,
         }
+        self._marker_task: Optional[asyncio.Task] = None
         self._live: Dict[str, Any] = {
             "printer": None,
             "derived_name": None,
@@ -205,7 +229,6 @@ class MuonSetup:
                 "self_hosted": False, "bluetooth": False,
             },
         }
-        self._op_seq = 0
         self._op_task: Optional[asyncio.Task] = None
         self._pending_op: Optional[Tuple[str, OpRunner]] = None
         self._tasks: Set[asyncio.Task] = set()
@@ -260,13 +283,13 @@ class MuonSetup:
             await self._migrate()
         if poll:
             self._poll_task = self._spawn(self._poll())
-        if (
-            self.doc is not None and self.doc["state"] == "complete"
-            and not self._internal.get("marker_written")
-            and self.read_only_version is None
-            and not self._migrated()
-        ):
-            self._spawn(self._write_marker())
+        if self.doc is not None and self.read_only_version is None:
+            # A marker write or clear that an earlier boot could not finish.
+            if self.doc["state"] == "complete":
+                if not self._internal.get("marker_written"):
+                    self._start_marker_sync()
+            elif self._internal.get("marker_clear_pending"):
+                self._start_marker_sync()
 
     def _load(self, stored: Dict[str, Any]) -> None:
         if stored.get("version") != model.SCHEMA_VERSION:
@@ -315,87 +338,138 @@ class MuonSetup:
 
     async def _migrate(self) -> None:
         """01 §7: a printer updated from firmware with no setup flow must not
-        be sent into setup. Decide once, before anything is stored."""
+        be sent into setup. Decide once, before anything is stored, and store
+        nothing until the answer is certain: a `new` saved on a guess traps a
+        field unit in setup on every later boot."""
+        loop = asyncio.get_event_loop()
+        first_unsure: Optional[float] = None
         while not self._closed:
             verdict = await self._field_signals()
-            if verdict is not None:
+            if verdict == UNSURE:
+                now = loop.time()
+                first_unsure = now if first_unsure is None else first_unsure
+                if now - first_unsure >= MIGRATION_UNSURE_LIMIT:
+                    logging.warning(
+                        "muon_setup: the Wi-Fi scan or muon-link still cannot "
+                        "say after %.0f s; deciding without them",
+                        MIGRATION_UNSURE_LIMIT)
+                    verdict = False
+            if verdict is True or verdict is False:
                 ids = manifest.item_ids(self.manifest)
                 if verdict:
                     logging.info(
                         "muon_setup: this printer was in use before setup "
                         "existed; marking setup complete (migrated)")
                     doc = model.migrated_document(ids)
-                    # Its marker, if any, is already there; it has none to
-                    # write, and a missing one is not ours to add.
-                    self._internal["marker_written"] = True
                 else:
                     doc = model.new_document(ids)
                 self.doc = doc
                 await self._persist()
                 self._resolved.set()
                 self._notify()
+                if verdict:
+                    # 02 §4: without the marker, OS-5's H1 keeps a field
+                    # unit's hotspot up for good.
+                    self._internal["marker_by"] = "migrated"
+                    self._start_marker_sync()
                 return
             logging.info(
                 "muon_setup: cannot tell yet whether this printer is new; "
                 "retrying in %.0f s", MIGRATION_RETRY)
             await asyncio.sleep(MIGRATION_RETRY)
 
-    def _migrated(self) -> bool:
-        assert self.doc is not None
-        return self.doc["steps"]["language"].get("source") == "migrated"
-
-    async def _field_signals(self) -> Optional[bool]:
+    async def _field_signals(self) -> Any:
         """True if any sign of earlier use is found, False if every source
-        answered and none did, None if a source could not be asked."""
+        answered and none did. None while Aux is not answering, and UNSURE
+        while the Wi-Fi scan or muon-link cannot say yet."""
         fluidd = await self.database.get_item("fluidd", None, {})
         if isinstance(fluidd, dict) and fluidd.get("uiSettings"):
             return True
-        inconclusive = False
+        verdict: Any = False
         for probe in (self._marker_present, self._wifi_saved, self._linked):
             try:
-                if await probe():
-                    return True
+                found = await probe()
             except AuxUnavailable as exc:
                 logging.info("muon_setup: migration check: %s", exc)
-                inconclusive = True
-        return None if inconclusive else False
+                verdict = None
+                continue
+            if found is True:
+                return True
+            if found == UNSURE and verdict is False:
+                verdict = UNSURE
+        return verdict
 
     async def _marker_present(self) -> bool:
         # OS-7's marker (MuonOS#313): GET /setup/complete -> {complete, ...}.
-        # Images carrying MuonOS#174 instead have GET /setup, same field.
-        for path in MARKER_READS:
-            try:
-                marker = await self.aux("GET", path)
-            except AuxMissing:
-                continue
-            return isinstance(marker, dict) and marker.get("complete") is True
-        return False
+        try:
+            marker = await self.aux("GET", MARKER_PATH)
+        except AuxMissing:
+            return False
+        return isinstance(marker, dict) and marker.get("complete") is True
 
-    async def _wifi_saved(self) -> bool:
-        # MuonOS#210's GET /wifi/saved lists saved profiles, hotspot excluded.
-        # Images without it can only say whether wlan0 is connected now.
+    async def _wifi_saved(self) -> Any:
+        """A saved Wi-Fi profile other than the hotspot's and the dev image's.
+
+        MuonOS#210's GET /wifi/saved answers exactly. Images without it are
+        asked about the networks in range (01 §7): the connection in use, then
+        GET /wifi/show?ssid= for each scanned SSID. An empty scan, or no radio
+        yet, is UNSURE, never "none": NetworkManager may simply not be up.
+        """
         try:
             saved = await self.aux("GET", "/wifi/saved")
         except AuxMissing:
+            saved = None
+        if isinstance(saved, list):
+            return any(
+                isinstance(p, dict) and p.get("name") not in IGNORED_WIFI_PROFILES
+                for p in saved
+            )
+        try:
+            current = await self.aux("GET", "/wifi/current")
+        except (AuxMissing, AuxRefused):
+            current = None
+        if isinstance(current, dict):
+            ssid = current.get("ssid")
+            if ssid and ssid not in IGNORED_WIFI_PROFILES:
+                return True
+        try:
+            scan = await self.aux("GET", "/wifi/scan")
+        except (AuxMissing, AuxRefused):
+            return UNSURE
+        ssids: List[str] = []
+        for net in scan if isinstance(scan, list) else []:
+            ssid = net.get("ssid") if isinstance(net, dict) else None
+            if (isinstance(ssid, str) and ssid and ssid not in ssids
+                    and ssid not in IGNORED_WIFI_PROFILES):
+                ssids.append(ssid)
+        if not ssids:
+            return UNSURE
+        for ssid in ssids[:WIFI_SHOW_LIMIT]:
             try:
-                current = await self.aux("GET", "/wifi/current")
-            except AuxMissing:
-                return False
-            return isinstance(current, dict) and bool(current.get("ssid"))
-        return isinstance(saved, list) and len(saved) > 0
+                await self.aux("GET", "/wifi/show?" + urlencode({"ssid": ssid}))
+            except (AuxMissing, AuxRefused):
+                continue
+            return True
+        return False
 
-    async def _linked(self) -> bool:
+    async def _linked(self) -> Any:
         # muon-link's GET /link answers {"phase": "linked", ...} once an
-        # account is linked (crates/muon-link-device/src/orch.rs, LinkPhase),
-        # reached through the muon_link component when it is configured.
+        # account is linked (LinkPhase), through the muon_link component
+        # (Moonraker#20) when it is configured. A 503 is muon-link not
+        # answering yet: UNSURE, not "never linked".
         link = self.server.lookup_component("muon_link", None)
         if link is None or not hasattr(link, "call"):
             return False
         try:
             status = await link.call("GET", "/link")
-        except Exception as exc:
+        except ServerError as exc:
+            if exc.status_code >= 500:
+                return UNSURE
             logging.info("muon_setup: migration check: link status: %s", exc)
             return False
+        except Exception as exc:
+            logging.info("muon_setup: migration check: link status: %s", exc)
+            return UNSURE
         return isinstance(status, dict) and status.get("phase") == "linked"
 
     async def close(self) -> None:
@@ -436,10 +510,11 @@ class MuonSetup:
     # Aux, through aux_api_proxy's helpers (02 §1)
     # ------------------------------------------------------------------
 
-    async def aux(self, method: str, path: str, body: Any = None) -> Any:
+    async def aux(self, method: str, path: str, body: Any = None,
+                  timeout: Optional[float] = None) -> Any:
         """Call the Aux API, sorting failures into unavailable / missing /
         refused. aux_api_proxy adds the token and turns an HTTP error into a
-        ServerError that keeps the status code."""
+        ServerError that keeps the status code and Aux's `detail.code`."""
         proxy = self.server.lookup_component("aux_api_proxy", None)
         if proxy is None:
             raise AuxUnavailable("aux_api_proxy is not loaded")
@@ -450,6 +525,8 @@ class MuonSetup:
                 if not hasattr(proxy, "delete"):
                     raise AuxMissing(path)
                 return await proxy.delete(path)
+            if timeout is not None:
+                return await proxy.post(path, body, timeout=timeout)
             return await proxy.post(path, body)
         except ServerError as exc:
             status = exc.status_code
@@ -457,7 +534,8 @@ class MuonSetup:
                 raise AuxMissing(path) from exc
             if status >= 500 or status in (401, 403):
                 raise AuxUnavailable(f"{method} {path}: {exc}") from exc
-            raise AuxRefused(status, str(exc)) from exc
+            raise AuxRefused(
+                status, str(exc), getattr(exc, "aux_code", None)) from exc
 
     # ------------------------------------------------------------------
     # The document as clients see it
@@ -482,13 +560,11 @@ class MuonSetup:
             # 02 §6: `value` is the effective name, so until the owner keeps
             # or renames it, it follows the identity; `derived` always does.
             name_step = public["steps"]["name"]
-            if name_step["status"] == PENDING:
+            if name_step["status"] == PENDING or not name_step.get("value"):
                 name_step["value"] = live["printer"]["name"]
             if live.get("derived_name"):
                 name_step["derived"] = live["derived_name"]
-        hotspot = dict(live["hotspot"])
-        hotspot["auto_off_at"] = self._internal.get("auto_off_at")
-        public["hotspot"] = hotspot
+        public["hotspot"] = dict(live["hotspot"])
         clock = dict(live["clock"])
         clock["tz_source"] = self._internal.get("tz_source")
         public["clock"] = clock
@@ -704,8 +780,9 @@ class MuonSetup:
         """
         doc = self.doc
         assert doc is not None
-        self._op_seq += 1
-        op_id = f"op_{self._op_seq}"
+        # Random, not counted: a counter restarts at every boot and after a
+        # reset, and an old OpHandle must never match a new operation.
+        op_id = f"op_{secrets.token_hex(4)}"
         doc["op"] = {
             "kind": kind, "id": op_id, "started": time.time(),
             "phase": fields.pop("phase", None), "progress": None, **fields,
@@ -772,6 +849,7 @@ class MuonSetup:
                 {"code": code, "endonym": ENDONYMS.get(code, code)}
                 for code in self.languages
             ],
+            # Aux GET /region/options, verbatim (02 §5.2).
             "region": await self._options_region(),
             "ready_manifest": copy.deepcopy(self.manifest),
         }
@@ -782,14 +860,13 @@ class MuonSetup:
 
     async def _options_region(self) -> Optional[Dict[str, Any]]:
         try:
-            state = await self.aux("GET", "/region")
             options = await self.aux("GET", "/region/options")
         except (AuxUnavailable, AuxMissing, AuxRefused) as exc:
             logging.debug("muon_setup: no region data: %s", exc)
             return None
-        if not isinstance(state, dict) or not isinstance(options, dict):
+        if not isinstance(options, dict):
             return None
-        return region.options_region(state, options)
+        return copy.deepcopy(options)
 
     async def _handle_driver(self, webreq: WebRequest) -> Dict[str, Any]:
         """Claim or renew the driver (02 §5.11). Never changes `rev`, and is
@@ -877,10 +954,12 @@ class MuonSetup:
             if step not in model.SKIPPABLE:
                 return model.error("invalid_step", f"unknown step {step!r}")
             if complete:
-                # E4: the card re-runs a skipped step, and may skip it again.
-                if step not in model.WRITABLE_AFTER_COMPLETE:
+                # 02 §5: after `complete` the only skip is `ready`'s, from
+                # the "Finish setup" card, and it never undoes a done step.
+                # Anything else would put a finished step back on the card.
+                if step != "ready" or doc["steps"][step]["status"] == DONE:
                     return model.error(
-                        "invalid_step", f"{step} is closed after setup")
+                        "invalid_step", f"{step} cannot be skipped now")
             elif not model.reachable(doc, step):
                 return model.error(
                     "invalid_step", f"cannot skip {step!r} from here", step=step)
@@ -891,6 +970,18 @@ class MuonSetup:
                 self.advance()
             return None
         return await self.write(webreq, handler, after_complete=True)
+
+    def effective_name(self) -> Optional[str]:
+        """The name "Keep" keeps: the identity's current name (the owner's
+        rename if there is one), else the derived name, else the last one
+        stored. Never None while any of them is known."""
+        printer = self._live.get("printer") or {}
+        if printer.get("name"):
+            return printer["name"]
+        if self._live.get("derived_name"):
+            return str(self._live["derived_name"]).title()
+        stored = (self.doc or {}).get("printer") or {}
+        return stored.get("name")
 
     async def _handle_finish(self, webreq: WebRequest) -> Dict[str, Any]:
         async def handler(ctx: WriteContext) -> Optional[Dict[str, Any]]:
@@ -907,8 +998,12 @@ class MuonSetup:
                 if step["status"] != PENDING:
                     continue
                 # "Keep" is the name step's default answer; it cannot end
-                # up skipped (01 §2).
-                step["status"] = DONE if step_id == "name" else SKIPPED
+                # up skipped (01 §2), and it keeps a real name, not null.
+                if step_id == "name":
+                    step["status"] = DONE
+                    step["value"] = step.get("value") or self.effective_name()
+                else:
+                    step["status"] = SKIPPED
             doc["state"] = "complete"
             doc["cursor"] = FINISH
             self._spawn(self._on_complete())
@@ -916,60 +1011,94 @@ class MuonSetup:
         return await self.write(webreq, handler, after_complete=True)
 
     async def _on_complete(self) -> None:
-        # Runs once the change is saved and announced: the lock is held until
-        # write() has committed, so wait for it before reading the result.
+        """02 §5.11: the marker, then `muon_setup:complete`, then the hotspot
+        auto-off, in that order. Runs once the change is saved and announced:
+        write() holds the lock until it has committed."""
         async with self._lock:
             pass
         if self.doc is None or self.doc["state"] != "complete":
             return
-        self.server.send_event("muon_setup:complete", self.public_state())
-        await self._schedule_hotspot_off()
-        await self._write_marker()
-
-    async def _write_marker(self) -> None:
-        """03 §7: POST /setup/complete (OS-7, MuonOS#313), or on an image
-        that carries MuonOS#174 instead, POST /setup {complete, language,
-        completed_at}. Retried while Aux is down; an image with neither
-        cannot hold a marker, and the next boot tries again."""
-        while not self._closed and self.doc is not None:
-            language = self.doc["steps"]["language"].get("value")
-            legacy = {
-                "complete": True,
-                "language": language if isinstance(language, str) else None,
-                "completed_at": datetime.datetime.now(
-                    datetime.timezone.utc).isoformat(timespec="seconds"),
-            }
-            try:
-                try:
-                    await self.aux("POST", "/setup/complete", {"by": "muon_setup"})
-                except AuxMissing:
-                    await self.aux("POST", "/setup", legacy)
-            except AuxMissing:
-                logging.warning(
-                    "muon_setup: this image has no Aux setup marker route; "
-                    "the completion marker was not written")
-                return
-            except AuxRefused as exc:
-                logging.error("muon_setup: Aux refused the marker: %s", exc)
-                return
-            except AuxUnavailable as exc:
-                logging.info(
-                    "muon_setup: marker not written yet (%s); retrying", exc)
-                await asyncio.sleep(MARKER_RETRY)
-                continue
-            self._internal["marker_written"] = True
-            await self._persist_internal()
+        self._internal["marker_by"] = "muon_setup"
+        if await self._marker_once() == "retry":
+            self._start_marker_sync()
+        if self.doc is None or self.doc["state"] != "complete":
             return
+        self.server.send_event("muon_setup:complete", self.public_state())
+        await self.schedule_hotspot_off()
 
-    async def _schedule_hotspot_off(self) -> None:
+    # --------------------------------------------------------------
+    # The completion marker follows `state` (02 §4, 03 §7)
+    # --------------------------------------------------------------
+
+    def _start_marker_sync(self) -> None:
+        """(Re)start the task that makes Aux's marker match `state`."""
+        if self._marker_task is not None and not self._marker_task.done():
+            self._marker_task.cancel()
+        self._marker_task = self._spawn(self._marker_sync())
+
+    async def _marker_sync(self) -> None:
+        while not self._closed:
+            outcome = await self._marker_once()
+            if outcome != "retry":
+                return
+            await asyncio.sleep(MARKER_RETRY)
+
+    async def _marker_once(self) -> str:
+        """One attempt to make the marker match `state`, re-read every time,
+        so a retry that outlives a `reset` never writes the marker back.
+        Returns "done", "retry" (Aux down) or "stop" (nothing to do, or it
+        cannot be done on this image)."""
+        doc = self.doc
+        if doc is None or self.read_only_version is not None:
+            return "stop"
+        if doc["state"] == "complete":
+            if self._internal.get("marker_written"):
+                return "stop"
+            method, body = "POST", {
+                "by": self._internal.get("marker_by") or "muon_setup"}
+        elif self._internal.get("marker_clear_pending"):
+            method, body = "DELETE", None
+        else:
+            return "stop"
+        try:
+            await self.aux(method, MARKER_PATH, body)
+        except AuxMissing:
+            logging.warning(
+                "muon_setup: this image has no Aux %s %s (OS-7); the setup "
+                "marker was not changed", method, MARKER_PATH)
+            return "stop"
+        except AuxRefused as exc:
+            logging.error("muon_setup: Aux refused the setup marker: %s", exc)
+            return "stop"
+        except AuxUnavailable as exc:
+            logging.info(
+                "muon_setup: setup marker not changed yet (%s); retrying", exc)
+            return "retry"
+        # The state may have moved on while Aux answered: record only what
+        # still holds, and let the next attempt put the marker right.
+        if self.doc is not None and self.doc["state"] == "complete":
+            if method == "DELETE":
+                return "retry"
+            self._internal["marker_written"] = True
+        else:
+            if method == "POST":
+                self._internal["marker_clear_pending"] = True
+                return "retry"
+            self._internal["marker_clear_pending"] = False
+        await self._persist_internal()
+        return "done"
+
+    async def schedule_hotspot_off(self) -> None:
         """01 §6 / 03 §1 H3: the hotspot goes off `hotspot_off_delay` after
-        finish, but only if an uplink has an address to fall back on."""
+        finish, or after a join once setup is complete (E5), but only if an
+        uplink has an address to fall back on. The deadline is the OS's; it
+        comes back through GET /wifi/ap/stations, never stored here."""
         assert self.doc is not None
         network = self.doc["steps"]["network"]
         if network.get("status") != DONE or not network.get("addresses"):
             return
         try:
-            await self.aux(
+            answer = await self.aux(
                 "POST", "/wifi/ap/auto_off", {"after_s": self.hotspot_off_delay})
         except AuxMissing:
             logging.warning(
@@ -979,8 +1108,9 @@ class MuonSetup:
         except (AuxUnavailable, AuxRefused) as exc:
             logging.warning("muon_setup: hotspot auto-off not scheduled: %s", exc)
             return
-        self._internal["auto_off_at"] = time.time() + self.hotspot_off_delay
-        await self._persist_internal()
+        if isinstance(answer, dict) and "auto_off_at" in answer:
+            self._live["hotspot"]["auto_off_at"] = answer["auto_off_at"]
+        await self._refresh_hotspot(check_up=True)
         self._notify()
 
     async def _handle_card_dismiss(self, webreq: WebRequest) -> Dict[str, Any]:
@@ -1001,10 +1131,14 @@ class MuonSetup:
 
     async def _handle_reset(self, webreq: WebRequest) -> Dict[str, Any]:
         """Development and support only (02 §5.11, 07 S11). Floored, and
-        panel-only here as well. Resets setup state; it is not a factory
-        reset and touches nothing else."""
-        self.begin(webreq, caller.PANEL_ONLY)
+        panel-only here as well -- not even another component may call it.
+        Resets setup state; it is not a factory reset and touches nothing
+        else. `rev` keeps increasing, so screens holding the old state take
+        the new one."""
+        self.begin(webreq, caller.RESET)
         await self.wait_resolved(STARTUP_WAIT)
+        if self._marker_task is not None and not self._marker_task.done():
+            self._marker_task.cancel()
         if self._op_task is not None and not self._op_task.done():
             self._op_task.cancel()
             try:
@@ -1012,6 +1146,11 @@ class MuonSetup:
             except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
                 pass
         async with self._lock:
+            old_rev = self.doc["rev"] if self.doc is not None else 0
+            if self.read_only_version is not None:
+                stored = await self.database.get_item(NAMESPACE, STATE_KEY, None)
+                if isinstance(stored, dict) and isinstance(stored.get("rev"), int):
+                    old_rev = max(old_rev, stored["rev"])
             for key in (STATE_KEY, INTERNAL_KEY):
                 try:
                     await self.database.delete_item(NAMESPACE, key)
@@ -1019,26 +1158,22 @@ class MuonSetup:
                     pass
             self.read_only_version = None
             self._internal = {
-                "marker_written": False, "auto_off_at": None, "tz_source": None,
+                "marker_written": False, "tz_source": None,
+                "marker_clear_pending": True,
             }
-            self.doc = model.new_document(manifest.item_ids(self.manifest))
+            doc = model.new_document(manifest.item_ids(self.manifest))
+            doc["rev"] = old_rev + 1
+            self.doc = doc
             await self._persist()
+            await self._persist_internal()
             self._resolved.set()
             self._notify()
-        # OS-7's DELETE /setup/complete clears the marker, so the hotspot's
-        # H1 rule sees a new printer again. MuonOS#174's marker has no delete,
-        # on purpose: only a factory reset removes it. Either way the new
-        # state is written directly, so no migration check runs to find it.
-        try:
-            await self.aux("DELETE", "/setup/complete")
-        except AuxMissing:
-            logging.info(
-                "muon_setup: setup state reset; this image's setup marker, "
-                "if any, stays until a factory reset")
-        except (AuxUnavailable, AuxRefused) as exc:
-            logging.warning("muon_setup: the setup marker was not cleared: %s", exc)
-        else:
-            logging.info("muon_setup: setup state and marker reset by the panel")
+        # OS-7's DELETE /setup/complete, so the hotspot's H1 rule sees a new
+        # printer again. Retried every 30 s while Aux is down, for as long as
+        # the state stays short of `complete`.
+        if await self._marker_once() == "retry":
+            self._start_marker_sync()
+        logging.info("muon_setup: setup state reset by the panel")
         return self.envelope()
 
     # ------------------------------------------------------------------
@@ -1073,7 +1208,32 @@ class MuonSetup:
         return self._live != before
 
     async def _refresh_hotspot(self, check_up: bool) -> None:
+        """02 §6: `hotspot` is OS-5's GET /wifi/ap/stations
+        {up, count, auto_off_at}. Only the OS knows the auto-off deadline
+        after a reboot or an owner's "off", so it is never stored here.
+        Images without OS-5 fall back to the device state and the bare
+        POST /wifi/ap/count, with no deadline."""
         hotspot = self._live["hotspot"]
+        if self._stations_route:
+            try:
+                stations = await self.aux("GET", "/wifi/ap/stations")
+            except AuxMissing:
+                self._stations_route = False
+            except (AuxUnavailable, AuxRefused):
+                return
+            else:
+                if isinstance(stations, dict):
+                    hotspot["up"] = stations.get("up") is True
+                    count = stations.get("count")
+                    hotspot["clients"] = (
+                        count if isinstance(count, int)
+                        and not isinstance(count, bool) else 0)
+                    deadline = stations.get("auto_off_at")
+                    hotspot["auto_off_at"] = (
+                        deadline if isinstance(deadline, (int, float))
+                        and not isinstance(deadline, bool) else None)
+                return
+        hotspot["auto_off_at"] = None
         if check_up:
             try:
                 status = await self.aux("GET", "/wifi/ap/device/status")
@@ -1087,20 +1247,6 @@ class MuonSetup:
         if not hotspot["up"]:
             hotspot["clients"] = 0
             return
-        # OS-5's GET /wifi/ap/stations, else the older POST /wifi/ap/count.
-        if self._stations_route:
-            try:
-                stations = await self.aux("GET", "/wifi/ap/stations")
-            except AuxMissing:
-                self._stations_route = False
-            except (AuxUnavailable, AuxRefused):
-                return
-            else:
-                if isinstance(stations, dict):
-                    hotspot["up"] = bool(stations.get("up", True))
-                    count = stations.get("count")
-                    hotspot["clients"] = count if isinstance(count, int) else 0
-                return
         try:
             count = await self.aux("POST", "/wifi/ap/count")
         except (AuxUnavailable, AuxRefused, AuxMissing):
@@ -1149,6 +1295,7 @@ class MuonSetup:
         except (AuxUnavailable, AuxRefused):
             return
         if isinstance(state, dict) and isinstance(options, dict):
+            # Aux GET /region verbatim, plus the derived market (02 §6).
             self._live["region"] = region.state_region(state, options)
 
     def _refresh_capabilities(self) -> None:

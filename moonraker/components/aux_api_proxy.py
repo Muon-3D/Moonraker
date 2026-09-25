@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Dict, Any, Callable, Optional
 from urllib.parse import unquote, urlencode
 
+from tornado.httpclient import HTTPClientError
+
 from ..utils import ServerError
 
 FASTAPI_ROOT = "http://127.0.0.1:6789"  # loopback-only Aux API bind
@@ -87,6 +89,39 @@ def _aux_error_message(resp: Any) -> Optional[str]:
             if isinstance(item, dict) and isinstance(item.get("msg"), str):
                 return item["msg"].strip() or None
     return None
+
+
+def _aux_error_code(resp: Any) -> Optional[str]:
+    """The Aux API's `detail.code`, e.g. `printer_busy` on a refused install.
+
+    Kept so a caller can branch on the code rather than the English message
+    (KAN-203: muon_setup maps 409s and 422s by it).
+    """
+    try:
+        payload = resp.json()
+    except Exception:
+        return None
+    detail = payload.get("detail") if isinstance(payload, dict) else None
+    code = detail.get("code") if isinstance(detail, dict) else None
+    return code if isinstance(code, str) and code else None
+
+
+def _raise_for_aux_status(resp: Any) -> None:
+    """raise_for_status with the Aux API's own message, and its `detail.code`
+    attached to the ServerError as `aux_code`."""
+    try:
+        resp.raise_for_status(_aux_error_message(resp))
+    except Exception as exc:
+        setattr(exc, "aux_code", _aux_error_code(resp))
+        raise
+
+
+def _not_answering(exc: ServerError) -> bool:
+    """A timeout (599), or a 500 that no HTTP response stands behind."""
+    if exc.status_code == 599:
+        return True
+    return exc.status_code == 500 and not isinstance(
+        exc.__cause__, HTTPClientError)
 
 
 def _has_encoded_separator(path: str) -> bool:
@@ -447,6 +482,12 @@ class AuxAutoProxy:
                 f"{(suffix or '').upper()}"
             ),
             "ssid": derived.get("ssid"),
+            # KAN-403. The Iroh EndpointId muon-link publishes, or None before
+            # it has run or from an Aux that predates the field. Public by
+            # design (PRIV-6): a client matches a printer found on the LAN to
+            # the one in its account with it. A match key, not a trust
+            # decision; the Iroh handshake proves the key.
+            "endpoint_id": derived.get("endpoint_id"),
             # ID-1. The trust identifier. Reported for a trust-context
             # display; it is deliberately not what the name derives from.
             "fingerprint": derived.get("fingerprint"),
@@ -469,13 +510,17 @@ class AuxAutoProxy:
 
         While Aux is not answering -- late at boot, or restarting -- they say
         503, which a client should retry, instead of the 500 a refused
-        connection turns into, which reads as a fault. http_client reports a
-        connection that failed as 500 and a timeout as 599.
+        connection turns into, which reads as a fault (02 §7).
+
+        Only "not answering" becomes 503. http_client reports a timeout as 599
+        and a failed connection as 500 with no HTTP error behind it; a 500
+        that Aux really answered carries Tornado's HTTPClientError as its
+        cause, and keeps its status.
         """
         try:
             return await self.get(path)
         except ServerError as exc:
-            if exc.status_code in (500, 599):
+            if _not_answering(exc):
                 raise self.server.error(
                     f"The Aux API is not answering yet ({path})", 503
                 ) from exc
@@ -546,12 +591,15 @@ class AuxAutoProxy:
             url, headers=self._auth_headers(),
             connect_timeout=3., request_timeout=8.
         )
-        resp.raise_for_status(_aux_error_message(resp))
+        _raise_for_aux_status(resp)
         with contextlib.suppress(Exception):
             return resp.json()
         return resp.content
 
-    async def post(self, path: str, body: Any | None = None) -> Any:
+    async def post(self, path: str, body: Any | None = None,
+                   timeout: float = 15.0) -> Any:
+        # `timeout` is for the few calls that legitimately run long: the
+        # region apply (~8 s, 60 s limit) and a waited update check (KAN-203).
         url = f"{FASTAPI_ROOT}{path}"
 
         # Prepare body + headers the way Moonraker's http_client expects.
@@ -574,9 +622,9 @@ class AuxAutoProxy:
             body=raw_body,
             headers=self._auth_headers(headers),
             connect_timeout=3.0,
-            request_timeout=15.0,
+            request_timeout=timeout,
         )
-        resp.raise_for_status(_aux_error_message(resp))
+        _raise_for_aux_status(resp)
         try:
             return resp.json()
         except Exception:
@@ -592,7 +640,7 @@ class AuxAutoProxy:
             connect_timeout=3.,
             request_timeout=8.,
         )
-        resp.raise_for_status(_aux_error_message(resp))
+        _raise_for_aux_status(resp)
         with contextlib.suppress(Exception):
             return resp.json()
         return resp.content
