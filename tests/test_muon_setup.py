@@ -50,8 +50,8 @@ class TestFreshStartAndMigration:
             "transport_clips", "self_test", "load_filament"]
 
     @pytest.mark.parametrize("signal", [
-        "marker", "marker_on_a_174_image", "saved_wifi",
-        "connected_wifi_on_an_older_image", "fluidd_settings", "link",
+        "marker", "saved_wifi", "connected_wifi_on_an_older_image",
+        "saved_wifi_in_range_on_an_older_image", "fluidd_settings", "link",
     ])
     def test_a_printer_already_in_use_is_marked_complete_not_sent_to_setup(
         self, signal: str
@@ -62,16 +62,20 @@ class TestFreshStartAndMigration:
         if signal == "marker":
             aux.routes[("GET", "/setup/complete")] = {
                 "complete": True, "completed_at": None, "by": "muon_setup"}
-        elif signal == "marker_on_a_174_image":
-            del aux.routes[("GET", "/setup/complete")]
-            aux.routes[("GET", "/setup")] = {
-                "complete": True, "language": "en", "completed_at": None}
         elif signal == "saved_wifi":
             aux.routes[("GET", "/wifi/saved")] = [
                 {"name": "HomeWiFi", "uuid": "u1", "device": None}]
         elif signal == "connected_wifi_on_an_older_image":
             del aux.routes[("GET", "/wifi/saved")]
             aux.routes[("GET", "/wifi/current")] = {"ssid": "HomeWiFi"}
+        elif signal == "saved_wifi_in_range_on_an_older_image":
+            # No /wifi/saved and nothing associated yet: 01 §7 asks each
+            # scanned SSID with GET /wifi/show?ssid=.
+            del aux.routes[("GET", "/wifi/saved")]
+            aux.routes[("GET", "/wifi/current")] = None
+            aux.routes[("GET", "/wifi/scan")] = [
+                {"ssid": "Neighbour"}, {"ssid": "HomeWiFi"}]
+            aux.routes[("GET", "/wifi/show?ssid=HomeWiFi")] = {"id": "HomeWiFi"}
         elif signal == "fluidd_settings":
             namespaces["fluidd"] = {"uiSettings": {"general": {"locale": "en"}}}
             aux.down = True  # no Aux needed for this one
@@ -98,14 +102,90 @@ class TestFreshStartAndMigration:
         ), state["steps"]
         # Nothing was skipped, so no "Finish setup" card.
         assert model.card_steps(state) == []
-        # A migrated printer has no marker to write.
-        assert aux.posted("/setup/complete") == []
+        # 02 §4: it writes the marker, or OS-5's H1 keeps the hotspot up for
+        # good. With Aux down (the Fluidd case) the write is retried later.
+        if signal == "fluidd_settings":
+            assert h.setup._marker_task is not None
+        else:
+            assert aux.posted("/setup/complete") == [{"by": "migrated"}]
         assert aux.posted("/setup") == []
 
-    def test_an_image_without_the_newer_routes_reads_as_new(self):
-        """Every signal route absent (404) means no signal, not "unknown":
-        an image that has no marker route never wrote a marker."""
+    def test_an_image_with_no_way_to_ask_decides_only_after_the_limit(
+        self, monkeypatch
+    ):
+        """No marker route, no /wifi/saved, no scan: every Wi-Fi answer is
+        "can't tell yet", so nothing is stored until MIGRATION_UNSURE_LIMIT
+        has passed. Only then is the printer called new."""
+        monkeypatch.setattr(pkg, "MIGRATION_RETRY", 0.01)
+        monkeypatch.setattr(pkg, "MIGRATION_UNSURE_LIMIT", 0.1)
         aux = FakeAux({})
+
+        async def go():
+            h = Harness(aux=aux)
+            start = asyncio.ensure_future(h.setup._startup(poll=False))
+            await asyncio.sleep(0.03)
+            assert "state" not in h.db.namespaces["muon_setup"]
+            await asyncio.wait_for(start, 2)
+            return h
+        assert run(go()).doc["state"] == "new"
+
+    @pytest.mark.parametrize("unsure", ["not_associated_yet", "empty_scan",
+                                        "link_not_answering"])
+    def test_a_field_unit_is_never_trapped_by_an_early_answer(
+        self, unsure: str, monkeypatch
+    ):
+        """The review's trap: on an image without /wifi/saved, /wifi/current
+        is null until NetworkManager associates, and that must not be saved
+        as `new`. Once the real answer arrives, the unit is migrated."""
+        monkeypatch.setattr(pkg, "MIGRATION_RETRY", 0.01)
+        aux = fresh_aux()
+        del aux.routes[("GET", "/wifi/saved")]
+        aux.routes[("GET", "/wifi/current")] = None
+        aux.routes[("GET", "/wifi/scan")] = [] if unsure == "empty_scan" else [
+            {"ssid": "HomeWiFi"}]
+        extra: Dict[str, Any] = {}
+        link_state = {"answering": False}
+        if unsure == "link_not_answering":
+            aux.routes[("GET", "/wifi/scan")] = [{"ssid": "Neighbour"}]
+
+            class Link:
+                async def call(self, method: str, path: str) -> Dict[str, Any]:
+                    if not link_state["answering"]:
+                        raise ServerError("muon-link is not answering", 503)
+                    return {"phase": "linked", "account": "a@b.c",
+                            "connected": True}
+            extra["muon_link"] = Link()
+
+        if unsure == "not_associated_yet":
+            # Its saved profile is found by name, associated or not.
+            aux.routes[("GET", "/wifi/show?ssid=HomeWiFi")] = {"id": "HomeWiFi"}
+
+        async def go():
+            h = Harness(aux=aux)
+            h.server.components.update(extra)
+            start = asyncio.ensure_future(h.setup._startup(poll=False))
+            await asyncio.sleep(0.05)
+            if unsure == "not_associated_yet":
+                await asyncio.wait_for(start, 2)
+                assert h.stored()["state"] == "complete"
+                return h
+            assert h.setup.doc is None
+            assert "state" not in h.db.namespaces["muon_setup"]
+            if unsure == "link_not_answering":
+                link_state["answering"] = True
+            else:
+                aux.routes[("GET", "/wifi/current")] = {"ssid": "HomeWiFi"}
+            await asyncio.wait_for(start, 2)
+            return h
+        assert run(go()).doc["state"] == "complete"
+
+    @pytest.mark.parametrize("profile", ["ap0-con", "Muon3D_Dev"])
+    def test_the_hotspot_and_the_dev_images_profile_are_not_earlier_use(
+        self, profile: str
+    ):
+        """02 §8 test 1: every M1-dev image bakes a Muon3D_Dev profile."""
+        aux = fresh_aux(**{"GET /wifi/saved": [
+            {"name": profile, "uuid": "u1", "device": None}]})
 
         async def go():
             return await Harness(aux=aux).start()
@@ -341,6 +421,36 @@ class TestRevAndDriver:
         assert model.driver_public(doc, 30., now=131.0)["lapsed"] is True
         panel = dict(doc, kind="panel")
         assert model.driver_public(panel, 30., now=10_000.0)["lapsed"] is False
+
+    def test_a_lapse_is_announced_once_without_changing_rev(self):
+        """02 §6: renewals are silent, so the panel learns of a lapse only
+        from this notification."""
+        async def go():
+            h = Harness(options={"driver_lease": "0.05"})
+            await h.start()
+            await h.post("/driver", {"rev": 1, "kind": "phone",
+                                     "client_id": "p1"}, kind="hotspot")
+            announced = len(h.server.changes())
+            await asyncio.sleep(0.7)
+            lapses = h.server.changes()[announced:]
+            assert len(lapses) == 1
+            assert lapses[0]["driver"]["lapsed"] is True
+            assert lapses[0]["rev"] == 1
+        run(go())
+
+    @pytest.mark.parametrize("kind", ["hotspot", "lan"])
+    def test_the_app_can_claim_the_driver_from_the_hotspot_or_the_lan(
+        self, kind: str
+    ):
+        """02 §8 test 3 (KAN-399): stored as `app`, with the caller's access."""
+        async def go():
+            h = await Harness().start()
+            result = await h.post("/driver", {"rev": 1, "kind": "app",
+                                              "client_id": "a1"}, kind=kind)
+            assert result["state"]["driver"]["kind"] == "app"
+            with pytest.raises(ServerError):
+                await h.post("/reset", {}, kind=kind)
+        run(go())
 
     def test_a_write_from_another_surface_takes_the_driver(self):
         async def go():
@@ -787,25 +897,94 @@ class TestFinish:
         assert h.aux.posted("/wifi/ap/auto_off") == [{"after_s": 900}]
         assert h.setup.public_state()["hotspot"]["auto_off_at"] is not None
 
-    def test_an_image_carrying_174_gets_its_marker_shape_instead(self):
-        """No OS-7 route, but MuonOS#174's POST /setup: the marker is written
-        there, with the language, and reset cannot clear it."""
-        aux = fresh_aux(**{"POST /setup": lambda body: dict(body)})
-        del aux.routes[("POST", "/setup/complete")]
-        del aux.routes[("DELETE", "/setup/complete")]
+    def test_finish_writes_the_marker_then_fires_complete_then_auto_off(self):
+        """02 §5.11: in that order."""
+        order: List[str] = []
+        aux = fresh_aux()
+        post_marker = aux.routes[("POST", "/setup/complete")]
+        post_off = aux.routes[("POST", "/wifi/ap/auto_off")]
+
+        def marker(body: Any) -> Any:
+            order.append("marker")
+            return post_marker(body)
+
+        def auto_off(body: Any) -> Any:
+            order.append("auto_off")
+            return post_off(body)
+        aux.routes[("POST", "/setup/complete")] = marker
+        aux.routes[("POST", "/wifi/ap/auto_off")] = auto_off
 
         async def go():
             h = await Harness(stored=self._stored(), aux=aux).start()
+            real_send = h.server.send_event
+
+            def send(event: str, *args: Any) -> None:
+                if event == "muon_setup:complete":
+                    order.append("event")
+                real_send(event, *args)
+            h.server.send_event = send  # type: ignore[assignment]
             await h.post("/finish", {"rev": 5})
             await h.setup.drain()
-            reset = await h.post("/reset", {})
-            assert reset["ok"] is True
             return h
         h = run(go())
-        (marker,) = h.aux.posted("/setup")
-        assert marker["complete"] is True
-        assert marker["language"] == "de"
-        assert isinstance(marker["completed_at"], str)
+        assert order == ["marker", "event", "auto_off"]
+        # The deadline is the OS's, read back from GET /wifi/ap/stations.
+        assert h.setup.public_state()["hotspot"]["auto_off_at"] == 1790252700.0
+
+    def test_keep_by_default_keeps_a_real_name(self):
+        """finish answers a pending name with "Keep", which must keep the
+        name, not store null (02 §5.7)."""
+        async def go():
+            h = await Harness(stored=self._stored()).start()
+            await h.post("/finish", {"rev": 5})
+            await h.setup.drain()
+            return h
+        h = run(go())
+        assert h.stored()["steps"]["name"]["value"] == "Walnut"
+        assert h.setup.public_state()["steps"]["name"]["value"] == "Walnut"
+
+    def test_after_complete_a_done_network_cannot_be_skipped(self):
+        """A LAN client must not turn a done step into a skipped one and
+        bring the card back."""
+        async def go():
+            h = await Harness(stored=self._stored()).start()
+            await h.post("/finish", {"rev": 5})
+            await h.setup.drain()
+            result = await h.post("/skip", {"rev": h.doc["rev"],
+                                            "step": "network"}, kind="lan")
+            assert result["error"]["code"] == "invalid_step"
+            assert h.doc["steps"]["network"]["status"] == "done"
+            # ready's skip is the one that stays open.
+            again = await h.post("/skip", {"rev": h.doc["rev"], "step": "ready"})
+            assert again["ok"] is True
+        run(go())
+
+    def test_a_reset_during_an_outage_is_not_undone_by_the_marker_retry(
+        self, monkeypatch
+    ):
+        """02 §4: finish hits an Aux outage, a reset follows, Aux comes back.
+        The marker must end up cleared, not written back."""
+        monkeypatch.setattr(pkg, "MARKER_RETRY", 0.01)
+
+        async def go():
+            h = await Harness(stored=self._stored()).start()
+            h.aux.down = True
+            await h.post("/finish", {"rev": 5})
+            for _ in range(5):
+                await asyncio.sleep(0.01)
+            reset = await h.post("/reset", {})
+            assert reset["state"]["state"] == "new"
+            h.aux.down = False
+            await asyncio.wait_for(h.setup.drain(), 2)
+            return h
+        h = run(go())
+        answered = [c for c in h.aux.calls if c[1] == "/setup/complete"]
+        # Every POST was an attempt made while Aux was down; the last call
+        # that went through is the DELETE.
+        assert answered[-1][0] == "DELETE"
+        internal = h.db.namespaces["muon_setup"]["internal"]
+        assert internal.get("marker_clear_pending") is False
+        assert not internal.get("marker_written")
 
     def test_no_auto_off_without_an_uplink_address(self):
         async def go():
@@ -941,6 +1120,49 @@ class TestReset:
             assert ("GET", "/setup/complete", None) not in h.aux.calls
         run(go())
 
+    def test_reset_keeps_rev_increasing(self):
+        """02 §5.11: screens holding the old state ignore a lower `rev`."""
+        async def go():
+            h = await Harness(stored=state_with(
+                language={"status": "done", "value": "en"})).start()
+            before = h.doc["rev"]
+            result = await h.post("/reset", {})
+            assert result["state"]["rev"] == before + 1
+            assert h.server.changes()[-1]["rev"] == before + 1
+        run(go())
+
+    def test_another_component_may_not_reset(self):
+        """02 §3: internal callers may do everything except reset."""
+        async def go():
+            h = await Harness(stored=state_with(
+                language={"status": "done", "value": "en"})).start()
+            with pytest.raises(ServerError) as info:
+                await h.call("internal", "/server/muon/setup/reset", {})
+            assert info.value.status_code == 403
+            assert h.doc["state"] == "in_progress"
+        run(go())
+
+    def test_a_failed_delete_is_retried_while_the_state_is_short_of_complete(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(pkg, "MARKER_RETRY", 0.01)
+
+        async def go():
+            h = await Harness(stored=state_with(
+                language={"status": "done", "value": "en"})).start()
+            h.aux.down = True
+            await h.post("/reset", {})
+            for _ in range(5):
+                await asyncio.sleep(0.01)
+            h.aux.down = False
+            await asyncio.wait_for(h.setup.drain(), 2)
+            return h
+        h = run(go())
+        deletes = [c for c in h.aux.calls if c[:2] == ("DELETE", "/setup/complete")]
+        assert len(deletes) >= 2
+        internal = h.db.namespaces["muon_setup"]["internal"]
+        assert internal["marker_clear_pending"] is False
+
 
 # ==========================================================================
 # 13. Aux unavailable (02 §1)
@@ -1002,6 +1224,8 @@ class TestLiveFields:
     ):
         monkeypatch.setattr(pkg.socket, "gethostname", lambda: "Muon-walnut-8987")
         aux = fresh_aux()
+        # An image without OS-5: the device state and the bare count.
+        del aux.routes[("GET", "/wifi/ap/stations")]
         aux.routes[("POST", "/wifi/ap/count")] = 2
 
         async def go():
@@ -1015,16 +1239,18 @@ class TestLiveFields:
             "auto_off_at": None, "address": "10.42.0.1"}
         assert state["steps"]["name"]["value"] == "Walnut"
         assert state["steps"]["name"]["derived"] == "walnut"
-        assert state["region"] == {"market": "picker", "country": "DE",
-                                   "declared": False, "config": "de",
-                                   "source": "default"}
+        assert state["region"] == dict(REGION_174, market="picker")
 
-    def test_the_stations_route_is_preferred_when_the_image_has_it(self):
-        aux = fresh_aux(**{"GET /wifi/ap/stations": {"up": True, "count": 3}})
+    def test_the_hotspot_comes_from_os5s_stations_route(self):
+        """02 §6: {up, count, auto_off_at}; the deadline is the OS's."""
+        aux = fresh_aux(**{"GET /wifi/ap/stations": {
+            "up": True, "count": 3, "auto_off_at": 1790252700.0}})
 
         async def go():
             return (await Harness(aux=aux).start()).setup.public_state()
-        assert run(go())["hotspot"]["clients"] == 3
+        hotspot = run(go())["hotspot"]
+        assert hotspot["clients"] == 3
+        assert hotspot["auto_off_at"] == 1790252700.0
         assert ("POST", "/wifi/ap/count", None) not in aux.calls
 
     def test_the_state_document_has_the_spec_keys_in_order(self):
@@ -1044,8 +1270,8 @@ class TestOptions:
         assert options["languages"][:2] == [
             {"code": "en", "endonym": "English"},
             {"code": "de", "endonym": "Deutsch"}]
-        assert options["region"]["market"] == "picker"
-        assert options["region"]["default_country"] == "DE"
+        # Aux GET /region/options, verbatim (02 §5.2).
+        assert options["region"] == REGION_OPTIONS_174
         assert options["ready_manifest"] == manifest.DEFAULT_MANIFEST
 
     def test_the_configured_languages_are_offered_in_order(self):
@@ -1097,34 +1323,15 @@ class TestManifest:
         assert manifest.load(str(path)) == shipped
 
 
-class TestRegionMapping:
-    """MuonOS#174's region routes, reshaped into 02 §5.2 and §6."""
+class TestRegion:
+    """02 §5.2 and §6: MuonOS#174's region routes, passed through, plus the
+    derived `market`."""
 
-    def test_an_eu_unit_with_the_fallback_applied(self):
-        assert region.state_region(REGION_174, REGION_OPTIONS_174) == {
-            "market": "picker", "country": "DE", "declared": False,
-            "config": "de", "source": "default"}
-        opts = region.options_region(REGION_174, REGION_OPTIONS_174)
-        assert opts["applied"] == {"country": "DE", "config": "de",
-                                   "declared": False}
-        assert opts["default_country"] == "DE"
-        assert opts["permitted_channels"][-1] == 48
-        # Not served by #174: left empty rather than guessed.
-        assert opts["for_language"] == []
-        assert opts["all"] is None
-        assert opts["support_code"] is None
-
-    def test_a_declared_country_detected_from_the_joined_network(self):
-        declared = dict(REGION_174, declared_country="GB", domain="GB",
-                        configuration="gb", detected_country="GB",
-                        basis="joined-network")
-        options = dict(REGION_OPTIONS_174, preselect="GB",
-                       basis="joined-network")
-        state = region.state_region(declared, options)
-        assert state == {"market": "picker", "country": "GB", "declared": True,
-                         "config": "gb", "source": "ap"}
-        # A detection hides the token default behind `preselect`.
-        assert region.options_region(declared, options)["default_country"] is None
+    def test_the_state_carries_every_aux_field_plus_market(self):
+        state = region.state_region(REGION_174, REGION_OPTIONS_174)
+        assert state == dict(REGION_174, market="picker")
+        assert state["explanation"] == REGION_174["explanation"]
+        assert state["enforcement"] == REGION_174["enforcement"]
 
     def test_a_us_locked_unit(self):
         us = dict(REGION_174, domain="US", configuration="us", locked=True)
@@ -1132,11 +1339,16 @@ class TestRegionMapping:
                    "locked": True}
         assert region.market(us, options) == "locked"
 
-    def test_a_unit_with_no_token(self):
+    def test_no_countries_is_market_none(self):
         none = dict(REGION_174, reason="no-token", domain="00",
                     configuration=None, channels=[])
         options = {"countries": [], "preselect": None, "basis": None,
                    "locked": False}
-        state = region.state_region(none, options)
-        assert state == {"market": "none", "country": None, "declared": False,
-                         "config": None, "source": None}
+        assert region.state_region(none, options)["market"] == "none"
+
+    def test_the_network_step_carries_the_region_confirmation(self):
+        async def go():
+            return (await Harness().start()).setup.public_state()
+        network = run(go())["steps"]["network"]
+        assert network["region_confirmed"] is False
+        assert network["region_error"] is None
