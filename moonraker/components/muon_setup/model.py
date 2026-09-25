@@ -50,6 +50,8 @@ def default_steps(ready_item_ids: List[str]) -> Dict[str, Any]:
         "network": {
             "status": PENDING, "kind": None, "ssid": None, "addresses": [],
             "hostname_local": None, "internet": None, "error": None,
+            # 02 §5.6a: the region is confirmed after the join.
+            "region_confirmed": False, "region_error": None,
         },
         "name": {"status": PENDING, "value": None, "derived": None},
         "update": {
@@ -95,6 +97,7 @@ def migrated_document(ready_item_ids: List[str]) -> Dict[str, Any]:
     for step in doc["steps"].values():
         step["status"] = DONE
     doc["steps"]["language"]["source"] = "migrated"
+    doc["steps"]["network"]["region_confirmed"] = True
     for item in doc["steps"]["ready"]["items"]:
         item["status"] = DONE
     return doc

@@ -104,11 +104,11 @@ enable_custom_config_write_access: True
 # out of reach (GATE-2(g)).
 trust_onlink_ipv6: true
 #
-# THE `unless configured` HALF IS NOT BUILT. An owner who wants a sign-in has no
-# way to ask for one, and creating a Moonraker user does not produce one either:
-# a trusted client bypasses login entirely, so the account would be ignored. That
-# switch is `SEC-8` Level 1 (KAN-25), and until it exists this file is the whole
-# policy.
+# The `unless configured` half is `SEC-8` Level 1, in [muon_protection] below.
+# It is not a Moonraker user and never will be: a trusted client bypasses login
+# entirely, so an account would be ignored, and a second user would 401 the
+# panel (MuonOS #87). Level 1 instead refuses /server/aux and /machine/update to
+# any caller this list is the only credential for.
 #
 # NOTE on force_logins: authorization.py:883 only honours it when
 # len(self.users) > 1, and _API_KEY_USER_ always occupies one slot, so on a
@@ -209,6 +209,13 @@ ready_manifest: /usr/share/muon/setup/ready.json
 # MuonOS's muon-link.service; a MuonOS test compares the two.
 [muon_gateway]
 socket_path: /home/printer_admin/comms/muon-gateway.sock
+
+# SEC-8. The protection level the owner sets at the panel: Level 0 (Open, the
+# shipped default) or Level 1 (Protected, where /server/aux and /machine/update
+# need an identity -- the panel, or a paired client through muon_gateway). Only
+# a panel caller can change it (POST /server/muon/protection). Without this
+# section the level cannot be raised at all, and the printer is Open for good.
+[muon_protection]
 
 # KAN-162: start the bed ramp when a job is queued instead of at the top
 # of PRINT_START.  This turns on the 170W bed heater with no human input,

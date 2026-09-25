@@ -9,9 +9,14 @@ import logging
 import os
 import re
 import contextlib
+import unicodedata
 from pathlib import Path
 from typing import Dict, Any, Callable, Optional
 from urllib.parse import unquote, urlencode
+
+from tornado.httpclient import HTTPClientError
+
+from ..utils import ServerError
 
 FASTAPI_ROOT = "http://127.0.0.1:6789"  # loopback-only Aux API bind
 OPENAPI_PATH = "/openapi.json"  # FastAPI default
@@ -87,6 +92,39 @@ def _aux_error_message(resp: Any) -> Optional[str]:
     return None
 
 
+def _aux_error_code(resp: Any) -> Optional[str]:
+    """The Aux API's `detail.code`, e.g. `printer_busy` on a refused install.
+
+    Kept so a caller can branch on the code rather than the English message
+    (KAN-203: muon_setup maps 409s and 422s by it).
+    """
+    try:
+        payload = resp.json()
+    except Exception:
+        return None
+    detail = payload.get("detail") if isinstance(payload, dict) else None
+    code = detail.get("code") if isinstance(detail, dict) else None
+    return code if isinstance(code, str) and code else None
+
+
+def _raise_for_aux_status(resp: Any) -> None:
+    """raise_for_status with the Aux API's own message, and its `detail.code`
+    attached to the ServerError as `aux_code`."""
+    try:
+        resp.raise_for_status(_aux_error_message(resp))
+    except Exception as exc:
+        setattr(exc, "aux_code", _aux_error_code(resp))
+        raise
+
+
+def _not_answering(exc: ServerError) -> bool:
+    """A timeout (599), or a 500 that no HTTP response stands behind."""
+    if exc.status_code == 599:
+        return True
+    return exc.status_code == 500 and not isinstance(
+        exc.__cause__, HTTPClientError)
+
+
 def _has_encoded_separator(path: str) -> bool:
     """True if percent-decoding `path` would introduce a new separator.
 
@@ -137,6 +175,13 @@ class AuxAutoProxy:
         # outlive whichever interface set it.
         self.database = self.server.lookup_component("database")
         self.database.register_local_namespace(MUON_NAMESPACE)
+        # MR-9 (KAN-203): the Muon endpoints below are served by the helpers,
+        # not mirrored from the spec, so they do not need the spec to exist.
+        # They used to be registered only after _fetch_spec() succeeded, so an
+        # Aux API that was late at boot made component_init raise and left
+        # them missing until Moonraker restarted: a printer that could not
+        # say its own name. Registered here, they answer 503 until Aux does.
+        self._register_muon_endpoints()
 
     # Moonraker calls this coroutine right after all components load
     async def component_init(self):
@@ -188,23 +233,8 @@ class AuxAutoProxy:
         rsp.raise_for_status()
         return rsp.json()
 
-    # ---------- build Moonraker endpoints from the spec -----------------
-    def _register_from_spec(self, spec: Dict[str, Any]):
-        needs_proxy = False
-
-        self._spec = spec
-        # KAN-83: every path the dynamic proxy is allowed to reach. Built
-        # from the spec rather than hand-written, so it cannot drift from
-        # the routes that actually exist.
-        self._proxy_allowed: list[tuple[re.Pattern[str], frozenset[str]]] = []
-
-        # register the raw OpenAPI document
-        self.server.register_endpoint(
-            f"{MOON_PREFIX}/openapi.json",
-            ["GET"],
-            self._openapi_handler
-        )
-
+    # ---------- Muon endpoints served by the helpers --------------------
+    def _register_muon_endpoints(self) -> None:
         # MUON, DEV-4: developer mode must be visible on the panel *and* in the
         # interface.  SEC-2 keeps /server/aux/dev_mode on the floor, and
         # `is_floor_endpoint` matches that prefix and everything under it, so
@@ -248,6 +278,23 @@ class AuxAutoProxy:
             "/server/muon/identity/name",
             ["POST"],
             self._set_identity_name_handler
+        )
+
+    # ---------- build Moonraker endpoints from the spec -----------------
+    def _register_from_spec(self, spec: Dict[str, Any]):
+        needs_proxy = False
+
+        self._spec = spec
+        # KAN-83: every path the dynamic proxy is allowed to reach. Built
+        # from the spec rather than hand-written, so it cannot drift from
+        # the routes that actually exist.
+        self._proxy_allowed: list[tuple[re.Pattern[str], frozenset[str]]] = []
+
+        # register the raw OpenAPI document
+        self.server.register_endpoint(
+            f"{MOON_PREFIX}/openapi.json",
+            ["GET"],
+            self._openapi_handler
         )
 
         for fast_path, path_item in spec.get("paths", {}).items():
@@ -393,9 +440,15 @@ class AuxAutoProxy:
         # return exactly the JSON you fetched from FastAPI
         return self._spec
 
-    # ---------- read-only developer-mode state (DEV-4) ------------------
+    # ---------- the printer's name (ID-2/ID-3/ID-4) ---------------------
     async def _identity_handler(self, webreq):
+        return await self.get_identity()
+
+    async def get_identity(self) -> Dict[str, Any]:
         """ID-2/ID-3/ID-4: what this printer is called, and what it is.
+
+        Public so muon_setup reads the same answer as GET
+        /server/muon/identity (KAN-203, spec 02 §5.7).
 
         `name` is what a person should be shown: the owner's rename if there
         is one, otherwise the name derived from the hardware serial. `source`
@@ -407,7 +460,7 @@ class AuxAutoProxy:
         label -- and that promise is about the derived name, whatever the
         current override happens to be.
         """
-        derived = await self.get("/identity")
+        derived = await self._get_or_unavailable("/identity")
         if not isinstance(derived, dict):
             raise self.server.error("Aux returned an unreadable identity", 502)
 
@@ -430,10 +483,49 @@ class AuxAutoProxy:
                 f"{(suffix or '').upper()}"
             ),
             "ssid": derived.get("ssid"),
+            # KAN-403. The Iroh EndpointId muon-link publishes, or None before
+            # it has run or from an Aux that predates the field. Public by
+            # design (PRIV-6): a client matches a printer found on the LAN to
+            # the one in its account with it. A match key, not a trust
+            # decision; the Iroh handshake proves the key.
+            "endpoint_id": derived.get("endpoint_id"),
             # ID-1. The trust identifier. Reported for a trust-context
             # display; it is deliberately not what the name derives from.
             "fingerprint": derived.get("fingerprint"),
+            # KAN-203 (spec 02 §7): whether this printer still needs setting
+            # up, so an app that finds it can route it (06 §1).
+            "setup": self._setup_state(),
         }
+
+    def _setup_state(self) -> Optional[str]:
+        """new | in_progress | complete, from muon_setup, or None when it is
+        not configured on this printer."""
+        setup = self.server.lookup_component("muon_setup", None)
+        if setup is None:
+            return None
+        state = setup.public_state().get("state")
+        return state if isinstance(state, str) else None
+
+    async def _get_or_unavailable(self, path: str) -> Any:
+        """GET from Aux for the Muon endpoints registered in __init__.
+
+        While Aux is not answering -- late at boot, or restarting -- they say
+        503, which a client should retry, instead of the 500 a refused
+        connection turns into, which reads as a fault (02 §7).
+
+        Only "not answering" becomes 503. http_client reports a timeout as 599
+        and a failed connection as 500 with no HTTP error behind it; a 500
+        that Aux really answered carries Tornado's HTTPClientError as its
+        cause, and keeps its status.
+        """
+        try:
+            return await self.get(path)
+        except ServerError as exc:
+            if _not_answering(exc):
+                raise self.server.error(
+                    f"The Aux API is not answering yet ({path})", 503
+                ) from exc
+            raise
 
     async def _set_identity_name_handler(self, webreq):
         """ID-2: the owner renames the printer.
@@ -445,10 +537,33 @@ class AuxAutoProxy:
         name = args.get("name")
         if name is None:
             raise self.server.error("A 'name' argument is required", 400)
+        return await self.set_friendly_name(name)
+
+    async def set_friendly_name(self, name: Any) -> Dict[str, Any]:
+        """Store the owner's rename, or clear it with an empty name, and
+        return the identity. Public so muon_setup's name step applies the
+        same rules as POST /server/muon/identity/name (spec 02 §5.7)."""
+        # Settings' rename answers with the identity, so ask Aux first: a
+        # 503 after the write would report a failure for a rename that
+        # happened. muon_setup's name step uses store_friendly_name(), which
+        # works with Aux down (02 §5.7).
+        await self._get_or_unavailable("/identity")
+        await self.store_friendly_name(name)
+        return await self.get_identity()
+
+    async def store_friendly_name(self, name: Any) -> str:
+        """The rename alone, with no Aux call: it lives in Moonraker's
+        database, so it can be saved while Aux is down. Returns the name as
+        stored, stripped; "" means the override was cleared."""
         if not isinstance(name, str):
             raise self.server.error("'name' must be a string", 400)
 
         name = name.strip()
+        # 02 §5.7: no control characters (C0, C1, newlines), and the length
+        # is counted in code points, which is what len() of a str counts.
+        if any(unicodedata.category(ch) == "Cc" for ch in name):
+            raise self.server.error(
+                "A printer name may not contain control characters", 400)
         if len(name) > MAX_NAME_LENGTH:
             raise self.server.error(
                 f"A printer name may be at most {MAX_NAME_LENGTH} characters",
@@ -466,11 +581,10 @@ class AuxAutoProxy:
                 await self.database.delete_item(
                     MUON_NAMESPACE, FRIENDLY_NAME_KEY
                 )
-
-        return await self._identity_handler(webreq)
+        return name
 
     async def _dev_mode_status_handler(self, webreq):
-        state = await self.get("/dev_mode")
+        state = await self._get_or_unavailable("/dev_mode")
         if not isinstance(state, dict):
             raise self.server.error(
                 "Aux returned an unreadable dev_mode state", 502
@@ -488,12 +602,15 @@ class AuxAutoProxy:
             url, headers=self._auth_headers(),
             connect_timeout=3., request_timeout=8.
         )
-        resp.raise_for_status(_aux_error_message(resp))
+        _raise_for_aux_status(resp)
         with contextlib.suppress(Exception):
             return resp.json()
         return resp.content
 
-    async def post(self, path: str, body: Any | None = None) -> Any:
+    async def post(self, path: str, body: Any | None = None,
+                   timeout: float = 15.0) -> Any:
+        # `timeout` is for the few calls that legitimately run long: the
+        # region apply (~8 s, 60 s limit) and a waited update check (KAN-203).
         url = f"{FASTAPI_ROOT}{path}"
 
         # Prepare body + headers the way Moonraker's http_client expects.
@@ -516,9 +633,9 @@ class AuxAutoProxy:
             body=raw_body,
             headers=self._auth_headers(headers),
             connect_timeout=3.0,
-            request_timeout=15.0,
+            request_timeout=timeout,
         )
-        resp.raise_for_status(_aux_error_message(resp))
+        _raise_for_aux_status(resp)
         try:
             return resp.json()
         except Exception:
@@ -534,7 +651,7 @@ class AuxAutoProxy:
             connect_timeout=3.,
             request_timeout=8.,
         )
-        resp.raise_for_status(_aux_error_message(resp))
+        _raise_for_aux_status(resp)
         with contextlib.suppress(Exception):
             return resp.json()
         return resp.content
