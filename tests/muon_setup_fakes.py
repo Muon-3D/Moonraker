@@ -299,8 +299,20 @@ REGION_OPTIONS_174 = {
 
 
 def fresh_aux(**extra: Route) -> FakeAux:
-    """A new unit's Aux: no marker, no saved networks, hotspot up."""
+    """A new unit's Aux: no marker, no saved networks, hotspot up.
+
+    OS-5's routes are live: POST /wifi/ap/auto_off sets the deadline that
+    GET /wifi/ap/stations then reports, as the real lifecycle does.
+    """
+    ap: Dict[str, Any] = {"up": True, "count": 0, "auto_off_at": None}
+
+    def auto_off(body: Any) -> Dict[str, Any]:
+        ap["auto_off_at"] = 1790252700.0
+        return {"after_s": body["after_s"], "auto_off_at": ap["auto_off_at"]}
+
     routes: Dict[Tuple[str, str], Route] = {
+        ("GET", "/wifi/ap/stations"): lambda body: dict(ap),
+        ("POST", "/wifi/ap/auto_off"): auto_off,
         # OS-7's marker (MuonOS#313).
         ("GET", "/setup/complete"): {"complete": False, "completed_at": None,
                                      "by": None},
@@ -316,7 +328,6 @@ def fresh_aux(**extra: Route) -> FakeAux:
             "by": body.get("by")},
         ("DELETE", "/setup/complete"): {"complete": False, "completed_at": None,
                                         "by": None},
-        ("POST", "/wifi/ap/auto_off"): {"ok": True},
     }
     for key, value in extra.items():
         method, path = key.split(" ", 1)
