@@ -72,8 +72,9 @@ class TestWhatIsOnTheFloor:
             "/server/aux/bms/standby",
             "/server/aux/bms/fault",
             "/server/aux/bms/ship",
-            "/server/aux/setup/complete",
+            "/server/aux/setup",
             "/server/aux/wifi/ap/auto_off",
+            "/server/aux/time",
         )
 
     @pytest.mark.parametrize(
@@ -156,17 +157,31 @@ class TestWhatIsOnTheFloor:
         "endpoint",
         [
             "/server/aux/setup/complete",
+            # Draft MuonOS#174's older marker, under the same prefix.
+            "/server/aux/setup",
             "/server/aux/wifi/ap/auto_off",
+            "/server/aux/time",
+            "/server/aux/time/zone",
         ],
     )
     def test_the_first_run_setup_writes_are_floored(self, endpoint: str):
-        """KAN-413 / KAN-411. Only ``muon_setup`` writes these, in-process.
+        """KAN-413 / KAN-411 / KAN-412. Only ``muon_setup`` writes these.
 
         From the network, marking setup complete would stop a new printer's
         setup and let its hotspot go off; clearing it would send a working
-        printer back to its first screen. Spelled out, not derived.
+        printer back to its first screen; setting the clock would skip
+        muon_setup's hotspot-only rule. Spelled out, not derived.
         """
         assert is_floor_endpoint(endpoint)
+
+    @pytest.mark.parametrize(
+        "endpoint",
+        ["/server/aux/setupx", "/server/aux/timezone", "/server/aux/time_sync"],
+    )
+    def test_the_setup_and_time_entries_stop_at_a_segment(self, endpoint: str):
+        """The prefixes are whole segments: a sibling route that merely starts
+        with the same letters is not floored by them."""
+        assert not is_floor_endpoint(endpoint)
 
     @pytest.mark.parametrize(
         "endpoint",
@@ -249,6 +264,40 @@ class TestWhoIsAllowedThrough:
         """DEV-5. The single action, from the interface that offers it."""
         check_floor("/server/aux/dev_mode/refresh", HTTP, LAN)
         check_floor("/server/aux/dev_mode/backup", HTTP, LAN)
+
+    @pytest.mark.parametrize(
+        "endpoint",
+        [
+            "/server/aux/setup/complete",
+            "/server/aux/wifi/ap/auto_off",
+            "/server/aux/time",
+            "/server/aux/time/zone",
+        ],
+    )
+    def test_the_setup_writes_are_denied_to_a_lan_caller(self, endpoint: str):
+        """KAN-413 / KAN-411 / KAN-412, through the check itself, not only the
+        membership test."""
+        with pytest.raises(ServerError) as excinfo:
+            check_floor(endpoint, HTTP, LAN)
+        assert excinfo.value.status_code == 403
+
+    @pytest.mark.parametrize(
+        "endpoint",
+        [
+            "/server/aux/setup/complete",
+            "/server/aux/wifi/ap/auto_off",
+            "/server/aux/time",
+            "/server/aux/time/zone",
+        ],
+    )
+    def test_muon_setup_and_the_panel_still_reach_them(self, endpoint: str):
+        """``muon_setup`` calls Aux in-process; the panel is on loopback."""
+        check_floor(endpoint, INTERNAL, None)
+        check_floor(endpoint, HTTP, LOOPBACK)
+
+    def test_the_owners_hotspot_toggle_stays_open_to_the_lan(self):
+        check_floor("/server/aux/wifi/ap/up", HTTP, LAN)
+        check_floor("/server/aux/wifi/ap/down", HTTP, LAN)
 
     def test_ship_mode_is_denied_to_a_lan_caller(self):
         """The case KAN-350 exists for.
