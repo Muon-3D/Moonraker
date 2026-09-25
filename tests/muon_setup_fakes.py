@@ -106,7 +106,8 @@ class FakeAux:
     async def get(self, path: str) -> Any:
         return await self._call("GET", path, None)
 
-    async def post(self, path: str, body: Any = None) -> Any:
+    async def post(self, path: str, body: Any = None,
+                   timeout: float = 15.0) -> Any:
         return await self._call("POST", path, body)
 
     async def delete(self, path: str) -> Any:

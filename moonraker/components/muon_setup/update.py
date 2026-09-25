@@ -1,16 +1,24 @@
 # MUON, KAN-203 -- the update step (spec 01 §2, 02 §5.8). Work package MR-4.
 #
-# "Install now" runs the same path as POST /machine/update/upgrade?name=MuonOS,
-# as a component-to-component call, so update_manager's own rules apply:
-# refused while printing (503), one update at a time, and every progress line
-# goes out as notify_update_response as usual. muon_setup never commits an
-# update itself; the OTA commit policy (KAN-358) decides that.
+# "Install now" starts the install through update_manager's MuonOS updater,
+# the same path as POST /machine/update/upgrade?name=MuonOS, as a
+# component-to-component call: update_manager's print refusal, its lock and
+# its notify_update_response lines all apply, and it ends at the same Aux
+# POST /update/install. muon_setup never commits an update itself; the OTA
+# commit policy (KAN-358) decides that.
+#
+# Progress and the result come from Aux GET /update/status, never from
+# update_manager's cache: OtaDeploy reports "?" until it refreshes, which the
+# M1 does weekly, and OtaDeploy.update() can return early (300 s without
+# progress, or on losing contact) while the install carries on. So the step
+# follows Aux until Aux says the install is over.
 #
 # An install ends in a reboot, so the operation outlives this process. The
 # target version is frozen into `op.target` when the install starts -- the Aux
 # status fields change during a commit, so reading the target afterwards would
-# compare a value with itself -- and after the reboot the version the printer
-# actually runs is compared with it: equal is done, anything else rolled back.
+# compare a value with itself -- and once Aux is `idle`, `commit_pending` or
+# `failed`, its `current_version` is compared with it: equal is done,
+# anything else rolled back.
 
 from __future__ import annotations
 
@@ -27,14 +35,20 @@ if TYPE_CHECKING:
 
 #: The updater the M1's config names: [update_manager MuonOS].
 UPDATER = "MuonOS"
-#: How often the install's progress is mirrored into `op.progress`.
+#: How often Aux's status is read while an install runs or is being judged.
 PROGRESS_POLL = 1.0
-#: How long to wait for the reboot once update_manager says the install is
-#: done, before deciding from the versions instead.
-REBOOT_WAIT = 900.0
-#: After a reboot, how long to wait for update_manager to report a version.
-VERSION_WAIT = 300.0
-VERSION_POLL = 2.0
+#: How long to follow an install before judging it anyway.
+FOLLOW_LIMIT = 3600.0
+#: After a boot, how long Aux may take to answer before the step is judged
+#: from what can be read.
+BOOT_LIMIT = 600.0
+#: 02 §5.6 step 4: a waited update check, bounded.
+CHECK_TIMEOUT = 20.0
+
+#: Aux states in which the install is still running (02 §5.8).
+RUNNING = ("installing", "rebooting", "committing")
+#: Aux states in which the result can be judged.
+SETTLED = ("idle", "commit_pending", "failed")
 
 
 def register(setup: MuonSetup) -> None:
@@ -44,46 +58,60 @@ def register(setup: MuonSetup) -> None:
     setup.hide_when_current["update"] = lambda doc: hide_update(setup, doc)
     setup.boot_op_handlers["update_install"] = (
         lambda doc: on_boot(setup, doc))
+    setup.live_refreshers.append(lambda: refresh(setup))
 
 
 # --------------------------------------------------------------------------
-# What update_manager knows
+# What Aux knows (GET /update/status)
 # --------------------------------------------------------------------------
 
-def updater_status(setup: MuonSetup) -> Optional[Dict[str, Any]]:
-    manager = setup.server.lookup_component("update_manager", None)
-    if manager is None:
+def _version(value: Any) -> Optional[str]:
+    return value if isinstance(value, str) and value not in ("", "?") else None
+
+
+async def read_status(setup: MuonSetup) -> Optional[Dict[str, Any]]:
+    """Aux GET /update/status, or None if Aux cannot say right now."""
+    from . import AuxMissing, AuxRefused, AuxUnavailable
+    try:
+        status = await setup.aux("GET", "/update/status")
+    except (AuxMissing, AuxRefused, AuxUnavailable) as exc:
+        logging.debug("muon_setup: no update status: %s", exc)
         return None
-    updater = manager.get_updaters().get(UPDATER)
-    if updater is None:
-        return None
-    status = updater.get_update_status()
     return status if isinstance(status, dict) else None
 
 
-def versions(setup: MuonSetup) -> Dict[str, Optional[str]]:
-    """{current, available}: `available` only when an update is on offer.
+def _progress(status: Dict[str, Any]) -> Optional[float]:
+    """Aux reports percent, at the top level or under `install`."""
+    pct = status.get("progress")
+    if pct is None and isinstance(status.get("install"), dict):
+        pct = status["install"].get("progress")
+    if isinstance(pct, bool) or not isinstance(pct, (int, float)):
+        return None
+    return round(min(max(float(pct) / 100.0, 0.0), 1.0), 3)
 
-    OtaDeploy reports `remote_version` equal to `version` when there is none.
-    A `?` version is its placeholder for "not read yet".
-    """
-    status = updater_status(setup) or {}
-    current = status.get("version")
-    remote = status.get("remote_version")
-    if not isinstance(current, str) or current in ("", "?"):
-        current = None
+
+async def refresh(setup: MuonSetup) -> None:
+    """Keep a snapshot for the synchronous visibility rule."""
+    status = await read_status(setup)
+    if status is not None:
+        setup._live["ota"] = status
+
+
+def versions(setup: MuonSetup) -> Dict[str, Optional[str]]:
+    """{current, available} from the last Aux status read."""
+    status = setup._live.get("ota") or {}
+    current = _version(status.get("current_version"))
     available = None
-    if (
-        status.get("is_valid", True) and isinstance(remote, str)
-        and remote not in ("", "?") and remote != current
-    ):
-        available = remote
+    if status.get("update_available") is True:
+        target = _version(status.get("target_version"))
+        if target is not None and target != current:
+            available = target
     return {"current": current, "available": available}
 
 
 def refresh_step(setup: MuonSetup, doc: Dict[str, Any]) -> None:
-    """Copy update_manager's versions into the step, unless an install is
-    under way -- then the frozen target is the one that matters."""
+    """Copy Aux's versions into the step, unless an install is under way --
+    then the frozen target is the one that matters."""
     op = doc.get("op")
     if op is not None and op.get("kind") == "update_install":
         return
@@ -95,17 +123,16 @@ def refresh_step(setup: MuonSetup, doc: Dict[str, Any]) -> None:
 
 
 async def check_for_update(setup: MuonSetup) -> None:
-    """Ask for a fresh update check. update_manager's own refresh interval is
-    a week on the M1, so the network step's `update_check` phase (MR-3) calls
-    this once the internet check has passed."""
-    manager = setup.server.lookup_component("update_manager", None)
-    updater = manager.get_updaters().get(UPDATER) if manager else None
-    if updater is None:
-        return
+    """A fresh update check, waited for (02 §5.6 step 4). `{"wait": false}`
+    only schedules one, and the status read straight after it is the old
+    answer. MR-3's `update_check` join phase calls this."""
+    from . import AuxMissing, AuxRefused, AuxUnavailable
     try:
-        await updater.refresh()
-    except Exception as exc:
+        await setup.aux("POST", "/update/check", {"wait": True},
+                        timeout=CHECK_TIMEOUT)
+    except (AuxMissing, AuxRefused, AuxUnavailable) as exc:
         logging.info("muon_setup: update check failed: %s", exc)
+    await refresh(setup)
 
 
 def hide_update(setup: MuonSetup, doc: Dict[str, Any]) -> bool:
@@ -138,6 +165,7 @@ async def handle_update(setup: MuonSetup, webreq: WebRequest) -> Dict[str, Any]:
             step["error"] = None
             setup.advance()
             return None
+        await refresh(setup)
         refresh_step(setup, doc)
         target = step.get("available")
         if not target:
@@ -155,44 +183,61 @@ async def handle_update(setup: MuonSetup, webreq: WebRequest) -> Dict[str, Any]:
     return await setup.write(webreq, handler)
 
 
+def refusal_code(exc: BaseException) -> str:
+    """02 §5.8: Aux refuses with 409 and `detail.code`. `printer_busy`
+    (printing, paused or busy; KAN-75) is printer_busy; `busy` and
+    `invalid_state` are update_failed. update_manager's own refusal while
+    printing is a 503."""
+    if getattr(exc, "aux_code", None) == "printer_busy":
+        return "printer_busy"
+    if getattr(exc, "status_code", None) == 503:
+        return "printer_busy"
+    return "update_failed"
+
+
 def _runner(setup: MuonSetup):
     async def run(handle: OpHandle) -> None:
-        mirror = asyncio.ensure_future(_mirror_progress(setup, handle))
         transport = setup.server.lookup_component("internal_transport")
         try:
             await transport.call_method(
                 "machine.update.upgrade", {"name": UPDATER})
         except Exception as exc:
-            mirror.cancel()
-            status = getattr(exc, "status_code", None)
-            code = "printer_busy" if status == 503 else "update_failed"
+            code = refusal_code(exc)
             message = str(exc)
             logging.info("muon_setup: the update did not start: %s", message)
             await handle.finish(lambda doc: _fail(doc, code, message))
             return
-        # Installed. The printer reboots into the new slot now; keep the op
-        # (and its frozen target) so the next boot can judge the result.
-        mirror.cancel()
-        await handle.update(phase="rebooting", progress=1.0)
-        await asyncio.sleep(REBOOT_WAIT)
-        # Still here: no reboot came. Judge from the versions instead.
-        await _judge(setup, handle)
+        # OtaDeploy.update() has returned, which does not mean the install
+        # has. Follow Aux until it says it is over; a reboot on the way ends
+        # this process, and on_boot() takes over.
+        await follow(setup, handle, FOLLOW_LIMIT)
     return run
 
 
-async def _mirror_progress(setup: MuonSetup, handle: OpHandle) -> None:
-    """update_manager's OTA progress (0-100) as `op.progress` (0-1)."""
-    last: Optional[float] = None
-    while True:
-        status = updater_status(setup) or {}
-        pct = status.get("progress")
-        if isinstance(pct, (int, float)) and not isinstance(pct, bool):
-            value = round(min(max(float(pct) / 100.0, 0.0), 1.0), 3)
-            if last is None or abs(value - last) >= 0.01:
-                last = value
-                if not await handle.update(progress=value):
-                    return
+async def follow(setup: MuonSetup, handle: OpHandle, limit: float) -> None:
+    """Mirror Aux's progress into `op` until the install settles, then judge.
+    A status that cannot be read is waited out, up to `limit`."""
+    deadline = time.monotonic() + limit
+    last: Optional[Dict[str, Any]] = None
+    while handle.current() and time.monotonic() < deadline:
+        status = await read_status(setup)
+        if status is not None:
+            last = status
+            setup._live["ota"] = status
+            state = str(status.get("state") or "").lower()
+            if state in SETTLED:
+                break
+            fields: Dict[str, Any] = {}
+            if state == "rebooting" and handle.current():
+                fields["phase"] = "rebooting"
+            progress = _progress(status)
+            if progress is not None:
+                fields["progress"] = progress
+            op = (setup.doc or {}).get("op") or {}
+            if any(op.get(k) != v for k, v in fields.items()):
+                await handle.update(**fields)
         await asyncio.sleep(PROGRESS_POLL)
+    await _judge(setup, handle, last)
 
 
 def _fail(doc: Dict[str, Any], code: str, message: str) -> None:
@@ -202,43 +247,40 @@ def _fail(doc: Dict[str, Any], code: str, message: str) -> None:
 
 
 # --------------------------------------------------------------------------
-# After the reboot (02 §5.8)
+# After a boot (02 §5.8)
 # --------------------------------------------------------------------------
 
 def on_boot(setup: MuonSetup, doc: Dict[str, Any]) -> None:
     """The stored state still shows `update_install`: the printer rebooted
-    (or lost power) during an update. Keep the op -- the step is `busy`
-    until the verdict -- and judge once update_manager can say what runs."""
+    (or lost power, or Moonraker restarted) during an update. Keep the op --
+    the step is `busy` until the verdict -- and follow Aux from here."""
     doc["op"]["phase"] = "verifying"
+    doc["rev"] += 1
     setup._spawn(_verify_after_boot(setup, doc["op"].get("id")))
 
 
 async def _verify_after_boot(setup: MuonSetup, op_id: Any) -> None:
     from . import OpHandle
     await setup.wait_resolved()
-    handle = OpHandle(setup, op_id)
-    deadline = time.monotonic() + VERSION_WAIT
-    while time.monotonic() < deadline:
-        if not handle.current():
-            return
-        if versions(setup)["current"] is not None:
-            break
-        await asyncio.sleep(VERSION_POLL)
-    await _judge(setup, handle)
+    await follow(setup, OpHandle(setup, op_id), BOOT_LIMIT)
 
 
-async def _judge(setup: MuonSetup, handle: OpHandle) -> None:
-    """Equal to the frozen target: done. Anything else: it rolled back."""
+async def _judge(setup: MuonSetup, handle: OpHandle,
+                 status: Optional[Dict[str, Any]]) -> None:
+    """Equal to the frozen target: done. Anything else: it rolled back, or
+    it failed. Never judged from update_manager's cache."""
     doc = setup.doc
     if doc is None or not handle.current():
         return
     target = doc["op"].get("target")
-    current = versions(setup)["current"]
+    status = status or {}
+    current = _version(status.get("current_version"))
+    state = str(status.get("state") or "").lower()
 
     def verdict(doc: Dict[str, Any]) -> None:
         step = doc["steps"]["update"]
         step["current"] = current
-        if current is not None and current == target:
+        if current is not None and current == target and state != "failed":
             step["status"] = model.DONE
             step["available"] = None
             step["error"] = None
@@ -248,6 +290,7 @@ async def _judge(setup: MuonSetup, handle: OpHandle) -> None:
             step["status"] = model.PENDING
             step["error"] = {
                 "code": "update_failed",
-                "message": f"running {current!r}, expected {target!r}",
+                "message": f"running {current!r}, expected {target!r}"
+                           + (f" ({state})" if state else ""),
             }
     await handle.finish(verdict)
