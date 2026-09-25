@@ -460,6 +460,35 @@ class TestOperations:
             assert h.stored()["op"] is None
         run(go())
 
+    def test_a_shutdown_mid_operation_leaves_it_for_the_next_boot(self):
+        """Moonraker stopping (a reboot, a power-off) must not tidy the
+        operation away: the next boot is what marks it `interrupted`."""
+        async def go():
+            h = await Harness(stored=state_with(
+                language={"status": "done", "value": "en"})).start()
+
+            async def runner(handle: pkg.OpHandle) -> None:
+                await handle.update(phase="dhcp")
+                await asyncio.sleep(3600)
+
+            async def start(ctx: pkg.WriteContext) -> None:
+                h.setup.start_op("join", runner, phase="saving")
+                return None
+
+            await h.setup.write(request("panel", "/x", {"rev": 5}), start)
+            for _ in range(10):
+                await asyncio.sleep(0)
+            await h.setup.close()
+            stored = h.stored()
+            assert stored["op"]["kind"] == "join"
+
+            after = await Harness(stored=stored).start()
+            await after.setup.drain()
+            assert after.doc["op"] is None
+            assert after.doc["steps"]["network"]["error"] == {
+                "code": "interrupted", "at_phase": "dhcp"}
+        run(go())
+
 
 # ==========================================================================
 # 7. Access: caller kinds x endpoints (02 §3)

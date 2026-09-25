@@ -713,9 +713,12 @@ class MuonSetup:
             logging.exception("muon_setup: operation %s failed", op_id)
         finally:
             # Whatever the runner did or did not do, an operation that has
-            # stopped must not leave the state `busy`.
+            # stopped must not leave the state `busy` -- unless Moonraker is
+            # shutting down. Then the operation stays stored: the next boot
+            # marks it `interrupted` (01 §3), or, for an update, judges the
+            # reboot it was waiting for (02 §5.8).
             async with self._lock:
-                if handle.current():
+                if handle.current() and not self._closed:
                     assert self.doc is not None
                     self.doc["op"] = None
                     try:
