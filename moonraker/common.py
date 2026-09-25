@@ -241,6 +241,9 @@ class APIDefinition:
         # JSON-RPC calls -- which authenticate once and are never matched
         # against a path again -- as well as plain HTTP.  See muon_floor.py.
         muon_floor.check_floor(self.endpoint, transport, ip_addr)
+        # MUON, SEC-8: the same convergence point, for the level the owner
+        # chose. After the floor, so a floor surface keeps the floor's reason.
+        muon_floor.check_protection(self.endpoint, transport, ip_addr, user)
         return self.callback(
             WebRequest(self.endpoint, args, request_type, transport, ip_addr, user)
         )

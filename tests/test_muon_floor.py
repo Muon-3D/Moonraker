@@ -15,6 +15,7 @@ import ipaddress
 
 import pytest
 
+from moonraker import muon_floor
 from moonraker.muon_floor import (
     FLOOR_PREFIXES,
     NETWORK_ROLE,
@@ -56,8 +57,7 @@ class TestWhatIsOnTheFloor:
     that gate to ``dev_mode_consent`` in the Aux API, which asks whether a person
     confirmed at the hardware rather than whether the packet came from 127.0.0.1.
     Keep the two reasons apart: an entry whose justification is physical presence
-    does not belong on a check that muon-link's loopback termination already
-    satisfies.
+    does not belong on a check that any process on the device already satisfies.
 
     Everything else is governed by SEC-8's levels, which is policy rather than
     floor.
@@ -263,3 +263,204 @@ class TestAddressClassification:
         assert role_for_address(LOOPBACK) == PANEL_ROLE
         assert role_for_address(LAN) == NETWORK_ROLE
         assert role_for_address(None) == NETWORK_ROLE
+
+
+# ---------------------------------------------------------------------------
+# SEC-8: the protection levels.
+# ---------------------------------------------------------------------------
+
+SENTINEL = ipaddress.ip_address("192.0.2.1")
+HOTSPOT = ipaddress.ip_address("10.42.0.23")
+LAN_V6 = ipaddress.ip_address("fd12:3456:789a::10")
+
+WIFI = "/server/aux/wifi/connect"
+UPGRADE = "/machine/update/upgrade"
+check_protection = muon_floor.check_protection
+
+
+class _User:
+    """Duck-typed UserInfo. `has_identity` reads `.source` and nothing else."""
+
+    def __init__(self, source: str) -> None:
+        self.source = source
+
+
+GATEWAY_USER = _User("muon_gateway")
+# What trusted_clients hands a LAN browser, and what a Moonraker login is.
+TRUSTED_USER = _User("moonraker")
+
+
+@pytest.fixture
+def protected():
+    muon_floor.set_protection_level(muon_floor.LEVEL_PROTECTED)
+    yield
+    muon_floor.set_protection_level(muon_floor.LEVEL_OPEN)
+
+
+@pytest.fixture(autouse=True)
+def _level_is_reset_after_every_test():
+    """The level is module state. A test that forgets to put it back would make
+    every later test run at the wrong level, and pass or fail by ordering."""
+    yield
+    muon_floor.set_protection_level(muon_floor.LEVEL_OPEN)
+
+
+class TestWhatLevelOneTakesBack:
+    def test_the_protected_surfaces_are_the_two_sec_2_released(self):
+        """SEC-8 names them: `/server/aux/*` and `/machine/update/*`. Pinned as
+        exact tuples, because the list is the decision."""
+        assert muon_floor.PROTECTED_PREFIXES == ("/server/aux", "/machine/update")
+        assert muon_floor.PROTECTED_EXCLUSIONS == ("/server/aux/dev_mode",)
+
+    @pytest.mark.parametrize(
+        "endpoint",
+        [
+            "/server/aux/wifi/current",
+            "/server/aux/wifi/connect",
+            "/server/aux/wifi/ap/down",
+            "/server/aux/proxy",
+            "/server/aux/bms/link",
+            "/server/aux/update/install",
+            "/machine/update/status",
+            "/machine/update/upgrade",
+            "/machine/update/recover",
+        ],
+    )
+    def test_every_route_under_the_two_prefixes_is_protected(self, endpoint):
+        """Including `/server/aux/proxy`, the generic escape hatch: a Level 1
+        that covered the named routes and not the proxy would cover nothing."""
+        assert muon_floor.is_protected_endpoint(endpoint)
+
+    @pytest.mark.parametrize(
+        "endpoint",
+        [
+            "/server/aux/dev_mode",
+            "/server/aux/dev_mode/waiver",
+            "/server/aux/dev_mode/consent",
+            "/server/aux/dev_mode/refresh",
+            "/server/aux/dev_mode/backup",
+        ],
+    )
+    def test_developer_mode_is_governed_elsewhere(self, endpoint):
+        """SEC-8 excludes the toggle by name: `dev_mode_consent` gates enabling,
+        and leaving must never depend on who is asking."""
+        assert not muon_floor.is_protected_endpoint(endpoint)
+
+    @pytest.mark.parametrize(
+        "endpoint",
+        [
+            "/printer/print/start",
+            "/server/files/upload",
+            "/server/muon/identity",
+            "/server/muon/protection",
+            "/server/muon/dev_mode",
+            "/machine/system_info",
+            # A segment boundary, not a substring.
+            "/server/auxiliary",
+            "/machine/updates",
+        ],
+    )
+    def test_printing_and_everything_else_stays_open(self, endpoint):
+        """Level 1 is not a login wall. A LAN browser still prints, uploads and
+        reads the printer's name."""
+        assert not muon_floor.is_protected_endpoint(endpoint)
+
+
+class TestWhoHasAnIdentity:
+    def test_the_panel_does(self):
+        assert muon_floor.has_identity(HTTP, LOOPBACK, TRUSTED_USER)
+
+    def test_a_component_to_component_call_does(self):
+        assert muon_floor.has_identity(INTERNAL, None, None)
+
+    def test_a_paired_client_through_the_gateway_does(self):
+        assert muon_floor.has_identity(HTTP, SENTINEL, GATEWAY_USER)
+
+    @pytest.mark.parametrize("addr", [LAN, HOTSPOT, LAN_V6])
+    def test_a_lan_or_hotspot_browser_does_not(self, addr):
+        """trusted_clients authenticates it by address alone, which is exactly
+        what Level 1 stops counting."""
+        assert not muon_floor.has_identity(HTTP, addr, TRUSTED_USER)
+
+    def test_the_sentinel_without_a_gateway_token_is_not_an_identity(self):
+        """Any request muon-link forwards carries the sentinel. Only the token
+        says the gateway admitted this client."""
+        assert not muon_floor.has_identity(HTTP, SENTINEL, TRUSTED_USER)
+        assert not muon_floor.has_identity(HTTP, SENTINEL, None)
+
+    def test_a_gateway_user_off_the_sentinel_is_not_an_identity(self):
+        """`_check_oneshot_token` binds the token to the sentinel, so this
+        cannot happen through Moonraker. Asserted anyway, so the check does not
+        quietly come to rest on the user alone."""
+        assert not muon_floor.has_identity(HTTP, LAN, GATEWAY_USER)
+
+    def test_an_addressless_transport_is_not_an_identity(self):
+        assert not muon_floor.has_identity(HTTP, None, TRUSTED_USER)
+
+    def test_the_sentinel_here_is_the_one_the_gateway_binds_tokens_to(self):
+        """Two constants for one address. If they drift, every paired client is
+        refused at Level 1 -- or, the other way round, the check reads an
+        address nobody sends."""
+        from moonraker.components import muon_gateway
+
+        assert muon_floor.GATEWAY_SENTINEL == muon_gateway.SENTINEL
+
+
+class TestLevelZeroIsOpen:
+    def test_the_default_is_open(self):
+        assert muon_floor.protection_level() == muon_floor.LEVEL_OPEN
+
+    @pytest.mark.parametrize("addr", [LAN, HOTSPOT, LAN_V6])
+    def test_a_lan_browser_reaches_wifi_and_updates(self, addr):
+        """SEC-1. The shipped default is what makes Fluidd work with no sign-in."""
+        check_protection(WIFI, HTTP, addr, TRUSTED_USER)
+        check_protection(UPGRADE, HTTP, addr, TRUSTED_USER)
+
+
+class TestLevelOneIsProtected:
+    @pytest.mark.parametrize("addr", [LAN, HOTSPOT, LAN_V6])
+    def test_a_lan_browser_is_refused_a_protected_surface(self, protected, addr):
+        for endpoint in ("/server/aux/wifi/connect", "/machine/update/upgrade"):
+            with pytest.raises(ServerError) as excinfo:
+                muon_floor.check_protection(endpoint, HTTP, addr, TRUSTED_USER)
+            assert excinfo.value.status_code == 403
+
+    def test_the_panel_keeps_everything(self, protected):
+        """SEC-8: an owner must not be able to lock themselves out."""
+        check_protection(WIFI, HTTP, LOOPBACK, TRUSTED_USER)
+        check_protection(UPGRADE, HTTP, LOOPBACK, TRUSTED_USER)
+
+    def test_a_paired_client_keeps_everything(self, protected):
+        check_protection(WIFI, HTTP, SENTINEL, GATEWAY_USER)
+        check_protection(UPGRADE, HTTP, SENTINEL, GATEWAY_USER)
+
+    def test_an_internal_call_keeps_everything(self, protected):
+        """ota_deploy drives an install through aux_api_proxy this way."""
+        muon_floor.check_protection("/server/aux/update/install", INTERNAL, None, None)
+
+    def test_a_lan_browser_still_prints(self, protected):
+        muon_floor.check_protection("/printer/print/start", HTTP, LAN, TRUSTED_USER)
+        muon_floor.check_protection("/server/files/upload", HTTP, LAN, TRUSTED_USER)
+
+    def test_a_lan_browser_can_still_leave_developer_mode(self, protected):
+        muon_floor.check_protection("/server/aux/dev_mode", HTTP, LAN, TRUSTED_USER)
+
+    def test_the_refusal_names_the_panel(self, protected):
+        """A 403 the UI can explain, not a bare one."""
+        with pytest.raises(ServerError) as excinfo:
+            check_protection(WIFI, HTTP, LAN, TRUSTED_USER)
+        assert "panel" in str(excinfo.value)
+
+    def test_the_floor_is_unchanged_by_the_level(self, protected):
+        """Level 1 adds to the floor and removes nothing from it: a paired
+        client still cannot reach ship mode."""
+        with pytest.raises(ServerError):
+            check_floor("/server/aux/bms/ship", HTTP, SENTINEL)
+
+
+class TestTheLevelSetter:
+    @pytest.mark.parametrize("bad", [2, -1, "1", None, 1.5, 1.0, True, False])
+    def test_an_unknown_level_is_refused(self, bad):
+        with pytest.raises(ValueError):
+            muon_floor.set_protection_level(bad)
+        assert muon_floor.protection_level() == muon_floor.LEVEL_OPEN
