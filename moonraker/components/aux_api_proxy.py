@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import contextlib
+import unicodedata
 from pathlib import Path
 from typing import Dict, Any, Callable, Optional
 from urllib.parse import unquote, urlencode
@@ -542,6 +543,11 @@ class AuxAutoProxy:
         """Store the owner's rename, or clear it with an empty name, and
         return the identity. Public so muon_setup's name step applies the
         same rules as POST /server/muon/identity/name (spec 02 §5.7)."""
+        # Settings' rename answers with the identity, so ask Aux first: a
+        # 503 after the write would report a failure for a rename that
+        # happened. muon_setup's name step uses store_friendly_name(), which
+        # works with Aux down (02 §5.7).
+        await self._get_or_unavailable("/identity")
         await self.store_friendly_name(name)
         return await self.get_identity()
 
@@ -553,6 +559,11 @@ class AuxAutoProxy:
             raise self.server.error("'name' must be a string", 400)
 
         name = name.strip()
+        # 02 §5.7: no control characters (C0, C1, newlines), and the length
+        # is counted in code points, which is what len() of a str counts.
+        if any(unicodedata.category(ch) == "Cc" for ch in name):
+            raise self.server.error(
+                "A printer name may not contain control characters", 400)
         if len(name) > MAX_NAME_LENGTH:
             raise self.server.error(
                 f"A printer name may be at most {MAX_NAME_LENGTH} characters",

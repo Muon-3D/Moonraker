@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import ipaddress
+import unicodedata
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from moonraker.common import RequestType, TransportType, UserInfo, WebRequest
@@ -131,6 +132,8 @@ class FakeAux:
         if not isinstance(name, str):
             raise ServerError("'name' must be a string", 400)
         name = name.strip()
+        if any(unicodedata.category(ch) == "Cc" for ch in name):
+            raise ServerError("no control characters", 400)
         if len(name) > 32:
             raise ServerError("A printer name may be at most 32 characters", 400)
         self.friendly_name = name or None

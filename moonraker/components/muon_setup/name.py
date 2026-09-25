@@ -18,10 +18,26 @@ if TYPE_CHECKING:
     from ...common import WebRequest
 
 
+#: Where aux_api_proxy keeps the rename (ID-3).
+FRIENDLY_NAMESPACE = "muon"
+FRIENDLY_NAME_KEY = "friendly_name"
+
+
 def register(setup: MuonSetup) -> None:
     setup.server.register_endpoint(
         "/server/muon/setup/name", ["POST"],
         lambda webreq: handle_name(setup, webreq))
+
+
+async def stored_name(setup: MuonSetup) -> Optional[str]:
+    """The owner's rename, straight from the `muon` namespace, so Keep works
+    before the identity has been read (Aux late at boot)."""
+    try:
+        name: Any = await setup.database.get_item(
+            FRIENDLY_NAMESPACE, FRIENDLY_NAME_KEY, None)
+    except Exception:
+        return None
+    return name if isinstance(name, str) and name else None
 
 
 async def handle_name(setup: MuonSetup, webreq: WebRequest) -> Dict[str, Any]:
@@ -31,6 +47,11 @@ async def handle_name(setup: MuonSetup, webreq: WebRequest) -> Dict[str, Any]:
         proxy = setup.server.lookup_component("aux_api_proxy", None)
         if name is not None and not isinstance(name, str):
             raise ServerError("muon_setup: 'name' must be a string", 400)
+        if ctx.doc["state"] != "complete" and not model.reachable(
+            ctx.doc, "name"
+        ):
+            # 02 §5 "Order": not ahead of the first pending step.
+            return model.error("invalid_step", "the name step is not open")
         if name and name.strip():
             if proxy is None:
                 return model.error(
@@ -39,7 +60,9 @@ async def handle_name(setup: MuonSetup, webreq: WebRequest) -> Dict[str, Any]:
             # the change and the caller sees the refusal.
             value = await proxy.store_friendly_name(name)
         else:
-            value = (setup._live.get("printer") or {}).get("name")
+            # Keep never clears an earlier rename (02 §5.7): the stored
+            # name, else the identity's, else the derived one.
+            value = await stored_name(setup) or setup.effective_name()
         ctx.doc["steps"]["name"]["status"] = model.DONE
         ctx.doc["steps"]["name"]["value"] = value
         if ctx.doc["state"] != "complete":

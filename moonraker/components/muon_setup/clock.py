@@ -22,14 +22,17 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-from . import model
+from . import caller, model
 from ...utils.exceptions import ServerError
 
 if TYPE_CHECKING:
     from . import MuonSetup, WriteContext
     from ...common import WebRequest
 
-ZONE_TAB = Path("/usr/share/zoneinfo/zone1970.tab")
+#: One row per country and zone, in tzdata's order, principal zone first
+#: (02 §5.2). Not zone1970.tab: its rows cover several countries, so DE
+#: would start with Europe/Zurich and NO, SE and DK get Europe/Berlin.
+ZONE_TAB = Path("/usr/share/zoneinfo/zone.tab")
 ZONEINFO = Path("/usr/share/zoneinfo")
 #: Written by MuonOS's build (muon.device-build/v1): `created_at` is when the
 #: image was built, and no real clock can be earlier than that.
@@ -37,6 +40,10 @@ BUILD_JSON = Path("/etc/muon3d/build.json")
 #: systemd-timesyncd creates this once it has synchronised (systemd >= 239).
 TIMESYNC_FLAG = Path("/run/systemd/timesync/synchronized")
 LOCALTIME = Path("/etc/localtime")
+
+#: 02 §3: only a phone on the hotspot may post the clock (and other
+#: components, which may do everything but reset).
+CLOCK_CALLERS = frozenset({caller.HOTSPOT, caller.INTERNAL})
 
 #: 02 §5.4: the clock is only set when it is more than this far out.
 CLOCK_TOLERANCE_MS = 2000
@@ -70,9 +77,8 @@ def _zone_rows(tab: Path) -> List[List[str]]:
 def zones_for_country(country: str, tab: Optional[Path] = None) -> List[str]:
     """A country's zones, principal zone first.
 
-    zone1970.tab lists each country's zones most populous first where
-    geography allows, which is the order 02 §5.2 wants. A row may name
-    several countries (`AT,BA,...`); it counts for each of them.
+    zone.tab lists each country's zones in tzdata's order, the principal
+    zone first, which is the order 02 §5.2 wants.
     """
     if not _COUNTRY_RE.match(country or ""):
         return []
@@ -170,9 +176,11 @@ async def handle_clock(setup: MuonSetup, webreq: WebRequest) -> Dict[str, Any]:
 
     The phone's clock and zone, posted when the owner taps Start. No `rev`,
     and it never changes `rev`: it is not the owner answering a question.
+    Only a phone on the hotspot may post it (02 §3): it is the only surface
+    that knows the owner's local time.
     """
     from . import AuxMissing, AuxRefused, AuxUnavailable, STARTUP_WAIT
-    setup.begin(webreq)
+    setup.begin(webreq, CLOCK_CALLERS)
     args = webreq.get_args()
     epoch_ms = args.get("epoch_ms")
     tz = args.get("tz")
@@ -185,44 +193,55 @@ async def handle_clock(setup: MuonSetup, webreq: WebRequest) -> Dict[str, Any]:
         return setup.envelope(model.error(
             "busy", f"{setup.doc['op']['kind']} is running",
             op=setup.doc["op"]["kind"]))
+    changed = False
+    clock_error: Optional[Dict[str, Any]] = None
     if epoch_ms <= build_floor_ms():
         # 08: silent on the surfaces, logged here. S9: a hotspot client can at
         # worst set a wrong clock until NTP corrects it; never an older one.
         logging.info("muon_setup: refused a clock before the image build time")
-        return setup.envelope(model.error(
-            "invalid_clock", "that time is before this image was built"))
-    try:
-        now = await setup.aux("GET", "/time")
-    except AuxMissing:
-        logging.warning(
-            "muon_setup: this image has no Aux /time (OS-6); the phone's "
-            "clock and zone were not applied")
-        return setup.envelope()
-    except (AuxUnavailable, AuxRefused) as exc:
-        logging.info("muon_setup: cannot read the clock: %s", exc)
-        return setup.envelope(model.error(
-            "aux_unavailable", "the Aux API is not answering"))
-    changed = False
-    if isinstance(now, dict) and now.get("ntp_synced") is not True:
-        current = now.get("epoch_ms")
-        if not isinstance(current, int) or abs(
-            current - epoch_ms
-        ) > CLOCK_TOLERANCE_MS:
-            try:
-                await setup.aux("POST", "/time", {"epoch_ms": epoch_ms})
-            except AuxRefused as exc:
-                # 409 ntp_synced: NTP won the race, which is the better clock.
-                logging.info("muon_setup: clock not set: %s", exc)
-            except (AuxMissing, AuxUnavailable) as exc:
-                logging.warning("muon_setup: clock not set: %s", exc)
-            else:
-                setup._clock_from_phone = True
-                changed = True
+        clock_error = model.error(
+            "invalid_clock", "that time is before this image was built")
+    else:
+        try:
+            now = await setup.aux("GET", "/time")
+        except AuxMissing:
+            logging.warning(
+                "muon_setup: this image has no Aux /time (OS-6); the phone's "
+                "clock and zone were not applied")
+            return setup.envelope()
+        except (AuxUnavailable, AuxRefused) as exc:
+            logging.info("muon_setup: cannot read the clock: %s", exc)
+            return setup.envelope(model.error(
+                "aux_unavailable", "the Aux API is not answering"))
+        if isinstance(now, dict) and now.get("ntp_synced") is not True:
+            current = now.get("epoch_ms")
+            if not isinstance(current, int) or abs(
+                current - epoch_ms
+            ) > CLOCK_TOLERANCE_MS:
+                try:
+                    await setup.aux("POST", "/time", {"epoch_ms": epoch_ms})
+                except AuxRefused as exc:
+                    if exc.status == 422:
+                        # OS-6's own bound: more than 20 years past the build.
+                        logging.info("muon_setup: Aux refused the clock: %s", exc)
+                        clock_error = model.error("invalid_clock", str(exc))
+                    else:
+                        # 409 ntp_synced: NTP won the race, the better clock.
+                        logging.info("muon_setup: clock not set: %s", exc)
+                except (AuxMissing, AuxUnavailable) as exc:
+                    logging.warning("muon_setup: clock not set: %s", exc)
+                else:
+                    setup._clock_from_phone = True
+                    changed = True
+    # 02 §5.4: the zone is applied even when the clock was refused.
+    zone_error: Optional[Dict[str, Any]] = None
     if tz is not None:
         if valid_zone(tz):
             try:
                 await _set_zone(setup, tz)
-            except (AuxMissing, AuxUnavailable, AuxRefused) as exc:
+            except AuxRefused as exc:
+                zone_error = model.error("invalid_timezone", str(exc))
+            except (AuxMissing, AuxUnavailable) as exc:
                 logging.warning("muon_setup: zone %s not set: %s", tz, exc)
             else:
                 setup._internal["tz_source"] = "phone"
@@ -233,7 +252,7 @@ async def handle_clock(setup: MuonSetup, webreq: WebRequest) -> Dict[str, Any]:
     if changed:
         await refresh(setup)
         setup._notify()
-    return setup.envelope()
+    return setup.envelope(clock_error or zone_error)
 
 
 async def handle_timezone(
@@ -245,15 +264,18 @@ async def handle_timezone(
 
     async def handler(ctx: WriteContext) -> Optional[Dict[str, Any]]:
         tz = ctx.args.get("tz")
+        # Aux GET /region, passed through (02 §6).
         region = setup._live.get("region") or {}
-        country = region.get("country") if region.get("declared") else None
-        if not country or tz not in zones_for_country(country):
+        country = region.get("declared_country")
+        if not isinstance(country, str) or tz not in zones_for_country(country):
             return model.error(
                 "invalid_timezone", f"{tz!r} is not a zone of {country!r}",
                 country=country)
         try:
             await _set_zone(setup, tz)
-        except (AuxMissing, AuxUnavailable, AuxRefused) as exc:
+        except AuxRefused as exc:
+            return model.error("invalid_timezone", str(exc), country=country)
+        except (AuxMissing, AuxUnavailable) as exc:
             return model.error(
                 "aux_unavailable", f"could not set the zone: {exc}")
         setup._internal["tz_source"] = "owner"
