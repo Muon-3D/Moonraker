@@ -290,6 +290,24 @@ class TestWhoIsAllowedThrough:
             "/server/aux/time/zone",
         ],
     )
+    def test_the_setup_writes_are_denied_to_a_hotspot_caller(self, endpoint: str):
+        """A phone on the hotspot is trusted by address (SEC-1) like the LAN,
+        and is just as much a network caller here: only muon_setup, in-process,
+        drives these (02 §1)."""
+        hotspot = ipaddress.ip_address("10.42.0.23")
+        with pytest.raises(ServerError) as excinfo:
+            check_floor(endpoint, HTTP, hotspot)
+        assert excinfo.value.status_code == 403
+
+    @pytest.mark.parametrize(
+        "endpoint",
+        [
+            "/server/aux/setup/complete",
+            "/server/aux/wifi/ap/auto_off",
+            "/server/aux/time",
+            "/server/aux/time/zone",
+        ],
+    )
     def test_muon_setup_and_the_panel_still_reach_them(self, endpoint: str):
         """``muon_setup`` calls Aux in-process; the panel is on loopback."""
         check_floor(endpoint, INTERNAL, None)
