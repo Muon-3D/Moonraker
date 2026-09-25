@@ -466,6 +466,12 @@ class AuxAutoProxy:
                 f"{(suffix or '').upper()}"
             ),
             "ssid": derived.get("ssid"),
+            # KAN-403. The Iroh EndpointId muon-link publishes, or None before
+            # it has run or from an Aux that predates the field. Public by
+            # design (PRIV-6): a client matches a printer found on the LAN to
+            # the one in its account with it. A match key, not a trust
+            # decision; the Iroh handshake proves the key.
+            "endpoint_id": derived.get("endpoint_id"),
             # ID-1. The trust identifier. Reported for a trust-context
             # display; it is deliberately not what the name derives from.
             "fingerprint": derived.get("fingerprint"),
