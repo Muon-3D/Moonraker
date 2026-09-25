@@ -35,7 +35,7 @@ from typing import (
     Set, Tuple
 )
 
-from . import caller, manifest, model, region
+from . import caller, clock, language, manifest, model, name, region
 from .model import DONE, FINISH, HIDDEN, PENDING, SKIPPED
 from ...utils.exceptions import ServerError
 
@@ -102,6 +102,9 @@ class WriteContext:
         self.kind = kind
         self.args = args
         self.now = now
+        #: Set by a handler whose change lives outside the document (the
+        #: time zone's `tz_source`), so it is still committed and announced.
+        self.changed = False
 
     @property
     def doc(self) -> Dict[str, Any]:
@@ -206,6 +209,7 @@ class MuonSetup:
         self._lapse_timer: Optional[asyncio.TimerHandle] = None
         self._poll_task: Optional[asyncio.Task] = None
         self._stations_route = True
+        self._clock_from_phone = False
         self._closed = False
 
         #: Hooks for the step packages. `hide_when_current[step](doc)` decides
@@ -228,6 +232,9 @@ class MuonSetup:
         reg("/server/muon/setup/reset", ["POST"], self._handle_reset)
         reg("/server/muon/setup/network/cancel", ["POST"],
             self._handle_network_cancel)
+        # The steps' own endpoints, one module each.
+        for step_module in (language, clock, name):
+            step_module.register(self)
 
     # ------------------------------------------------------------------
     # Startup, migration and shutdown
@@ -613,7 +620,7 @@ class MuonSetup:
                 self.doc = before
                 self._pending_op = None
                 return self.envelope(err)
-            if self.doc != before:
+            if self.doc != before or ctx.changed:
                 self._take_driver(ctx)
                 if self.doc["state"] == "new":
                     self.doc["state"] = "in_progress"
@@ -747,7 +754,7 @@ class MuonSetup:
 
     async def _handle_options(self, webreq: WebRequest) -> Dict[str, Any]:
         caller.require(caller.caller_kind(webreq), caller.READ)
-        return {
+        options: Dict[str, Any] = {
             "languages": [
                 {"code": code, "endonym": ENDONYMS.get(code, code)}
                 for code in self.languages
@@ -755,6 +762,10 @@ class MuonSetup:
             "region": await self._options_region(),
             "ready_manifest": copy.deepcopy(self.manifest),
         }
+        country = webreq.get_args().get("country")
+        if isinstance(country, str) and country:
+            options["timezones"] = clock.zones_for_country(country)
+        return options
 
     async def _options_region(self) -> Optional[Dict[str, Any]]:
         try:
@@ -1032,6 +1043,7 @@ class MuonSetup:
         if full:
             await self._refresh_printer()
             await self._refresh_region()
+            await clock.refresh(self)
             self._refresh_capabilities()
         return self._live != before
 
@@ -1072,14 +1084,14 @@ class MuonSetup:
             hotspot["clients"] = count
 
     async def _refresh_printer(self) -> None:
-        """The name and fingerprint, from aux_api_proxy's identity endpoint,
-        reached as a component-to-component call so there is one definition
-        of the name (the owner's rename over the derived one)."""
-        transport = self.server.lookup_component("internal_transport", None)
+        """The name and fingerprint, from aux_api_proxy.get_identity(), so
+        there is one definition of the name (the owner's rename over the
+        derived one)."""
+        proxy = self.server.lookup_component("aux_api_proxy", None)
         identity: Any = None
-        if transport is not None:
+        if proxy is not None and hasattr(proxy, "get_identity"):
             try:
-                identity = await transport.call_method("server.muon.identity")
+                identity = await proxy.get_identity()
             except Exception as exc:
                 logging.debug("muon_setup: identity unavailable: %s", exc)
         hostname = socket.gethostname()
