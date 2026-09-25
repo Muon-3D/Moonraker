@@ -40,6 +40,8 @@ READ_STATE = frozenset({PANEL, HOTSPOT, LAN, REMOTE, INTERNAL})
 READ = frozenset({PANEL, HOTSPOT, LAN, INTERNAL})
 WRITE = frozenset({PANEL, HOTSPOT, LAN, INTERNAL})
 PANEL_ONLY = frozenset({PANEL, INTERNAL})
+#: 02 §3: `reset` is the one thing another component may not do.
+RESET = frozenset({PANEL})
 
 #: Which driver surface a write from each kind of caller claims (01 §3).
 SURFACE_FOR_KIND = {PANEL: "panel", HOTSPOT: "phone", LAN: "web"}
