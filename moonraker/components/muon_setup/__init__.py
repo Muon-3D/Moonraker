@@ -35,7 +35,7 @@ from typing import (
     Set, Tuple
 )
 
-from . import caller, manifest, model, region
+from . import caller, manifest, model, region, update
 from .model import DONE, FINISH, HIDDEN, PENDING, SKIPPED
 from ...utils.exceptions import ServerError
 
@@ -228,6 +228,9 @@ class MuonSetup:
         reg("/server/muon/setup/reset", ["POST"], self._handle_reset)
         reg("/server/muon/setup/network/cancel", ["POST"],
             self._handle_network_cancel)
+        # The steps' own endpoints, one module each.
+        for step_module in (update,):
+            step_module.register(self)
 
     # ------------------------------------------------------------------
     # Startup, migration and shutdown

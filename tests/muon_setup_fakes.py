@@ -111,6 +111,7 @@ class FakeAux:
 class FakeInternalTransport:
     def __init__(self, methods: Optional[Dict[str, Callable[..., Any]]] = None):
         self.methods = dict(methods or {})
+        self.calls: List[Tuple[str, Any]] = []
 
     @property
     def transport_type(self) -> TransportType:
@@ -120,7 +121,12 @@ class FakeInternalTransport:
                           **kwargs: Any) -> Any:
         if method_name not in self.methods:
             raise ServerError(f"No method {method_name} available")
-        return self.methods[method_name]()
+        self.calls.append((method_name, request_arguments))
+        fn = self.methods[method_name]
+        result = fn(request_arguments) if fn.__code__.co_argcount else fn()
+        if asyncio.iscoroutine(result):
+            result = await result
+        return result
 
 
 class FakeMachine:
