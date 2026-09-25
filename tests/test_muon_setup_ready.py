@@ -38,9 +38,14 @@ class FakeKlippyApis:
         self.ran: List[str] = []
         self.fail_with: Optional[str] = None
         self.gate: Optional[asyncio.Event] = None
+        self.print_state = "standby"
 
     async def get_object_list(self) -> List[str]:
         return list(self.objects)
+
+    async def query_objects(self, objects: Dict[str, Any]) -> Dict[str, Any]:
+        assert objects == {"print_stats": ["state"]}
+        return {"print_stats": {"state": self.print_state}}
 
     async def run_gcode(self, script: str) -> str:
         self.ran.append(script)
@@ -106,8 +111,10 @@ class TestItems:
             await h.setup.drain()
             item = h.doc["steps"]["ready"]["items"][1]
             assert item["status"] == "failed"
-            assert item["error"] == {"code": "self_test_failed",
-                                     "message": "Endstop x still triggered"}
+            assert item["error"] == {
+                "code": "self_test_failed",
+                "message": "Endstop x still triggered",
+                "detail": {"gcode_error": "Endstop x still triggered"}}
             assert h.doc["steps"]["ready"]["status"] == "pending"
             h.server.components["klippy_apis"].fail_with = None
             await post(h, "self_test", "start")
@@ -119,11 +126,15 @@ class TestItems:
 
     def test_a_running_macro_makes_every_other_write_busy(self):
         async def go():
-            h = await harness(at_ready()).start()
+            h = await harness(at_ready(transport_clips="done")).start()
             apis = h.server.components["klippy_apis"]
             apis.gate = asyncio.Event()
-            await post(h, "self_test", "start")
-            busy = await post(h, "transport_clips", "confirm")
+            start = await post(h, "self_test", "start")
+            assert start["state"]["op"] == {
+                "kind": "ready_item", "id": start["state"]["op"]["id"],
+                "started": start["state"]["op"]["started"],
+                "phase": "running", "progress": None, "item": "self_test"}
+            busy = await post(h, "load_filament", "confirm")
             assert busy["error"]["code"] == "busy"
             apis.gate.set()
             await h.setup.drain()
@@ -155,6 +166,53 @@ class TestItems:
         assert result["state"]["steps"]["ready"]["status"] == "pending"
 
 
+class TestMotionGuards:
+    """02 §5.10: the self-test moves the printer."""
+
+    def test_the_self_test_waits_for_the_transport_clips(self):
+        async def go():
+            h = await harness(at_ready()).start()
+            result = await post(h, "self_test", "start")
+            return h, result
+        h, result = run(go())
+        assert result["error"]["code"] == "invalid_step"
+        assert result["error"]["detail"]["pending"] == ["transport_clips"]
+        assert h.server.components["klippy_apis"].ran == []
+
+    @pytest.mark.parametrize("state", ["printing", "paused"])
+    def test_nothing_moves_over_a_print_running_or_paused(self, state: str):
+        async def go():
+            h = await harness(at_ready(transport_clips="done")).start()
+            h.server.components["klippy_apis"].print_state = state
+            return h, await post(h, "self_test", "start")
+        h, result = run(go())
+        assert result["error"]["code"] == "printer_busy"
+        assert h.server.components["klippy_apis"].ran == []
+
+    def test_the_macro_is_checked_again_at_start(self):
+        """Defined when the step loaded, gone by the time of the press."""
+        async def go():
+            h = await harness(at_ready(transport_clips="done")).start()
+            apis = h.server.components["klippy_apis"]
+            apis.objects.remove("gcode_macro MUON_SELF_TEST")
+            return h, await post(h, "self_test", "start")
+        h, result = run(go())
+        assert result["error"]["code"] == "invalid_step"
+        assert h.server.components["klippy_apis"].ran == []
+
+    def test_a_phone_gets_403_even_while_busy(self):
+        """The caller is checked before busy, stale_rev or Klipper."""
+        async def go():
+            h = await harness(at_ready()).start()
+            h.doc["op"] = {"kind": "join", "id": "op_x", "started": 0.0,
+                           "phase": "dhcp", "progress": None}
+            with pytest.raises(ServerError) as info:
+                await h.post("/ready", {"rev": 0, "item": "self_test",
+                                        "action": "start"}, kind="hotspot")
+            assert info.value.status_code == 403
+        run(go())
+
+
 class TestGuards:
     @pytest.mark.parametrize("kind", ["hotspot", "lan"])
     @pytest.mark.parametrize("action,item", [
@@ -171,7 +229,7 @@ class TestGuards:
 
     def test_nothing_starts_while_printing(self):
         async def go():
-            h = await harness(at_ready()).start()
+            h = await harness(at_ready(transport_clips="done")).start()
             h.server.components["klippy_connection"].printing = True
             return h, await post(h, "self_test", "start")
         h, result = run(go())
@@ -180,7 +238,7 @@ class TestGuards:
 
     def test_nothing_starts_before_klippy_is_ready(self):
         async def go():
-            h = await harness(at_ready()).start()
+            h = await harness(at_ready(transport_clips="done")).start()
             h.server.components["klippy_connection"].ready = False
             return await post(h, "self_test", "start")
         assert run(go())["error"]["code"] == "printer_not_ready"
@@ -217,13 +275,75 @@ class TestUndefinedMacros:
             return h
         assert run(go()).doc["steps"]["ready"]["items"][1]["status"] == "pending"
 
+    def test_hiding_a_macro_does_not_finish_a_skipped_step(self):
+        """The owner skipped `ready`; a macro disappearing later must not
+        quietly turn that skip into `done`."""
+        async def go():
+            stored = at_ready(transport_clips="done")
+            stored["steps"]["ready"]["status"] = "skipped"
+            stored["cursor"] = "finish"
+            h = harness(stored, macros=[])
+            h.server.components["klippy_connection"].ready = False
+            await h.start()
+            h.server.components["klippy_connection"].ready = True
+            await ready.refresh_macros(h.setup)
+            return h
+        h = run(go())
+        assert h.doc["steps"]["ready"]["items"][1]["status"] == "hidden"
+        assert h.doc["steps"]["ready"]["status"] == "skipped"
+
+    def test_the_macro_check_runs_when_the_state_loads(self):
+        """Not only on klippy_ready: a Moonraker restart with Klippy already
+        up must still hide an undefined macro."""
+        async def go():
+            return await harness(at_ready(), macros=[]).start()
+        h = run(go())
+        assert h.doc["steps"]["ready"]["items"][1]["status"] == "hidden"
+        assert h.stored()["steps"]["ready"]["items"][1]["status"] == "hidden"
+
     def test_nothing_is_hidden_while_klippy_cannot_say(self):
         async def go():
-            h = await harness(at_ready(), macros=[]).start()
+            h = harness(at_ready(), macros=[])
             h.server.components["klippy_connection"].ready = False
+            await h.start()
             await ready.refresh_macros(h.setup)
             return h
         assert run(go()).doc["steps"]["ready"]["items"][1]["status"] == "pending"
+
+
+class TestAfterSetupCard:
+    def test_the_card_keeps_ready_until_its_required_items_are_done(self):
+        """Stopping halfway (clips confirmed, the self-test failed) must not
+        drop `ready` off the "Finish setup" card (02 §5.10)."""
+        async def go():
+            h = await harness(at_ready()).start()
+            await h.post("/skip", {"rev": h.doc["rev"], "step": "ready"})
+            await h.post("/finish", {"rev": h.doc["rev"]})
+            await h.setup.drain()
+            await post(h, "transport_clips", "confirm")
+            assert h.doc["steps"]["ready"]["status"] == "skipped"
+            h.server.components["klippy_apis"].fail_with = "probe failed"
+            await post(h, "self_test", "start")
+            await h.setup.drain()
+            return h
+        h = run(go())
+        assert h.doc["steps"]["ready"]["status"] == "skipped"
+        assert h.doc["steps"]["ready"]["items"][1]["status"] == "failed"
+
+    def test_a_done_step_is_never_taken_back(self):
+        async def go():
+            h = await harness(at_ready()).start()
+            await post(h, "transport_clips", "confirm")
+            await post(h, "self_test", "start")
+            await h.setup.drain()
+            assert h.doc["steps"]["ready"]["status"] == "done"
+            await h.post("/finish", {"rev": h.doc["rev"]})
+            await h.setup.drain()
+            h.server.components["klippy_apis"].fail_with = "probe failed"
+            await post(h, "self_test", "start")
+            await h.setup.drain()
+            return h
+        assert run(go()).doc["steps"]["ready"]["status"] == "done"
 
 
 class TestAfterSetup:

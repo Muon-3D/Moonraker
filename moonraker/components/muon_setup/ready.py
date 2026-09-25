@@ -7,10 +7,15 @@
 # printer, so starting and confirming them is panel-only (02 §3); a phone can
 # only skip.
 #
+# A macro item moves the printer, so it starts only when every earlier
+# required item is done (the transport clips come off first), Klipper defines
+# the macro at that moment, no print is running or paused, and Klippy is
+# ready.
+#
 # The manifest and the MUON_SELF_TEST macro are provisional (decision D6). A
-# macro item whose macro Klipper does not define is hidden rather than offered
-# as a step that can only fail -- but only once Klipper has said which macros
-# it has, so an item does not flicker away while Klippy is still starting.
+# pending macro item whose macro Klipper does not define is hidden rather than
+# offered as a step that can only fail -- but only once Klipper has said which
+# macros it has, so an item does not flicker away while Klippy is starting.
 
 from __future__ import annotations
 
@@ -25,6 +30,8 @@ if TYPE_CHECKING:
 
 ACTIONS = ("start", "confirm", "skip")
 FAILED = "failed"
+#: print_stats states in which nothing may move the toolhead (02 §5.10).
+BUSY_PRINT_STATES = ("printing", "paused")
 
 
 def register(setup: MuonSetup) -> None:
@@ -33,6 +40,8 @@ def register(setup: MuonSetup) -> None:
         lambda webreq: handle_ready(setup, webreq))
     setup.server.register_event_handler(
         "server:klippy_ready", lambda: refresh_macros(setup))
+    # When the state loads, as well as when Klippy becomes ready (02 §5.10).
+    setup.live_refreshers.append(lambda: refresh_macros(setup))
 
 
 def _manifest_items(setup: MuonSetup) -> Dict[str, Dict[str, Any]]:
@@ -40,7 +49,7 @@ def _manifest_items(setup: MuonSetup) -> Dict[str, Dict[str, Any]]:
 
 
 # --------------------------------------------------------------------------
-# Hiding undefined macros
+# What Klipper can do right now
 # --------------------------------------------------------------------------
 
 async def defined_macros(setup: MuonSetup) -> Optional[Set[str]]:
@@ -61,10 +70,27 @@ async def defined_macros(setup: MuonSetup) -> Optional[Set[str]]:
     }
 
 
+async def print_state(setup: MuonSetup) -> Optional[str]:
+    """print_stats `state`, or None if Klipper cannot say. is_printing() is
+    only true for `printing`; a paused print must stop a self-test too."""
+    klippy = setup.server.lookup_component("klippy_apis", None)
+    if klippy is None:
+        return None
+    try:
+        result = await klippy.query_objects({"print_stats": ["state"]})
+    except Exception as exc:
+        logging.info("muon_setup: cannot read print_stats: %s", exc)
+        return None
+    stats = result.get("print_stats") if isinstance(result, dict) else None
+    state = stats.get("state") if isinstance(stats, dict) else None
+    return state if isinstance(state, str) else None
+
+
 def apply_macros(setup: MuonSetup, doc: Dict[str, Any],
                  macros: Optional[Set[str]]) -> None:
     """Hide pending macro items Klipper cannot run; show them again once it
-    can. Items already done or failed are left as they are."""
+    can. Done or failed items are left as they are, and a macro appearing
+    later never reopens a done step."""
     if macros is None:
         return
     items = _manifest_items(setup)
@@ -81,13 +107,16 @@ def apply_macros(setup: MuonSetup, doc: Dict[str, Any],
 
 
 async def refresh_macros(setup: MuonSetup) -> None:
-    """Called when Klippy is ready: apply what it defines, and announce it."""
+    """Apply what Klipper defines as its own change, committed and announced,
+    so a hide never rides on a write that is then rolled back."""
+    if setup.doc is None or setup.read_only_version is not None:
+        return
     macros = await defined_macros(setup)
-    if macros is None or setup.doc is None:
+    if macros is None:
         return
     async with setup._lock:
         doc = setup.doc
-        if doc is None or setup.read_only_version is not None:
+        if doc is None or doc["op"] is not None:
             return
         before = [dict(i) for i in doc["steps"]["ready"]["items"]]
         status = doc["steps"]["ready"]["status"]
@@ -98,9 +127,17 @@ async def refresh_macros(setup: MuonSetup) -> None:
 
 
 def settle(setup: MuonSetup, doc: Dict[str, Any]) -> None:
-    """The step is done when every required item that is offered is done."""
+    """The step is done when every required item that is offered is done.
+
+    After `complete`, a skipped step stays `skipped` -- it is what the
+    "Finish setup" card lists -- until then (02 §5.10). A done step is never
+    taken back.
+    """
     step = doc["steps"]["ready"]
-    if step["status"] != model.PENDING:
+    complete = doc["state"] == "complete"
+    if step["status"] == model.DONE:
+        return
+    if step["status"] == model.SKIPPED and not complete:
         return
     items = _manifest_items(setup)
     required: List[Dict[str, Any]] = [
@@ -110,8 +147,23 @@ def settle(setup: MuonSetup, doc: Dict[str, Any]) -> None:
     ]
     if all(state["status"] == model.DONE for state in required):
         step["status"] = model.DONE
-        if doc["state"] != "complete" and doc["cursor"] == "ready":
+        if not complete and doc["cursor"] == "ready":
             setup.advance()
+
+
+def _earlier_required_pending(setup: MuonSetup, doc: Dict[str, Any],
+                              item_id: str) -> List[str]:
+    """Required items before `item_id` in manifest order that aren't done."""
+    states = {s["id"]: s for s in doc["steps"]["ready"]["items"]}
+    pending: List[str] = []
+    for item in setup.manifest["items"]:
+        if item["id"] == item_id:
+            break
+        state = states.get(item["id"])
+        if (item.get("required") and state is not None
+                and state["status"] not in (model.DONE, model.HIDDEN)):
+            pending.append(item["id"])
+    return pending
 
 
 # --------------------------------------------------------------------------
@@ -119,30 +171,35 @@ def settle(setup: MuonSetup, doc: Dict[str, Any]) -> None:
 # --------------------------------------------------------------------------
 
 async def handle_ready(setup: MuonSetup, webreq: WebRequest) -> Dict[str, Any]:
-    macros = await defined_macros(setup)
+    args = webreq.get_args()
+    action = args.get("action")
+    if action in ("start", "confirm"):
+        # 02 §3: these need a person at the printer. Checked first, before
+        # `busy`, `stale_rev` or any Klipper query, so a phone always gets 403.
+        caller.require(caller.caller_kind(webreq), caller.PANEL_ONLY)
+    # Hiding undefined macros is its own change (on load, on klippy_ready and
+    # in the poll). Doing it here would bump `rev` under this very write and
+    # answer it `stale_rev`; `start` checks the macro again below instead.
 
     async def handler(ctx: WriteContext) -> Optional[Dict[str, Any]]:
         doc = ctx.doc
-        action = ctx.args.get("action")
         item_id = ctx.args.get("item")
         if action not in ACTIONS:
             return model.error("invalid_step", f"unknown action {action!r}")
         if not isinstance(item_id, str):
             return model.error("invalid_step", "'item' names no ready item")
-        if action in ("start", "confirm"):
-            # 02 §3: these need a person at the printer.
-            caller.require(ctx.kind, caller.PANEL_ONLY)
-        if doc["state"] != "complete" and not model.reachable(doc, "ready"):
+        complete = doc["state"] == "complete"
+        if not complete and not model.reachable(doc, "ready"):
             return model.error("invalid_step", "the ready step is not open")
-        apply_macros(setup, doc, macros)
         item = _manifest_items(setup).get(item_id)
         state = next((s for s in doc["steps"]["ready"]["items"]
                       if s["id"] == item_id), None)
         if item is None or state is None or state["status"] == model.HIDDEN:
             return model.error("invalid_step", f"no ready item {item_id!r}")
         step = doc["steps"]["ready"]
-        if step["status"] in (model.DONE, model.SKIPPED):
-            # Working through the card after a skip reopens the step.
+        if step["status"] == model.SKIPPED and not complete:
+            # Going back to a skipped step before `complete` reopens it; after
+            # `complete` it stays on the card (see settle()).
             step["status"] = model.PENDING
         if action == "skip":
             state["status"] = model.SKIPPED
@@ -157,14 +214,26 @@ async def handle_ready(setup: MuonSetup, webreq: WebRequest) -> Dict[str, Any]:
             state["error"] = None
             settle(setup, doc)
             return None
-        # start
+        # start: it moves the printer (02 §5.10).
         if item["kind"] != "macro":
             return model.error("invalid_step", f"{item_id} is not a macro")
+        earlier = _earlier_required_pending(setup, doc, item_id)
+        if earlier:
+            return model.error(
+                "invalid_step", f"{', '.join(earlier)} must be done first",
+                pending=earlier)
+        macros = await defined_macros(setup)
+        if macros is None:
+            return model.error("printer_not_ready", "Klippy is not ready")
+        if item["macro"].lower() not in macros:
+            return model.error(
+                "invalid_step", f"Klipper does not define {item['macro']}")
         kconn = setup.server.lookup_component("klippy_connection", None)
         if kconn is None or not kconn.is_ready():
             return model.error("printer_not_ready", "Klippy is not ready")
-        if kconn.is_printing():
-            return model.error("printer_busy", "a print is running")
+        printing = await print_state(setup)
+        if kconn.is_printing() or printing in BUSY_PRINT_STATES:
+            return model.error("printer_busy", "a print is running or paused")
         state["error"] = None
         setup.start_op("ready_item", _runner(setup, item_id, item["macro"]),
                        item=item_id, phase="running")
@@ -191,8 +260,8 @@ def _runner(setup: MuonSetup, item_id: str, macro: str):
                     state["error"] = None
                 else:
                     state["status"] = FAILED
-                    state["error"] = {"code": "self_test_failed",
-                                      "message": error}
+                    state["error"] = model.error(
+                        "self_test_failed", error, gcode_error=error)
             settle(setup, doc)
         await handle.finish(outcome)
     return run
