@@ -69,8 +69,41 @@ class FakeResponse:
             raise ValueError("not JSON")
         return self._payload
 
-    def raise_for_status(self) -> None:
+    def raise_for_status(self, message: Optional[str] = None) -> None:
+        # The real HttpResponse.raise_for_status takes the message to raise
+        # with (KAN-216 passes the Aux API's own), so the fake must accept it.
         self.raised_for_status = True
+        self.raise_message = message
+
+
+class UnreachableResponse(FakeResponse):
+    """What http_client hands back when the connection is refused: its
+    raise_for_status raises ServerError with status 500."""
+
+    def raise_for_status(self, message: Optional[str] = None) -> None:
+        from moonraker.utils import ServerError
+        raise ServerError("HTTP Request Error: http://127.0.0.1:6789/", 500)
+
+
+class FakeDatabase:
+    """The slice of Moonraker's database the proxy uses: the `muon`
+    namespace, for the owner's rename (ID-3)."""
+
+    def __init__(self) -> None:
+        self.namespaces: Dict[str, Dict[str, Any]] = {}
+
+    def register_local_namespace(self, namespace: str, forbidden: bool = False
+                                 ) -> None:
+        self.namespaces.setdefault(namespace, {})
+
+    async def get_item(self, namespace: str, key: str, default: Any = None) -> Any:
+        return self.namespaces.get(namespace, {}).get(key, default)
+
+    async def insert_item(self, namespace: str, key: str, value: Any) -> None:
+        self.namespaces.setdefault(namespace, {})[key] = value
+
+    async def delete_item(self, namespace: str, key: str) -> Any:
+        return self.namespaces[namespace].pop(key)
 
 
 class FakeHttpClient:
@@ -105,11 +138,15 @@ class FakeServer:
     def __init__(self, http_client: FakeHttpClient) -> None:
         self.http_client = http_client
         self.endpoints: List[Tuple[str, List[str], Any]] = []
+        # Without these, AuxAutoProxy.__init__ raised on the database lookup
+        # and every test that built a proxy failed (42 of them, KAN-203 MR-9).
+        self.components: Dict[str, Any] = {
+            "http_client": http_client,
+            "database": FakeDatabase(),
+        }
 
     def lookup_component(self, name: str, default: Any = None) -> Any:
-        if name == "http_client":
-            return self.http_client
-        return default
+        return self.components.get(name, default)
 
     def register_endpoint(self, path: str, verbs: List[str], handler: Any) -> None:
         self.endpoints.append((path, verbs, handler))
@@ -263,16 +300,162 @@ def test_an_empty_spec_still_registers_only_the_openapi_route():
 
     proxy._register_from_spec({"paths": {}})
 
-    # /server/muon/dev_mode is registered unconditionally, not from the spec:
-    # SEC-2 took every /server/aux/* path off the network including the
-    # dev-mode status read, and DEV-4 still requires developer mode to be
-    # visible in the interface, so it is published off the floor. It is GET
-    # only and forwards no body, which is what stops it becoming a way to
-    # *change* the mode.
+    # The /server/muon endpoints are registered unconditionally, in __init__,
+    # not from the spec (see test_the_muon_endpoints_exist_before_any_spec).
+    # /server/muon/dev_mode is there because SEC-2 took every /server/aux/*
+    # path off the network including the dev-mode status read, and DEV-4
+    # still requires developer mode to be visible in the interface, so it is
+    # published off the floor. It is GET only and forwards no body, which is
+    # what stops it becoming a way to *change* the mode.
     assert server.paths() == [
-        "/server/aux/openapi.json",
         "/server/muon/dev_mode",
+        "/server/muon/identity",
+        "/server/muon/identity/name",
+        "/server/aux/openapi.json",
     ]
+
+
+# --------------------------------------------------------------------------
+# The printer's name and developer mode: the endpoints the proxy serves itself
+# (KAN-203 MR-9, spec 02 §7)
+# --------------------------------------------------------------------------
+
+AUX_IDENTITY = {
+    "serial": "10000000abcd8987", "name": "walnut", "suffix": "8987",
+    "ssid": "Muon-walnut-8987", "display": "Walnut · 8987",
+    "fingerprint": "SHA256:placeholder",
+}
+
+
+def test_the_muon_endpoints_exist_before_any_spec():
+    """They are served by the helpers, not mirrored, so a late Aux API must
+    not leave the printer unable to say its name."""
+    _proxy, server, _client = make_proxy()
+
+    assert server.paths() == [
+        "/server/muon/dev_mode",
+        "/server/muon/identity",
+        "/server/muon/identity/name",
+    ]
+    assert server.verbs_for("/server/muon/identity") == ["GET"]
+    assert server.verbs_for("/server/muon/identity/name") == ["POST"]
+
+
+def test_a_late_aux_api_still_fails_init_but_the_identity_answers_503():
+    """component_init still raises -- the /server/aux routes do need the
+    spec, and Moonraker's warning about that is worth keeping -- but the
+    identity endpoint is registered and says "not yet", not "no such route"."""
+    client = FakeHttpClient(UnreachableResponse())
+    proxy, server, _client = make_proxy(client)
+
+    with pytest.raises(Exception):
+        asyncio.run(proxy.component_init())
+
+    handler = server.handler_for("/server/muon/identity")
+    with pytest.raises(FakeServerError) as excinfo:
+        asyncio.run(handler(FakeWebRequest("GET")))
+    assert excinfo.value.status_code == 503
+
+    dev_mode = server.handler_for("/server/muon/dev_mode")
+    with pytest.raises(FakeServerError) as excinfo:
+        asyncio.run(dev_mode(FakeWebRequest("GET")))
+    assert excinfo.value.status_code == 503
+
+
+def test_an_aux_refusal_is_not_turned_into_503():
+    """Only "not answering" is 503. An answer Aux chose to give -- its own
+    503 when the serial cannot be read, say -- keeps its status."""
+    class Refused(FakeResponse):
+        def raise_for_status(self, message: Optional[str] = None) -> None:
+            from moonraker.utils import ServerError
+            raise ServerError("could not derive this printer's identity", 404)
+
+    _proxy, server, _client = make_proxy(FakeHttpClient(Refused()))
+    handler = server.handler_for("/server/muon/identity")
+    from moonraker.utils import ServerError
+    with pytest.raises(ServerError) as excinfo:
+        asyncio.run(handler(FakeWebRequest("GET")))
+    assert excinfo.value.status_code == 404
+
+
+def test_a_real_aux_500_keeps_its_status_but_a_timeout_is_503():
+    """02 §7: http_client reports both a refused connection and a genuine
+    Aux 500 as 500. Only the first is "not answering"; the genuine one has
+    Tornado's HTTPClientError behind it."""
+    from tornado.httpclient import HTTPClientError
+
+    from moonraker.utils import ServerError
+
+    class AuxFault(FakeResponse):
+        def raise_for_status(self, message: Optional[str] = None) -> None:
+            raise ServerError("Internal Server Error", 500) from HTTPClientError(500)
+
+    class TimedOut(FakeResponse):
+        def raise_for_status(self, message: Optional[str] = None) -> None:
+            raise ServerError("Timeout", 599) from HTTPClientError(599)
+
+    _proxy, server, _client = make_proxy(FakeHttpClient(AuxFault()))
+    with pytest.raises(ServerError) as excinfo:
+        asyncio.run(server.handler_for("/server/muon/identity")(FakeWebRequest()))
+    assert excinfo.value.status_code == 500
+
+    _proxy, server, _client = make_proxy(FakeHttpClient(TimedOut()))
+    with pytest.raises(FakeServerError) as fake:
+        asyncio.run(server.handler_for("/server/muon/identity")(FakeWebRequest()))
+    assert fake.value.status_code == 503
+
+
+def test_the_identity_is_the_derived_name_until_the_owner_renames_it():
+    """What the endpoint said before MR-9, pinned: the owner's rename wins,
+    the derived half is always reported, and the display form follows the
+    rename."""
+    _proxy, server, _client = make_proxy(
+        FakeHttpClient(FakeResponse(dict(AUX_IDENTITY))))
+    get = server.handler_for("/server/muon/identity")
+    rename = server.handler_for("/server/muon/identity/name")
+
+    assert asyncio.run(get(FakeWebRequest("GET"))) == {
+        "name": "walnut", "source": "derived", "derived_name": "walnut",
+        "suffix": "8987", "display": "Walnut · 8987",
+        "ssid": "Muon-walnut-8987", "fingerprint": "SHA256:placeholder",
+        # KAN-403 (#27): null until Aux reports an EndpointId.
+        "endpoint_id": None,
+        "setup": None,
+    }
+
+    renamed = asyncio.run(rename(FakeWebRequest("POST", {"name": "  Workshop "})))
+    assert renamed["name"] == "Workshop"
+    assert renamed["source"] == "owner"
+    assert renamed["derived_name"] == "walnut"
+    assert renamed["display"] == "Workshop · 8987"
+
+    cleared = asyncio.run(rename(FakeWebRequest("POST", {"name": ""})))
+    assert cleared["name"] == "walnut"
+    assert cleared["source"] == "derived"
+
+
+def test_a_rename_is_bounded_and_must_be_a_string():
+    _proxy, server, _client = make_proxy(
+        FakeHttpClient(FakeResponse(dict(AUX_IDENTITY))))
+    rename = server.handler_for("/server/muon/identity/name")
+    for args in ({}, {"name": 7}, {"name": "x" * 33}):
+        with pytest.raises(FakeServerError) as excinfo:
+            asyncio.run(rename(FakeWebRequest("POST", args)))
+        assert excinfo.value.status_code == 400
+
+
+@pytest.mark.parametrize("state", ["new", "in_progress", "complete"])
+def test_the_identity_says_whether_setup_is_done(state: str):
+    """02 §7: apps route a printer they found by this (06 §1)."""
+    class Setup:
+        def public_state(self) -> Dict[str, Any]:
+            return {"state": state}
+
+    _proxy, server, _client = make_proxy(
+        FakeHttpClient(FakeResponse(dict(AUX_IDENTITY))))
+    server.components["muon_setup"] = Setup()
+    get = server.handler_for("/server/muon/identity")
+    assert asyncio.run(get(FakeWebRequest("GET")))["setup"] == state
 
 
 # --------------------------------------------------------------------------
@@ -432,7 +615,7 @@ def test_a_non_json_response_falls_back_to_a_raw_response():
 
 def test_a_failing_upstream_status_is_raised_not_swallowed():
     class Failing(FakeResponse):
-        def raise_for_status(self) -> None:
+        def raise_for_status(self, message: Optional[str] = None) -> None:
             raise FakeServerError("500 from the Aux API", 500)
 
     proxy, server, _client = make_proxy(FakeHttpClient(Failing()))
@@ -510,7 +693,9 @@ def test_every_helper_call_carries_a_bounded_timeout():
 
     asyncio.run(proxy.get("/update/status"))
     asyncio.run(proxy.post("/update/check", {"wait": False}))
+    asyncio.run(proxy.delete("/setup/complete"))
 
+    assert len(client.calls) == 3
     for _kind, call in client.calls:
         assert call["connect_timeout"] > 0
         assert call["request_timeout"] > 0
@@ -777,8 +962,8 @@ def test_a_body_that_is_not_json_is_not_an_error():
 
 
 # The wiring, not just the helper. `get` and `post` are driven UNBOUND against
-# a stub self, because AuxAutoProxy.__init__ is what breaks the rest of this
-# file -- the method bodies themselves are fine to exercise. The response is a
+# a stub self, which was how they could be tested while AuxAutoProxy.__init__
+# still broke the rest of this file (fixed in KAN-203 MR-9). The response is a
 # REAL HttpResponse carrying a REAL tornado HTTPError, so this pins the
 # integration with Moonraker's own raise_for_status rather than a fake of it.
 
@@ -872,6 +1057,24 @@ def test_a_successful_response_is_returned_and_not_raised():
     assert asyncio.run(AuxAutoProxy.get(_StubProxySelf(ok), "/update/status")) == {
         "state": "idle"
     }
+
+
+def test_delete_goes_to_the_aux_api_with_the_token_and_raises_on_refusal():
+    """muon_setup's reset clears OS-7's marker with DELETE /setup/complete."""
+    client = FakeHttpClient(FakeResponse({"complete": False}))
+    proxy, _server, _client = make_proxy(client)
+    proxy._token = "t0k"
+
+    assert asyncio.run(proxy.delete("/setup/complete")) == {"complete": False}
+    call = client.last
+    assert call["method"] == "DELETE"
+    assert call["url"] == "http://127.0.0.1:6789/setup/complete"
+    assert call["headers"]["X-Aux-Api-Key"] == "t0k"
+
+    proxy, _server, _client = make_proxy(FakeHttpClient(UnreachableResponse()))
+    from moonraker.utils import ServerError
+    with pytest.raises(ServerError):
+        asyncio.run(proxy.delete("/setup/complete"))
 
 
 # --------------------------------------------------------------------------

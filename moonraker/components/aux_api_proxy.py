@@ -13,6 +13,10 @@ from pathlib import Path
 from typing import Dict, Any, Callable, Optional
 from urllib.parse import unquote, urlencode
 
+from tornado.httpclient import HTTPClientError
+
+from ..utils import ServerError
+
 FASTAPI_ROOT = "http://127.0.0.1:6789"  # loopback-only Aux API bind
 OPENAPI_PATH = "/openapi.json"  # FastAPI default
 MOON_PREFIX = "/server/aux"  # Moonraker namespace
@@ -112,6 +116,14 @@ def _raise_for_aux_status(resp: Any) -> None:
         raise
 
 
+def _not_answering(exc: ServerError) -> bool:
+    """A timeout (599), or a 500 that no HTTP response stands behind."""
+    if exc.status_code == 599:
+        return True
+    return exc.status_code == 500 and not isinstance(
+        exc.__cause__, HTTPClientError)
+
+
 def _has_encoded_separator(path: str) -> bool:
     """True if percent-decoding `path` would introduce a new separator.
 
@@ -162,6 +174,13 @@ class AuxAutoProxy:
         # outlive whichever interface set it.
         self.database = self.server.lookup_component("database")
         self.database.register_local_namespace(MUON_NAMESPACE)
+        # MR-9 (KAN-203): the Muon endpoints below are served by the helpers,
+        # not mirrored from the spec, so they do not need the spec to exist.
+        # They used to be registered only after _fetch_spec() succeeded, so an
+        # Aux API that was late at boot made component_init raise and left
+        # them missing until Moonraker restarted: a printer that could not
+        # say its own name. Registered here, they answer 503 until Aux does.
+        self._register_muon_endpoints()
 
     # Moonraker calls this coroutine right after all components load
     async def component_init(self):
@@ -213,23 +232,8 @@ class AuxAutoProxy:
         rsp.raise_for_status()
         return rsp.json()
 
-    # ---------- build Moonraker endpoints from the spec -----------------
-    def _register_from_spec(self, spec: Dict[str, Any]):
-        needs_proxy = False
-
-        self._spec = spec
-        # KAN-83: every path the dynamic proxy is allowed to reach. Built
-        # from the spec rather than hand-written, so it cannot drift from
-        # the routes that actually exist.
-        self._proxy_allowed: list[tuple[re.Pattern[str], frozenset[str]]] = []
-
-        # register the raw OpenAPI document
-        self.server.register_endpoint(
-            f"{MOON_PREFIX}/openapi.json",
-            ["GET"],
-            self._openapi_handler
-        )
-
+    # ---------- Muon endpoints served by the helpers --------------------
+    def _register_muon_endpoints(self) -> None:
         # MUON, DEV-4: developer mode must be visible on the panel *and* in the
         # interface.  SEC-2 keeps /server/aux/dev_mode on the floor, and
         # `is_floor_endpoint` matches that prefix and everything under it, so
@@ -273,6 +277,23 @@ class AuxAutoProxy:
             "/server/muon/identity/name",
             ["POST"],
             self._set_identity_name_handler
+        )
+
+    # ---------- build Moonraker endpoints from the spec -----------------
+    def _register_from_spec(self, spec: Dict[str, Any]):
+        needs_proxy = False
+
+        self._spec = spec
+        # KAN-83: every path the dynamic proxy is allowed to reach. Built
+        # from the spec rather than hand-written, so it cannot drift from
+        # the routes that actually exist.
+        self._proxy_allowed: list[tuple[re.Pattern[str], frozenset[str]]] = []
+
+        # register the raw OpenAPI document
+        self.server.register_endpoint(
+            f"{MOON_PREFIX}/openapi.json",
+            ["GET"],
+            self._openapi_handler
         )
 
         for fast_path, path_item in spec.get("paths", {}).items():
@@ -432,7 +453,7 @@ class AuxAutoProxy:
         label -- and that promise is about the derived name, whatever the
         current override happens to be.
         """
-        derived = await self.get("/identity")
+        derived = await self._get_or_unavailable("/identity")
         if not isinstance(derived, dict):
             raise self.server.error("Aux returned an unreadable identity", 502)
 
@@ -464,7 +485,40 @@ class AuxAutoProxy:
             # ID-1. The trust identifier. Reported for a trust-context
             # display; it is deliberately not what the name derives from.
             "fingerprint": derived.get("fingerprint"),
+            # KAN-203 (spec 02 §7): whether this printer still needs setting
+            # up, so an app that finds it can route it (06 §1).
+            "setup": self._setup_state(),
         }
+
+    def _setup_state(self) -> Optional[str]:
+        """new | in_progress | complete, from muon_setup, or None when it is
+        not configured on this printer."""
+        setup = self.server.lookup_component("muon_setup", None)
+        if setup is None:
+            return None
+        state = setup.public_state().get("state")
+        return state if isinstance(state, str) else None
+
+    async def _get_or_unavailable(self, path: str) -> Any:
+        """GET from Aux for the Muon endpoints registered in __init__.
+
+        While Aux is not answering -- late at boot, or restarting -- they say
+        503, which a client should retry, instead of the 500 a refused
+        connection turns into, which reads as a fault (02 §7).
+
+        Only "not answering" becomes 503. http_client reports a timeout as 599
+        and a failed connection as 500 with no HTTP error behind it; a 500
+        that Aux really answered carries Tornado's HTTPClientError as its
+        cause, and keeps its status.
+        """
+        try:
+            return await self.get(path)
+        except ServerError as exc:
+            if _not_answering(exc):
+                raise self.server.error(
+                    f"The Aux API is not answering yet ({path})", 503
+                ) from exc
+            raise
 
     async def _set_identity_name_handler(self, webreq):
         """ID-2: the owner renames the printer.
@@ -501,7 +555,7 @@ class AuxAutoProxy:
         return await self._identity_handler(webreq)
 
     async def _dev_mode_status_handler(self, webreq):
-        state = await self.get("/dev_mode")
+        state = await self._get_or_unavailable("/dev_mode")
         if not isinstance(state, dict):
             raise self.server.error(
                 "Aux returned an unreadable dev_mode state", 502
