@@ -872,3 +872,80 @@ def test_a_successful_response_is_returned_and_not_raised():
     assert asyncio.run(AuxAutoProxy.get(_StubProxySelf(ok), "/update/status")) == {
         "state": "idle"
     }
+
+
+# --------------------------------------------------------------------------
+# KAN-403: the EndpointId reaches /server/muon/identity
+# --------------------------------------------------------------------------
+#
+# A real AuxAutoProxy on a server that does provide `database`, with `get`
+# replaced on the instance. Anything the handler reaches through self.get
+# therefore sees the fake Aux answer.
+
+ENDPOINT_ID = "3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29"
+
+DERIVED: Dict[str, Any] = {
+    "serial": "100000008b9791ab",
+    "name": "walnut",
+    "suffix": "8987",
+    "ssid": "Muon-walnut-8987",
+    "display": "Walnut · 8987",
+    "fingerprint": "SHA256:abc",
+}
+
+
+class _FakeDatabase:
+    def __init__(self, override: Optional[str] = None) -> None:
+        self.override = override
+
+    def register_local_namespace(self, namespace: str) -> None:
+        pass
+
+    async def get_item(self, namespace: str, key: str, default: Any = None) -> Any:
+        return self.override if self.override is not None else default
+
+
+class _ServerWithDatabase(FakeServer):
+    def __init__(self, database: _FakeDatabase) -> None:
+        super().__init__(FakeHttpClient())
+        self.database = database
+
+    def lookup_component(self, name: str, default: Any = None) -> Any:
+        if name == "database":
+            return self.database
+        return super().lookup_component(name, default)
+
+
+def _identity(derived: Dict[str, Any], override: Optional[str] = None) -> Any:
+    proxy = AuxAutoProxy(FakeConfig(_ServerWithDatabase(_FakeDatabase(override))))
+
+    async def fake_get(path: str) -> Any:
+        assert path == "/identity", path
+        return dict(derived)
+
+    proxy.get = fake_get  # type: ignore[method-assign]
+    return asyncio.run(proxy._identity_handler(FakeWebRequest()))
+
+
+def test_the_endpoint_id_from_aux_is_passed_on():
+    body = _identity(dict(DERIVED, endpoint_id=ENDPOINT_ID))
+    assert body["endpoint_id"] == ENDPOINT_ID
+
+
+def test_the_endpoint_id_is_null_before_muon_link_has_published_it():
+    body = _identity(dict(DERIVED, endpoint_id=None))
+    assert body["endpoint_id"] is None
+    assert body["name"] == "walnut"
+
+
+def test_an_aux_without_the_field_gives_null_not_an_error():
+    """Moonraker can be updated before Aux, or run against an older one."""
+    body = _identity(DERIVED)
+    assert body["endpoint_id"] is None
+
+
+def test_a_rename_does_not_touch_the_endpoint_id():
+    """ID-5: the name carries no authority, and it doesn't move the key."""
+    body = _identity(dict(DERIVED, endpoint_id=ENDPOINT_ID), override="bench")
+    assert body["name"] == "bench"
+    assert body["endpoint_id"] == ENDPOINT_ID
