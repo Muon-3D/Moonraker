@@ -63,7 +63,7 @@ class TestWhatIsOnTheFloor:
     floor.
     """
 
-    def test_the_floor_is_the_battery_commands(self):
+    def test_the_floor_is_the_battery_commands_and_the_setup_writes(self):
         """Pinned as an exact tuple, so adding or dropping one is a failure here
         rather than a discovery in the field."""
         assert FLOOR_PREFIXES == (
@@ -72,6 +72,8 @@ class TestWhatIsOnTheFloor:
             "/server/aux/bms/standby",
             "/server/aux/bms/fault",
             "/server/aux/bms/ship",
+            "/server/aux/setup/complete",
+            "/server/aux/wifi/ap/auto_off",
         )
 
     @pytest.mark.parametrize(
@@ -148,6 +150,36 @@ class TestWhatIsOnTheFloor:
         ``/bms/link`` is what a UI polls to decide whether the battery exists,
         so flooring it makes a LAN client draw a printer with no battery.
         """
+        assert not is_floor_endpoint(endpoint)
+
+    @pytest.mark.parametrize(
+        "endpoint",
+        [
+            "/server/aux/setup/complete",
+            "/server/aux/wifi/ap/auto_off",
+        ],
+    )
+    def test_the_first_run_setup_writes_are_floored(self, endpoint: str):
+        """KAN-413 / KAN-411. Only ``muon_setup`` writes these, in-process.
+
+        From the network, marking setup complete would stop a new printer's
+        setup and let its hotspot go off; clearing it would send a working
+        printer back to its first screen. Spelled out, not derived.
+        """
+        assert is_floor_endpoint(endpoint)
+
+    @pytest.mark.parametrize(
+        "endpoint",
+        [
+            "/server/aux/wifi/ap/up",
+            "/server/aux/wifi/ap/down",
+            "/server/aux/wifi/ap/stations",
+            "/server/aux/wifi/ap/show",
+        ],
+    )
+    def test_the_owners_hotspot_controls_stay_open(self, endpoint: str):
+        """The Fluidd hotspot card uses these (Level 0). A segment-boundary
+        match on ``wifi/ap/auto_off`` must not take its siblings with it."""
         assert not is_floor_endpoint(endpoint)
 
     def test_the_bms_prefix_as_a_whole_is_not_floored(self):
