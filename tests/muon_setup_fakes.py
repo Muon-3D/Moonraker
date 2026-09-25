@@ -104,6 +104,9 @@ class FakeAux:
     async def post(self, path: str, body: Any = None) -> Any:
         return await self._call("POST", path, body)
 
+    async def delete(self, path: str) -> Any:
+        return await self._call("DELETE", path, None)
+
     def posted(self, path: str) -> List[Any]:
         return [body for m, p, body in self.calls if m == "POST" and p == path]
 
@@ -298,8 +301,9 @@ REGION_OPTIONS_174 = {
 def fresh_aux(**extra: Route) -> FakeAux:
     """A new unit's Aux: no marker, no saved networks, hotspot up."""
     routes: Dict[Tuple[str, str], Route] = {
-        ("GET", "/setup"): {"complete": False, "language": None,
-                            "completed_at": None},
+        # OS-7's marker (MuonOS#313).
+        ("GET", "/setup/complete"): {"complete": False, "completed_at": None,
+                                     "by": None},
         ("GET", "/wifi/saved"): [],
         ("GET", "/wifi/ap/device/status"): {
             "device": "ap0", "device_type": "wifi", "state": "connected",
@@ -307,7 +311,11 @@ def fresh_aux(**extra: Route) -> FakeAux:
         ("POST", "/wifi/ap/count"): 0,
         ("GET", "/region"): REGION_174,
         ("GET", "/region/options"): REGION_OPTIONS_174,
-        ("POST", "/setup"): lambda body: dict(body),
+        ("POST", "/setup/complete"): lambda body: {
+            "complete": True, "completed_at": "2026-09-24T12:00:00+00:00",
+            "by": body.get("by")},
+        ("DELETE", "/setup/complete"): {"complete": False, "completed_at": None,
+                                        "by": None},
         ("POST", "/wifi/ap/auto_off"): {"ok": True},
     }
     for key, value in extra.items():
