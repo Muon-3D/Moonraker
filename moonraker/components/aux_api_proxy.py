@@ -524,6 +524,21 @@ class AuxAutoProxy:
         except Exception:
             return resp.content
 
+    async def delete(self, path: str) -> Any:
+        """DELETE, for muon_setup's development reset of the setup marker
+        (KAN-203; DELETE /setup/complete, MuonOS OS-7). Same bounds as get()."""
+        resp = await self.http_client.request(
+            method="DELETE",
+            url=f"{FASTAPI_ROOT}{path}",
+            headers=self._auth_headers(),
+            connect_timeout=3.,
+            request_timeout=8.,
+        )
+        resp.raise_for_status(_aux_error_message(resp))
+        with contextlib.suppress(Exception):
+            return resp.json()
+        return resp.content
+
     # OTA convenience wrappers
     async def ota_status(self) -> Any:
         return await self.get("/update/status")

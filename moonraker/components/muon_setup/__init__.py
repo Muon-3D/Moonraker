@@ -50,6 +50,9 @@ STATE_KEY = "state"
 INTERNAL_KEY = "internal"
 
 DEFAULT_READY_MANIFEST = "/usr/share/muon/setup/ready.json"
+#: Where the completion marker is read: OS-7's route (MuonOS#313), then the
+#: one MuonOS#174 carries. Both answer {"complete": bool, ...}.
+MARKER_READS = ("/setup/complete", "/setup")
 DEFAULT_LANGUAGES = "en, de, fr, es, it"
 
 #: How long GET waits at boot for the migration check before it answers.
@@ -354,12 +357,15 @@ class MuonSetup:
         return None if inconclusive else False
 
     async def _marker_present(self) -> bool:
-        # MuonOS#174's marker: GET /setup -> {complete, language, completed_at}.
-        try:
-            marker = await self.aux("GET", "/setup")
-        except AuxMissing:
-            return False
-        return isinstance(marker, dict) and marker.get("complete") is True
+        # OS-7's marker (MuonOS#313): GET /setup/complete -> {complete, ...}.
+        # Images carrying MuonOS#174 instead have GET /setup, same field.
+        for path in MARKER_READS:
+            try:
+                marker = await self.aux("GET", path)
+            except AuxMissing:
+                continue
+            return isinstance(marker, dict) and marker.get("complete") is True
+        return False
 
     async def _wifi_saved(self) -> bool:
         # MuonOS#210's GET /wifi/saved lists saved profiles, hotspot excluded.
@@ -436,6 +442,10 @@ class MuonSetup:
         try:
             if method == "GET":
                 return await proxy.get(path)
+            if method == "DELETE":
+                if not hasattr(proxy, "delete"):
+                    raise AuxMissing(path)
+                return await proxy.delete(path)
             return await proxy.post(path, body)
         except ServerError as exc:
             status = exc.status_code
@@ -909,23 +919,27 @@ class MuonSetup:
         await self._write_marker()
 
     async def _write_marker(self) -> None:
-        """03 §7, as MuonOS#174 built it: POST /setup {complete, language,
-        completed_at}. Retried while Aux is down; an image without the route
+        """03 §7: POST /setup/complete (OS-7, MuonOS#313), or on an image
+        that carries MuonOS#174 instead, POST /setup {complete, language,
+        completed_at}. Retried while Aux is down; an image with neither
         cannot hold a marker, and the next boot tries again."""
         while not self._closed and self.doc is not None:
             language = self.doc["steps"]["language"].get("value")
-            body = {
+            legacy = {
                 "complete": True,
                 "language": language if isinstance(language, str) else None,
                 "completed_at": datetime.datetime.now(
                     datetime.timezone.utc).isoformat(timespec="seconds"),
             }
             try:
-                await self.aux("POST", "/setup", body)
+                try:
+                    await self.aux("POST", "/setup/complete", {"by": "muon_setup"})
+                except AuxMissing:
+                    await self.aux("POST", "/setup", legacy)
             except AuxMissing:
                 logging.warning(
-                    "muon_setup: this image has no Aux POST /setup; the "
-                    "completion marker was not written")
+                    "muon_setup: this image has no Aux setup marker route; "
+                    "the completion marker was not written")
                 return
             except AuxRefused as exc:
                 logging.error("muon_setup: Aux refused the marker: %s", exc)
@@ -1003,12 +1017,20 @@ class MuonSetup:
             await self._persist()
             self._resolved.set()
             self._notify()
-        # MuonOS#174's marker cannot be cleared through Aux, on purpose: only
-        # a factory reset removes it. The new state is written directly, so
-        # this does not re-run the migration check that would find it.
-        logging.info(
-            "muon_setup: setup state reset by the panel; the Aux setup marker, "
-            "if any, stays until a factory reset")
+        # OS-7's DELETE /setup/complete clears the marker, so the hotspot's
+        # H1 rule sees a new printer again. MuonOS#174's marker has no delete,
+        # on purpose: only a factory reset removes it. Either way the new
+        # state is written directly, so no migration check runs to find it.
+        try:
+            await self.aux("DELETE", "/setup/complete")
+        except AuxMissing:
+            logging.info(
+                "muon_setup: setup state reset; this image's setup marker, "
+                "if any, stays until a factory reset")
+        except (AuxUnavailable, AuxRefused) as exc:
+            logging.warning("muon_setup: the setup marker was not cleared: %s", exc)
+        else:
+            logging.info("muon_setup: setup state and marker reset by the panel")
         return self.envelope()
 
     # ------------------------------------------------------------------

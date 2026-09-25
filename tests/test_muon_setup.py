@@ -50,8 +50,8 @@ class TestFreshStartAndMigration:
             "transport_clips", "self_test", "load_filament"]
 
     @pytest.mark.parametrize("signal", [
-        "marker", "saved_wifi", "connected_wifi_on_an_older_image",
-        "fluidd_settings", "link",
+        "marker", "marker_on_a_174_image", "saved_wifi",
+        "connected_wifi_on_an_older_image", "fluidd_settings", "link",
     ])
     def test_a_printer_already_in_use_is_marked_complete_not_sent_to_setup(
         self, signal: str
@@ -60,6 +60,10 @@ class TestFreshStartAndMigration:
         namespaces: Dict[str, Dict[str, Any]] = {}
         extra: Dict[str, Any] = {}
         if signal == "marker":
+            aux.routes[("GET", "/setup/complete")] = {
+                "complete": True, "completed_at": None, "by": "muon_setup"}
+        elif signal == "marker_on_a_174_image":
+            del aux.routes[("GET", "/setup/complete")]
             aux.routes[("GET", "/setup")] = {
                 "complete": True, "language": "en", "completed_at": None}
         elif signal == "saved_wifi":
@@ -95,6 +99,7 @@ class TestFreshStartAndMigration:
         # Nothing was skipped, so no "Finish setup" card.
         assert model.card_steps(state) == []
         # A migrated printer has no marker to write.
+        assert aux.posted("/setup/complete") == []
         assert aux.posted("/setup") == []
 
     def test_an_image_without_the_newer_routes_reads_as_new(self):
@@ -133,14 +138,14 @@ class TestFreshStartAndMigration:
     def test_a_stored_state_is_loaded_not_migrated_again(self):
         stored = state_with(language={"status": "done", "value": "de"})
         aux = fresh_aux()
-        aux.routes[("GET", "/setup")] = {"complete": True}
+        aux.routes[("GET", "/setup/complete")] = {"complete": True}
 
         async def go():
             return await Harness(stored=stored, aux=aux).start()
         h = run(go())
         assert h.doc["state"] == "in_progress"
         assert h.doc["cursor"] == "network"
-        assert ("GET", "/setup", None) not in aux.calls
+        assert ("GET", "/setup/complete", None) not in aux.calls
 
     def test_an_unknown_schema_version_is_complete_and_read_only(self):
         """02 §4: a downgrade never re-runs setup, and never writes over the
@@ -772,11 +777,8 @@ class TestFinish:
         assert steps["remote"]["status"] == "skipped"
         assert steps["ready"]["status"] == "skipped"
         assert model.card_steps(state) == ["remote", "ready"]
-        # The marker, in MuonOS#174's shape.
-        (marker,) = h.aux.posted("/setup")
-        assert marker["complete"] is True
-        assert marker["language"] == "de"
-        assert isinstance(marker["completed_at"], str)
+        # The marker, through OS-7's route (MuonOS#313).
+        assert h.aux.posted("/setup/complete") == [{"by": "muon_setup"}]
         assert h.db.namespaces["muon_setup"]["internal"]["marker_written"] is True
         # The in-process event, for other components.
         (complete,) = [a for e, a in h.server.events if e == "muon_setup:complete"]
@@ -784,6 +786,26 @@ class TestFinish:
         # The hotspot goes off in 15 minutes, because an uplink has an address.
         assert h.aux.posted("/wifi/ap/auto_off") == [{"after_s": 900}]
         assert h.setup.public_state()["hotspot"]["auto_off_at"] is not None
+
+    def test_an_image_carrying_174_gets_its_marker_shape_instead(self):
+        """No OS-7 route, but MuonOS#174's POST /setup: the marker is written
+        there, with the language, and reset cannot clear it."""
+        aux = fresh_aux(**{"POST /setup": lambda body: dict(body)})
+        del aux.routes[("POST", "/setup/complete")]
+        del aux.routes[("DELETE", "/setup/complete")]
+
+        async def go():
+            h = await Harness(stored=self._stored(), aux=aux).start()
+            await h.post("/finish", {"rev": 5})
+            await h.setup.drain()
+            reset = await h.post("/reset", {})
+            assert reset["ok"] is True
+            return h
+        h = run(go())
+        (marker,) = h.aux.posted("/setup")
+        assert marker["complete"] is True
+        assert marker["language"] == "de"
+        assert isinstance(marker["completed_at"], str)
 
     def test_no_auto_off_without_an_uplink_address(self):
         async def go():
@@ -813,7 +835,8 @@ class TestFinish:
             await h.post("/finish", {"rev": 5})
             for _ in range(20):
                 await asyncio.sleep(0.01)
-            assert len(h.aux.posted("/setup")) >= 2   # tried, and tried again
+            # tried, and tried again
+            assert len(h.aux.posted("/setup/complete")) >= 2
             internal = h.db.namespaces["muon_setup"].get("internal", {})
             assert not internal.get("marker_written")
             h.aux.down = False
@@ -822,10 +845,11 @@ class TestFinish:
         run(go())
 
     def test_an_image_without_the_new_routes_still_completes(self):
-        """No POST /setup (before MuonOS#174) and no auto_off (before OS-5):
-        setup completes, the hotspot stays up, and nothing loops."""
+        """No marker route at all (before OS-7 and MuonOS#174) and no
+        auto_off (before OS-5): setup completes, the hotspot stays up, and
+        nothing loops."""
         aux = fresh_aux()
-        del aux.routes[("POST", "/setup")]
+        del aux.routes[("POST", "/setup/complete")]
         del aux.routes[("POST", "/wifi/ap/auto_off")]
 
         async def go():
@@ -909,13 +933,12 @@ class TestReset:
             assert result["state"]["state"] == "new"
             assert result["state"]["op"] is None
             assert h.stored()["state"] == "new"
-            # MuonOS#174's marker cannot be cleared, and reset does not try:
-            # no write reaches Aux's /setup at all.
-            assert [c for c in h.aux.calls if c[:2] != ("GET", "/setup")
-                    and c[1] == "/setup"] == []
-            # Reset does not re-run the migration check, which would find the
+            # OS-7's marker is cleared, so the hotspot's H1 rule sees a new
+            # printer again.
+            assert ("DELETE", "/setup/complete", None) in h.aux.calls
+            # Reset does not re-run the migration check, which would find a
             # marker and call the printer migrated.
-            assert ("GET", "/setup", None) not in h.aux.calls
+            assert ("GET", "/setup/complete", None) not in h.aux.calls
         run(go())
 
 
