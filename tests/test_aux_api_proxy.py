@@ -695,7 +695,9 @@ def test_every_helper_call_carries_a_bounded_timeout():
 
     asyncio.run(proxy.get("/update/status"))
     asyncio.run(proxy.post("/update/check", {"wait": False}))
+    asyncio.run(proxy.delete("/setup/complete"))
 
+    assert len(client.calls) == 3
     for _kind, call in client.calls:
         assert call["connect_timeout"] > 0
         assert call["request_timeout"] > 0
@@ -1057,3 +1059,21 @@ def test_a_successful_response_is_returned_and_not_raised():
     assert asyncio.run(AuxAutoProxy.get(_StubProxySelf(ok), "/update/status")) == {
         "state": "idle"
     }
+
+
+def test_delete_goes_to_the_aux_api_with_the_token_and_raises_on_refusal():
+    """muon_setup's reset clears OS-7's marker with DELETE /setup/complete."""
+    client = FakeHttpClient(FakeResponse({"complete": False}))
+    proxy, _server, _client = make_proxy(client)
+    proxy._token = "t0k"
+
+    assert asyncio.run(proxy.delete("/setup/complete")) == {"complete": False}
+    call = client.last
+    assert call["method"] == "DELETE"
+    assert call["url"] == "http://127.0.0.1:6789/setup/complete"
+    assert call["headers"]["X-Aux-Api-Key"] == "t0k"
+
+    proxy, _server, _client = make_proxy(FakeHttpClient(UnreachableResponse()))
+    from moonraker.utils import ServerError
+    with pytest.raises(ServerError):
+        asyncio.run(proxy.delete("/setup/complete"))
