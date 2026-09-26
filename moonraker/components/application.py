@@ -701,8 +701,11 @@ class DynamicRequestHandler(AuthorizedRequestHandler):
         self._log_debug(f"HTTP Request::{req}", args)
         try:
             ip = parse_ip_address(self.request.remote_ip or "")
+            # MUON, KAN-203: pass the headers on, so a component can apply
+            # its own CSRF and DNS-rebinding checks (WebRequest.get_http_headers)
             result = await self.api_defintion.request(
-                args, req_type, transport, ip, self.current_user
+                args, req_type, transport, ip, self.current_user,
+                self.request.headers
             )
         except ServerError as e:
             if self.server.is_verbose_enabled():

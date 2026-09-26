@@ -104,11 +104,11 @@ enable_custom_config_write_access: True
 # out of reach (GATE-2(g)).
 trust_onlink_ipv6: true
 #
-# THE `unless configured` HALF IS NOT BUILT. An owner who wants a sign-in has no
-# way to ask for one, and creating a Moonraker user does not produce one either:
-# a trusted client bypasses login entirely, so the account would be ignored. That
-# switch is `SEC-8` Level 1 (KAN-25), and until it exists this file is the whole
-# policy.
+# The `unless configured` half is `SEC-8` Level 1, in [muon_protection] below.
+# It is not a Moonraker user and never will be: a trusted client bypasses login
+# entirely, so an account would be ignored, and a second user would 401 the
+# panel (MuonOS #87). Level 1 instead refuses /server/aux and /machine/update to
+# any caller this list is the only credential for.
 #
 # NOTE on force_logins: authorization.py:883 only honours it when
 # len(self.users) > 1, and _API_KEY_USER_ always occupies one slot, so on a
@@ -186,6 +186,21 @@ timeout: 120
 
 [aux_api_proxy]
 
+# KAN-203: the first-run setup state machine. The panel and the phone's /setup
+# page both render it. Spec: specs/m1-first-run-setup in Muon-3D/OrcaSlicer.
+[muon_setup]
+# Languages offered on the first screen, in BCP 47, in the order shown.
+languages: en, de, fr, es, it
+# Seconds the hotspot stays up after `finish` when an uplink has an address.
+hotspot_off_delay: 900
+# Seconds before the panel treats a phone's driver claim as lapsed.
+driver_lease: 30
+# Seconds allowed for a Wi-Fi join, from submit to an address.
+join_timeout: 45
+# Ready-to-print manifest shipped in the image (OS-8). The built-in default is
+# used while the file is missing or invalid.
+ready_manifest: /usr/share/muon/setup/ready.json
+
 # GATE-2 / ADR 0002 option E. muon-link forwards a paired client's requests
 # with X-Real-IP 192.0.2.1, which trusted_clients deliberately does not list,
 # so without a token Moonraker refuses them all. This component mints a
@@ -199,6 +214,13 @@ socket_path: /home/printer_admin/comms/muon-gateway.sock
 # stands. It can never confirm one; that happens at the panel.
 [muon_link]
 admin_address: 127.0.0.1:7131
+
+# SEC-8. The protection level the owner sets at the panel: Level 0 (Open, the
+# shipped default) or Level 1 (Protected, where /server/aux and /machine/update
+# need an identity -- the panel, or a paired client through muon_gateway). Only
+# a panel caller can change it (POST /server/muon/protection). Without this
+# section the level cannot be raised at all, and the printer is Open for good.
+[muon_protection]
 
 # KAN-162: start the bed ramp when a job is queued instead of at the top
 # of PRINT_START.  This turns on the 170W bed heater with no human input,

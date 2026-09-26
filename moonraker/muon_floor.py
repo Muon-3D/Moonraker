@@ -46,15 +46,16 @@
 #
 # What this check therefore means is "the request originated on this device",
 # and that is the claim to rely on.  It is NOT the same as "a person is
-# standing at the printer", and the difference is not hypothetical: muon-link
-# terminates a remote session onto 127.0.0.1:80, so the gateway is a second
-# loopback consumer and a remote operator reaching the machine through it
-# arrives here indistinguishable from the panel.  ``SEC-3`` records exactly
-# this, and ``GATE-2`` is the work that is supposed to close it.  Until GATE-2
-# exists, do not put anything on this floor whose justification is physical
-# presence -- that is the mistake KAN-371 corrected for the developer-mode
-# toggle.  The entries that remain are justified by "no other check holds
-# them" (BMS-21), which an on-device origin does answer.
+# standing at the printer".  The gateway is a second on-device caller: muon-link
+# forwards a remote session to 127.0.0.1:7125.  ``GATE-2`` is what keeps it
+# apart from the panel, and it is built: muon-link stamps every forwarded
+# request ``X-Real-IP: 192.0.2.1`` (GATE-2(b)), and ``utils/real_ip.py`` refuses
+# an ambiguous header before authentication (GATE-2(c), Moonraker#17), so a
+# gateway caller arrives here with the sentinel, not loopback.  Even so, do not
+# put anything on this floor whose justification is physical presence: any
+# process on the device is loopback too.  That is the mistake KAN-371 corrected
+# for the developer-mode toggle.  The entries that remain are justified by "no
+# other check holds them" (BMS-21), which an on-device origin does answer.
 #
 # The floor is deliberately not configurable.  SEC-2 says these surfaces are
 # denied "in every mode, with no setting that opens them", so there is no
@@ -81,11 +82,11 @@ FLOOR_PREFIXES = (
     # arrived from 127.0.0.1", which is a different statement, and the distance
     # between the two is what made this the wrong place for the gate:
     #
-    #   * Loopback is not presence. muon-link terminates a *remote* session
-    #     onto 127.0.0.1:80, so an operator on the other side of the world
-    #     already presents as loopback here. `SEC-3` names `GATE-2` as what is
-    #     meant to keep "loopback means the panel" true, and `GATE-2` is not
-    #     built. The floor was not delivering presence to begin with.
+    #   * Loopback is not presence. When this entry was removed, `GATE-2` was
+    #     not built and a remote muon-link session presented as loopback here.
+    #     `GATE-2` has since kept the gateway off loopback (see the header), but
+    #     any process on the device is still loopback, so the floor was never
+    #     delivering presence and still does not.
     #   * It denied far more than the irreversible half. Reading the state,
     #     reading the waiver, opening a consent challenge, restoring defaults,
     #     taking a backup and *leaving* developer mode are all under this
@@ -146,6 +147,37 @@ FLOOR_PREFIXES = (
     # environment variable staying unset is not one to leave alone on the route
     # that powers the pack down.
     "/server/aux/bms/ship",
+    # KAN-203, 07 S11. Throws away the owner's setup answers and puts the
+    # printer back on its first-run screen. It is for development and support
+    # at the machine, and no network caller has a use for it. Not justified by
+    # presence, per the rule above: any on-device caller may reset. muon_setup
+    # refuses non-panel callers as well, so this is the second of two locks. It
+    # is the one that also covers the websocket and MQTT paths.
+    "/server/muon/setup/reset",
+    # KAN-413 / KAN-411 / KAN-412 (first-run setup spec OS-7, OS-5 and OS-6).
+    # Aux routes that only this process's own ``muon_setup`` component should
+    # drive. It reaches them through ``aux_api_proxy``'s in-process helpers,
+    # which call the Aux API directly and never pass this check, so the floor
+    # costs it nothing. What they change is not a network caller's to change:
+    #
+    #   * ``setup`` -- the whole prefix. ``/setup/complete`` marks first-run
+    #     setup finished, or clears it, which decides whether the printer runs
+    #     setup again and whether its hotspot is held up (rule H1). The prefix
+    #     also covers the older ``/setup`` marker on draft MuonOS#174. Reads
+    #     are covered too; nothing off the device needs them, because
+    #     ``muon_setup``'s own state carries the fact.
+    #   * ``wifi/ap/auto_off`` schedules the hotspot to go off (rule H3). The
+    #     owner's own hotspot controls, ``/wifi/ap/up`` and ``/down``, stay
+    #     open, as Level 0 intends.
+    #   * ``time`` sets the clock and the time zone (07 S9). ``muon_setup``
+    #     decides who may (the phone page on the hotspot, 02 §3); a LAN or
+    #     remote caller reaching Aux directly would skip that decision.
+    #
+    # The same reason as the battery entries -- nothing else holds them -- and
+    # not physical presence, which this check cannot give (see above).
+    "/server/aux/setup",
+    "/server/aux/wifi/ap/auto_off",
+    "/server/aux/time",
 )
 
 #: The battery routes deliberately NOT floored. Telemetry discloses pack state,
@@ -236,5 +268,170 @@ def check_floor(
     raise ServerError(
         f"'{endpoint}' is not available over the network. This surface is "
         "reachable only from the printer's own panel, in every mode.",
+        403,
+    )
+
+
+# ---------------------------------------------------------------------------
+# SEC-8: the protection levels.
+#
+# The floor above is what no setting opens. This is what the owner may close.
+# ``SEC-1`` makes Level 0 (Open) the shipped default: anyone who can reach the
+# printer on the LAN or the hotspot may drive it, and KAN-350 made that true by
+# opening ``trusted_clients``. Level 1 (Protected) takes back exactly the
+# surfaces SEC-2 no longer floors -- ``/server/aux/*`` and ``/machine/update/*``
+# -- from any caller that has no identity.
+#
+# What counts as an identity, and why it is not an address
+# --------------------------------------------------------
+# ``SEC-8`` puts this check at ``GATE-2``'s enforcement point on purpose. The
+# gateway is a second caller on loopback, so "loopback means the panel" is only
+# true because muon-link stamps every forwarded request ``X-Real-IP: 192.0.2.1``
+# (GATE-2(b)) and ``utils/real_ip.py`` refuses an ambiguous header before
+# authentication (GATE-2(c), Moonraker#17). Given both, three callers have an
+# identity and one does not:
+#
+#   * the panel, and anything else on the device: a loopback address that is
+#     not the sentinel. The panel vhost listens on 127.0.0.1:100 only.
+#   * a component-to-component call (``InternalTransport``) -- ota_deploy
+#     driving an install through aux_api_proxy, for instance.
+#   * a paired client through the gateway: the sentinel address AND a user that
+#     ``muon_gateway`` authenticated. muon-link mints that token only for a
+#     client its GATE-3 policy has already admitted, so the user is the NET-11
+#     identity SEC-8 names. Neither half is enough alone: the address without
+#     the token is any request muon-link forwards, and the token is bound to
+#     the sentinel by ``_check_oneshot_token``, so it cannot arrive from
+#     anywhere else.
+#   * NOT a LAN or hotspot browser. ``trusted_clients`` authenticates it as
+#     ``_TRUSTED_USER_`` purely because of where it is, which is exactly what
+#     Level 1 exists to stop counting.
+#
+# No Moonraker user is created, at either level. ``authenticate_request`` puts
+# the ``force_logins`` gate before ``_check_trusted_connection``, so a second
+# row in ``self.users`` would 401 the panel on everything with no way back
+# (MuonOS #87). The level lives in ``components/muon_protection.py``.
+# ---------------------------------------------------------------------------
+
+#: Level 0. The shipped default (SEC-1): the LAN and the hotspot drive the
+#: printer with no sign-in.
+LEVEL_OPEN = 0
+#: Level 1. The surfaces below need an identity.
+LEVEL_PROTECTED = 1
+LEVEL_NAMES = {LEVEL_OPEN: "open", LEVEL_PROTECTED: "protected"}
+
+#: What Level 1 takes back: the two surfaces SEC-2 no longer floors. Matched on
+#: the registered endpoint, like FLOOR_PREFIXES, so the JSON-RPC methods derived
+#: from these endpoints are covered by the same entry.
+PROTECTED_PREFIXES = (
+    "/server/aux",
+    "/machine/update",
+)
+
+#: Under a protected prefix, and governed by something else. SEC-8 excludes the
+#: developer-mode toggle by name: its gate is ``dev_mode_consent`` in the Aux
+#: API, which asks the hardware rather than the address (KAN-371), and leaving
+#: developer mode is ungated on purpose so that recovery never depends on who
+#: is asking. The whole prefix goes with it, for the reason the floor gives for
+#: removing it: reading the waiver, restoring defaults and taking a backup are
+#: all under it, and none of them is authority.
+PROTECTED_EXCLUSIONS = ("/server/aux/dev_mode",)
+
+#: The address muon-link stamps on every request it forwards (GATE-2(b)).
+#: ``components/muon_gateway.py`` binds its tokens to the same value; a test
+#: asserts the two agree.
+GATEWAY_SENTINEL = ipaddress.ip_address("192.0.2.1")
+#: ``UserInfo.source`` for a user ``muon_gateway`` authenticated.
+GATEWAY_USER_SOURCE = "muon_gateway"
+
+# Open here, so a Moonraker with no [muon_protection] section keeps upstream
+# behaviour. The component raises this to Protected as soon as it loads, and
+# holds it there until it has read the stored level: a configured printer that
+# cannot say which level it is at is Protected, not Open.
+_protection_level = LEVEL_OPEN
+
+
+def is_known_level(value: Any) -> bool:
+    """Is this exactly one of the levels?
+
+    `type() is int`, not isinstance or `in`: True and 1.0 both compare equal to
+    1, and a level that prints as "True" is one nobody set on purpose.
+    """
+    return type(value) is int and value in LEVEL_NAMES
+
+
+def set_protection_level(level: int) -> None:
+    """Set the level this process enforces. Only muon_protection calls this."""
+    global _protection_level
+    if not is_known_level(level):
+        raise ValueError(f"unknown protection level {level!r}")
+    _protection_level = level
+
+
+def protection_level() -> int:
+    return _protection_level
+
+
+def _matches(endpoint: str, prefixes: Any) -> bool:
+    for prefix in prefixes:
+        if endpoint == prefix or endpoint.startswith(prefix + "/"):
+            return True
+    return False
+
+
+def is_protected_endpoint(endpoint: str) -> bool:
+    """Is this one of the surfaces Level 1 takes back?"""
+    if _matches(endpoint, PROTECTED_EXCLUSIONS):
+        return False
+    return _matches(endpoint, PROTECTED_PREFIXES)
+
+
+def _is_gateway_address(ip_addr: Optional[Any]) -> bool:
+    if ip_addr is None:
+        return False
+    try:
+        return ipaddress.ip_address(str(ip_addr)) == GATEWAY_SENTINEL
+    except ValueError:
+        return False
+
+
+def has_identity(
+    transport: Optional[Any] = None,
+    ip_addr: Optional[Any] = None,
+    user: Optional[Any] = None,
+) -> bool:
+    """Does this caller carry an identity SEC-8 Level 1 accepts?
+
+    See the block comment above for the three that do. Fail-closed: an absent
+    address, an absent user, or a user from any other source is no identity.
+    """
+    if _is_internal(transport):
+        return True
+    if local_address(ip_addr):
+        return True
+    return (
+        _is_gateway_address(ip_addr)
+        and user is not None
+        and getattr(user, "source", None) == GATEWAY_USER_SOURCE
+    )
+
+
+def check_protection(
+    endpoint: str,
+    transport: Optional[Any] = None,
+    ip_addr: Optional[Any] = None,
+    user: Optional[Any] = None,
+) -> None:
+    """Raise 403 when Level 1 is set and a caller without an identity touches a
+    protected surface. At Level 0 this never refuses anything."""
+    if _protection_level == LEVEL_OPEN:
+        return
+    if not is_protected_endpoint(endpoint):
+        return
+    if has_identity(transport, ip_addr, user):
+        return
+    raise ServerError(
+        f"'{endpoint}' is protected on this printer. The owner turned on "
+        "network protection, which can only be turned off at the printer's "
+        "panel. A paired device can still reach it.",
         403,
     )
