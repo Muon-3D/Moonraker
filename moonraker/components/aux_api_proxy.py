@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import contextlib
+import unicodedata
 from pathlib import Path
 from typing import Dict, Any, Callable, Optional
 from urllib.parse import unquote, urlencode
@@ -439,9 +440,15 @@ class AuxAutoProxy:
         # return exactly the JSON you fetched from FastAPI
         return self._spec
 
-    # ---------- read-only developer-mode state (DEV-4) ------------------
+    # ---------- the printer's name (ID-2/ID-3/ID-4) ---------------------
     async def _identity_handler(self, webreq):
+        return await self.get_identity()
+
+    async def get_identity(self) -> Dict[str, Any]:
         """ID-2/ID-3/ID-4: what this printer is called, and what it is.
+
+        Public so muon_setup reads the same answer as GET
+        /server/muon/identity (KAN-203, spec 02 §5.7).
 
         `name` is what a person should be shown: the owner's rename if there
         is one, otherwise the name derived from the hardware serial. `source`
@@ -530,10 +537,33 @@ class AuxAutoProxy:
         name = args.get("name")
         if name is None:
             raise self.server.error("A 'name' argument is required", 400)
+        return await self.set_friendly_name(name)
+
+    async def set_friendly_name(self, name: Any) -> Dict[str, Any]:
+        """Store the owner's rename, or clear it with an empty name, and
+        return the identity. Public so muon_setup's name step applies the
+        same rules as POST /server/muon/identity/name (spec 02 §5.7)."""
+        # Settings' rename answers with the identity, so ask Aux first: a
+        # 503 after the write would report a failure for a rename that
+        # happened. muon_setup's name step uses store_friendly_name(), which
+        # works with Aux down (02 §5.7).
+        await self._get_or_unavailable("/identity")
+        await self.store_friendly_name(name)
+        return await self.get_identity()
+
+    async def store_friendly_name(self, name: Any) -> str:
+        """The rename alone, with no Aux call: it lives in Moonraker's
+        database, so it can be saved while Aux is down. Returns the name as
+        stored, stripped; "" means the override was cleared."""
         if not isinstance(name, str):
             raise self.server.error("'name' must be a string", 400)
 
         name = name.strip()
+        # 02 §5.7: no control characters (C0, C1, newlines), and the length
+        # is counted in code points, which is what len() of a str counts.
+        if any(unicodedata.category(ch) == "Cc" for ch in name):
+            raise self.server.error(
+                "A printer name may not contain control characters", 400)
         if len(name) > MAX_NAME_LENGTH:
             raise self.server.error(
                 f"A printer name may be at most {MAX_NAME_LENGTH} characters",
@@ -551,8 +581,7 @@ class AuxAutoProxy:
                 await self.database.delete_item(
                     MUON_NAMESPACE, FRIENDLY_NAME_KEY
                 )
-
-        return await self._identity_handler(webreq)
+        return name
 
     async def _dev_mode_status_handler(self, webreq):
         state = await self._get_or_unavailable("/dev_mode")

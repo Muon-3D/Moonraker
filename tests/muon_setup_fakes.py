@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import ipaddress
+import unicodedata
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from moonraker.common import RequestType, TransportType, UserInfo, WebRequest
@@ -83,6 +84,10 @@ class FakeAux:
         self.routes: Dict[Tuple[str, str], Route] = dict(routes or {})
         self.calls: List[Tuple[str, str, Any]] = []
         self.down = False
+        #: What get_identity() derives from; None is Aux not answering (503).
+        self.identity: Optional[Dict[str, Any]] = None
+        #: The `muon` namespace's friendly_name, as aux_api_proxy keeps it.
+        self.friendly_name: Optional[str] = None
 
     async def _call(self, method: str, path: str, body: Any) -> Any:
         await asyncio.sleep(0)
@@ -109,6 +114,34 @@ class FakeAux:
 
     def posted(self, path: str) -> List[Any]:
         return [body for m, p, body in self.calls if m == "POST" and p == path]
+
+    # aux_api_proxy's identity methods (MR-2), with its rules.
+    async def get_identity(self) -> Dict[str, Any]:
+        await asyncio.sleep(0)
+        if self.down or self.identity is None:
+            raise ServerError("The Aux API is not answering yet", 503)
+        ident = dict(self.identity)
+        if self.friendly_name:
+            ident.update(name=self.friendly_name, source="owner",
+                         display=f"{self.friendly_name.title()} · "
+                                 f"{ident.get('suffix', '').upper()}")
+        return ident
+
+    async def store_friendly_name(self, name: Any) -> str:
+        await asyncio.sleep(0)
+        if not isinstance(name, str):
+            raise ServerError("'name' must be a string", 400)
+        name = name.strip()
+        if any(unicodedata.category(ch) == "Cc" for ch in name):
+            raise ServerError("no control characters", 400)
+        if len(name) > 32:
+            raise ServerError("A printer name may be at most 32 characters", 400)
+        self.friendly_name = name or None
+        return name
+
+    async def set_friendly_name(self, name: Any) -> Dict[str, Any]:
+        await self.store_friendly_name(name)
+        return await self.get_identity()
 
 
 class FakeInternalTransport:
@@ -352,14 +385,13 @@ class Harness:
         self.db = FakeDatabase(ns)
         self.db.log = self.server.log
         self.aux = aux if aux is not None else fresh_aux()
+        if self.aux.identity is None and identity is not None:
+            self.aux.identity = copy.deepcopy(identity)
         self.server.components.update({
             "database": self.db,
             "aux_api_proxy": self.aux,
             "machine": FakeMachine(),
-            "internal_transport": FakeInternalTransport(
-                {"server.muon.identity": lambda: copy.deepcopy(identity)}
-                if identity is not None else {}
-            ),
+            "internal_transport": FakeInternalTransport(),
         })
         opts = {"ready_manifest": "/nonexistent/ready.json"}
         opts.update(options or {})

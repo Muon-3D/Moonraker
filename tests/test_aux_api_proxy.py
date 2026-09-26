@@ -458,6 +458,58 @@ def test_the_identity_says_whether_setup_is_done(state: str):
     assert asyncio.run(get(FakeWebRequest("GET")))["setup"] == state
 
 
+def test_the_public_identity_methods_are_what_the_endpoints_serve():
+    """MR-2 (spec 02 §5.7): muon_setup calls get_identity() and
+    set_friendly_name(), so they must be the endpoints' own answers."""
+    proxy, server, _client = make_proxy(
+        FakeHttpClient(FakeResponse(dict(AUX_IDENTITY))))
+    get = server.handler_for("/server/muon/identity")
+    rename = server.handler_for("/server/muon/identity/name")
+
+    assert asyncio.run(proxy.get_identity()) == asyncio.run(
+        get(FakeWebRequest("GET")))
+    renamed = asyncio.run(proxy.set_friendly_name("Oak"))
+    assert renamed == asyncio.run(get(FakeWebRequest("GET")))
+    assert renamed["name"] == "Oak"
+    assert asyncio.run(rename(FakeWebRequest("POST", {"name": "Elm"})))[
+        "name"] == "Elm"
+
+
+def test_a_settings_rename_asks_aux_first_and_stores_nothing_if_it_is_down():
+    """The endpoint answers with the identity, so a 503 after the write
+    would report a failure for a rename that happened (#23 review)."""
+    proxy, server, _client = make_proxy(FakeHttpClient(UnreachableResponse()))
+    rename = server.handler_for("/server/muon/identity/name")
+    with pytest.raises(FakeServerError) as excinfo:
+        asyncio.run(rename(FakeWebRequest("POST", {"name": "Oak"})))
+    assert excinfo.value.status_code == 503
+    assert server.components["database"].namespaces["muon"] == {}
+
+
+@pytest.mark.parametrize("bad", ["Oak\n", "O\x07ak", "O\x9bak"])
+def test_a_rename_with_control_characters_is_refused(bad: str):
+    """02 §5.7: C0 and C1 control characters, newlines included."""
+    proxy, server, _client = make_proxy(
+        FakeHttpClient(FakeResponse(dict(AUX_IDENTITY))))
+    with pytest.raises(FakeServerError) as excinfo:
+        asyncio.run(proxy.store_friendly_name(bad + "x"))
+    assert excinfo.value.status_code == 400
+
+
+def test_a_rename_can_be_stored_while_aux_is_down():
+    """store_friendly_name touches only Moonraker's database."""
+    client = FakeHttpClient(UnreachableResponse())
+    proxy, server, _client = make_proxy(client)
+
+    assert asyncio.run(proxy.store_friendly_name("  Oak ")) == "Oak"
+    assert client.calls == []
+    assert server.components["database"].namespaces["muon"] == {
+        "friendly_name": "Oak"}
+    with pytest.raises(FakeServerError) as excinfo:
+        asyncio.run(proxy.store_friendly_name("x" * 33))
+    assert excinfo.value.status_code == 400
+
+
 # --------------------------------------------------------------------------
 # Parameterised paths go through the generic proxy
 # --------------------------------------------------------------------------
