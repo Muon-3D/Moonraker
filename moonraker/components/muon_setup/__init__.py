@@ -36,7 +36,7 @@ from typing import (
 )
 from urllib.parse import urlencode
 
-from . import caller, clock, language, manifest, model, name, region, update
+from . import caller, clock, language, manifest, model, name, ready, region, update
 from .model import DONE, FINISH, HIDDEN, PENDING, SKIPPED
 from ...utils.exceptions import ServerError
 
@@ -261,7 +261,7 @@ class MuonSetup:
         reg("/server/muon/setup/network/cancel", ["POST"],
             self._handle_network_cancel)
         # The steps' own endpoints, one module each.
-        for step_module in (language, clock, name, update):
+        for step_module in (language, clock, name, update, ready):
             step_module.register(self)
 
     # ------------------------------------------------------------------
