@@ -147,6 +147,13 @@ FLOOR_PREFIXES = (
     # environment variable staying unset is not one to leave alone on the route
     # that powers the pack down.
     "/server/aux/bms/ship",
+    # KAN-203, 07 S11. Throws away the owner's setup answers and puts the
+    # printer back on its first-run screen. It is for development and support
+    # at the machine, and no network caller has a use for it. Not justified by
+    # presence, per the rule above: any on-device caller may reset. muon_setup
+    # refuses non-panel callers as well, so this is the second of two locks. It
+    # is the one that also covers the websocket and MQTT paths.
+    "/server/muon/setup/reset",
     # KAN-413 / KAN-411 / KAN-412 (first-run setup spec OS-7, OS-5 and OS-6).
     # Aux routes that only this process's own ``muon_setup`` component should
     # drive. It reaches them through ``aux_api_proxy``'s in-process helpers,

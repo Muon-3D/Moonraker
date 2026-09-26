@@ -61,9 +61,16 @@ class TestWhatIsOnTheFloor:
 
     Everything else is governed by SEC-8's levels, which is policy rather than
     floor.
+
+    The first-run setup entries follow the battery's reason, not presence.
+    ``/server/muon/setup/reset`` (KAN-203, 07 S11) is refused by muon_setup to
+    anything but the panel as well, so the floor is its second lock, the one
+    that holds on every transport. ``/server/aux/setup``, ``/wifi/ap/auto_off``
+    and ``/time`` (KAN-411/412/413) are driven only by muon_setup in-process,
+    and nothing else holds them.
     """
 
-    def test_the_floor_is_the_battery_commands_and_the_setup_writes(self):
+    def test_the_floor_is_the_battery_commands_and_the_setup_entries(self):
         """Pinned as an exact tuple, so adding or dropping one is a failure here
         rather than a discovery in the field."""
         assert FLOOR_PREFIXES == (
@@ -72,10 +79,32 @@ class TestWhatIsOnTheFloor:
             "/server/aux/bms/standby",
             "/server/aux/bms/fault",
             "/server/aux/bms/ship",
+            "/server/muon/setup/reset",
             "/server/aux/setup",
             "/server/aux/wifi/ap/auto_off",
             "/server/aux/time",
         )
+
+    def test_the_setup_reset_is_floored_and_nothing_else_of_setup_is(self):
+        """07 S11: reset is panel-only. Every other setup route is reachable
+        from the hotspot and the LAN, which is how the phone does setup, and
+        muon_setup applies its own per-caller rules to them."""
+        assert is_floor_endpoint("/server/muon/setup/reset")
+        for endpoint in (
+            "/server/muon/setup",
+            "/server/muon/setup/options",
+            "/server/muon/setup/driver",
+            "/server/muon/setup/goto",
+            "/server/muon/setup/skip",
+            "/server/muon/setup/finish",
+            "/server/muon/setup/card/dismiss",
+            "/server/muon/setup/network/cancel",
+        ):
+            assert not is_floor_endpoint(endpoint), endpoint
+        with pytest.raises(ServerError) as info:
+            check_floor("/server/muon/setup/reset", HTTP, LAN)
+        assert info.value.status_code == 403
+        check_floor("/server/muon/setup/reset", HTTP, LOOPBACK)
 
     @pytest.mark.parametrize(
         "endpoint",

@@ -34,7 +34,8 @@ from typing import (
     Awaitable,
     ClassVar,
     Tuple,
-    Generic
+    Generic,
+    Mapping
 )
 
 if TYPE_CHECKING:
@@ -233,7 +234,8 @@ class APIDefinition:
         request_type: RequestType,
         transport: Optional[APITransport] = None,
         ip_addr: Optional[IPAddress] = None,
-        user: Optional[UserInfo] = None
+        user: Optional[UserInfo] = None,
+        http_headers: Optional[Mapping[str, str]] = None
     ) -> Coroutine:
         # MUON, SEC-2: the one place every transport converges.  The HTTP
         # handler, JsonRPC.execute_method and InternalTransport.call_method all
@@ -245,7 +247,10 @@ class APIDefinition:
         # chose. After the floor, so a floor surface keeps the floor's reason.
         muon_floor.check_protection(self.endpoint, transport, ip_addr, user)
         return self.callback(
-            WebRequest(self.endpoint, args, request_type, transport, ip_addr, user)
+            WebRequest(
+                self.endpoint, args, request_type, transport, ip_addr, user,
+                http_headers
+            )
         )
 
     @property
@@ -547,7 +552,8 @@ class WebRequest:
         request_type: RequestType = RequestType(0),
         transport: Optional[APITransport] = None,
         ip_addr: Optional[IPAddress] = None,
-        user: Optional[UserInfo] = None
+        user: Optional[UserInfo] = None,
+        http_headers: Optional[Mapping[str, str]] = None
     ) -> None:
         self.endpoint = endpoint
         self.args = args
@@ -555,6 +561,7 @@ class WebRequest:
         self.request_type = request_type
         self.ip_addr: Optional[IPAddress] = ip_addr
         self.current_user = user
+        self.http_headers = http_headers
 
     def get_endpoint(self) -> str:
         return self.endpoint
@@ -581,6 +588,21 @@ class WebRequest:
 
     def get_current_user(self) -> Optional[UserInfo]:
         return self.current_user
+
+    # MUON, KAN-203: request headers, for a component that has to check them
+    # itself (muon_setup's CSRF and DNS-rebinding rules).  A plain HTTP request
+    # carries its own.  A JSON-RPC call reports the headers of the HTTP request
+    # it rode in on: the POST for /server/jsonrpc, the upgrade for a websocket.
+    # None when no HTTP request was involved at all, i.e. an internal call,
+    # MQTT or the unix socket.
+    def get_http_headers(self) -> Optional[Mapping[str, str]]:
+        if self.http_headers is not None:
+            return self.http_headers
+        request = getattr(self.transport, "request", None)
+        return getattr(request, "headers", None)
+
+    def is_plain_http(self) -> bool:
+        return self.http_headers is not None
 
     def _get_converted_arg(self,
                            key: str,

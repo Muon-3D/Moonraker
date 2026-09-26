@@ -186,6 +186,21 @@ timeout: 120
 
 [aux_api_proxy]
 
+# KAN-203: the first-run setup state machine. The panel and the phone's /setup
+# page both render it. Spec: specs/m1-first-run-setup in Muon-3D/OrcaSlicer.
+[muon_setup]
+# Languages offered on the first screen, in BCP 47, in the order shown.
+languages: en, de, fr, es, it
+# Seconds the hotspot stays up after `finish` when an uplink has an address.
+hotspot_off_delay: 900
+# Seconds before the panel treats a phone's driver claim as lapsed.
+driver_lease: 30
+# Seconds allowed for a Wi-Fi join, from submit to an address.
+join_timeout: 45
+# Ready-to-print manifest shipped in the image (OS-8). The built-in default is
+# used while the file is missing or invalid.
+ready_manifest: /usr/share/muon/setup/ready.json
+
 # GATE-2 / ADR 0002 option E. muon-link forwards a paired client's requests
 # with X-Real-IP 192.0.2.1, which trusted_clients deliberately does not list,
 # so without a token Moonraker refuses them all. This component mints a
