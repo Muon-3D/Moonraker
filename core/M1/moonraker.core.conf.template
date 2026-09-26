@@ -210,6 +210,11 @@ ready_manifest: /usr/share/muon/setup/ready.json
 [muon_gateway]
 socket_path: /home/printer_admin/comms/muon-gateway.sock
 
+# ADR 0018 route 3: a LAN client may start an account link and read how it
+# stands. It can never confirm one; that happens at the panel.
+[muon_link]
+admin_address: 127.0.0.1:7131
+
 # SEC-8. The protection level the owner sets at the panel: Level 0 (Open, the
 # shipped default) or Level 1 (Protected, where /server/aux and /machine/update
 # need an identity -- the panel, or a paired client through muon_gateway). Only
