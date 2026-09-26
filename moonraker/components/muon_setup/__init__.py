@@ -36,7 +36,7 @@ from typing import (
 )
 from urllib.parse import urlencode
 
-from . import caller, clock, language, manifest, model, name, region
+from . import caller, clock, language, manifest, model, name, region, update
 from .model import DONE, FINISH, HIDDEN, PENDING, SKIPPED
 from ...utils.exceptions import ServerError
 
@@ -246,6 +246,8 @@ class MuonSetup:
             "update": self._hide_update,
         }
         self.boot_op_handlers: Dict[str, Callable[[Dict[str, Any]], None]] = {}
+        #: Extra live refreshes a step module needs (MR-4: Aux's OTA status).
+        self.live_refreshers: List[Callable[[], Awaitable[None]]] = []
 
         reg = self.server.register_endpoint
         reg("/server/muon/setup", ["GET"], self._handle_get)
@@ -259,7 +261,7 @@ class MuonSetup:
         reg("/server/muon/setup/network/cancel", ["POST"],
             self._handle_network_cancel)
         # The steps' own endpoints, one module each.
-        for step_module in (language, clock, name):
+        for step_module in (language, clock, name, update):
             step_module.register(self)
 
     # ------------------------------------------------------------------
@@ -1204,6 +1206,8 @@ class MuonSetup:
             await self._refresh_printer()
             await self._refresh_region()
             await clock.refresh(self)
+            for refresher in self.live_refreshers:
+                await refresher()
             self._refresh_capabilities()
         return self._live != before
 
