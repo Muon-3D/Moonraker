@@ -147,6 +147,30 @@ FLOOR_PREFIXES = (
     # environment variable staying unset is not one to leave alone on the route
     # that powers the pack down.
     "/server/aux/bms/ship",
+    # KAN-413 / KAN-411 / KAN-412 (first-run setup spec OS-7, OS-5 and OS-6).
+    # Aux routes that only this process's own ``muon_setup`` component should
+    # drive. It reaches them through ``aux_api_proxy``'s in-process helpers,
+    # which call the Aux API directly and never pass this check, so the floor
+    # costs it nothing. What they change is not a network caller's to change:
+    #
+    #   * ``setup`` -- the whole prefix. ``/setup/complete`` marks first-run
+    #     setup finished, or clears it, which decides whether the printer runs
+    #     setup again and whether its hotspot is held up (rule H1). The prefix
+    #     also covers the older ``/setup`` marker on draft MuonOS#174. Reads
+    #     are covered too; nothing off the device needs them, because
+    #     ``muon_setup``'s own state carries the fact.
+    #   * ``wifi/ap/auto_off`` schedules the hotspot to go off (rule H3). The
+    #     owner's own hotspot controls, ``/wifi/ap/up`` and ``/down``, stay
+    #     open, as Level 0 intends.
+    #   * ``time`` sets the clock and the time zone (07 S9). ``muon_setup``
+    #     decides who may (the phone page on the hotspot, 02 §3); a LAN or
+    #     remote caller reaching Aux directly would skip that decision.
+    #
+    # The same reason as the battery entries -- nothing else holds them -- and
+    # not physical presence, which this check cannot give (see above).
+    "/server/aux/setup",
+    "/server/aux/wifi/ap/auto_off",
+    "/server/aux/time",
 )
 
 #: The battery routes deliberately NOT floored. Telemetry discloses pack state,
