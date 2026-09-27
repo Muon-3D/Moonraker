@@ -618,15 +618,7 @@ class MuonSetup:
         return {"ok": err is None, "error": err, "state": self.public_state()}
 
     def allowed_hosts(self) -> Set[str]:
-        addresses: List[str] = []
-        machine = self.server.lookup_component("machine", None)
-        if machine is not None:
-            network = machine.get_system_info().get("network", {})
-            for info in network.values():
-                for addr in info.get("ip_addresses", []):
-                    if isinstance(addr.get("address"), str):
-                        addresses.append(addr["address"])
-        return caller.allowed_hosts(socket.gethostname(), addresses)
+        return caller.printer_hosts(self.server)
 
     def begin(
         self, webreq: WebRequest, allowed: FrozenSet[str] = caller.WRITE
