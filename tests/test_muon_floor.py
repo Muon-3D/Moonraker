@@ -403,6 +403,7 @@ LAN_V6 = ipaddress.ip_address("fd12:3456:789a::10")
 
 WIFI = "/server/aux/wifi/connect"
 UPGRADE = "/machine/update/upgrade"
+LINK_START = "/server/muon/link/start"
 check_protection = muon_floor.check_protection
 
 
@@ -434,10 +435,17 @@ def _level_is_reset_after_every_test():
 
 
 class TestWhatLevelOneTakesBack:
-    def test_the_protected_surfaces_are_the_two_sec_2_released(self):
-        """SEC-8 names them: `/server/aux/*` and `/machine/update/*`. Pinned as
-        exact tuples, because the list is the decision."""
-        assert muon_floor.PROTECTED_PREFIXES == ("/server/aux", "/machine/update")
+    def test_the_protected_surfaces_are_sec_2s_two_and_starting_a_link(self):
+        """SEC-8 names the two SEC-2 released, `/server/aux/*` and
+        `/machine/update/*`. The first-run setup spec (MR-6) adds starting an
+        account link: that is authority, and a LAN or hotspot browser at Level 1
+        must not have it. Pinned as exact tuples, because the list is the
+        decision."""
+        assert muon_floor.PROTECTED_PREFIXES == (
+            "/server/aux",
+            "/machine/update",
+            "/server/muon/link/start",
+        )
         assert muon_floor.PROTECTED_EXCLUSIONS == ("/server/aux/dev_mode",)
 
     @pytest.mark.parametrize(
@@ -544,6 +552,11 @@ class TestLevelZeroIsOpen:
         check_protection(WIFI, HTTP, addr, TRUSTED_USER)
         check_protection(UPGRADE, HTTP, addr, TRUSTED_USER)
 
+    @pytest.mark.parametrize("addr", [LAN, HOTSPOT, LAN_V6])
+    def test_a_lan_or_hotspot_browser_can_start_a_link(self, addr):
+        """ADR 0018 route 3: Fluidd on the printer's network starts the link."""
+        check_protection(LINK_START, HTTP, addr, TRUSTED_USER)
+
 
 class TestLevelOneIsProtected:
     @pytest.mark.parametrize("addr", [LAN, HOTSPOT, LAN_V6])
@@ -578,6 +591,34 @@ class TestLevelOneIsProtected:
         with pytest.raises(ServerError) as excinfo:
             check_protection(WIFI, HTTP, LAN, TRUSTED_USER)
         assert "panel" in str(excinfo.value)
+
+    @pytest.mark.parametrize("addr", [LAN, HOTSPOT, LAN_V6])
+    def test_a_lan_or_hotspot_browser_cannot_start_a_link(self, protected, addr):
+        with pytest.raises(ServerError) as excinfo:
+            check_protection(LINK_START, HTTP, addr, TRUSTED_USER)
+        assert excinfo.value.status_code == 403
+        assert "protected" in str(excinfo.value)
+
+    @pytest.mark.parametrize(
+        "transport,addr,user",
+        [
+            pytest.param(HTTP, LOOPBACK, TRUSTED_USER, id="panel"),
+            pytest.param(INTERNAL, None, None, id="internal"),
+        ],
+    )
+    def test_the_panel_and_a_component_can_start_a_link(
+        self, protected, transport, addr, user
+    ):
+        """The panel starts one at the printer; muon_setup starts one
+        in-process."""
+        check_protection(LINK_START, transport, addr, user)
+
+    @pytest.mark.parametrize("addr", [LAN, HOTSPOT])
+    def test_reading_and_cancelling_a_link_stay_open(self, protected, addr):
+        """Only `start` is authority. Reading where the ceremony stands and
+        stopping the wait are not."""
+        for endpoint in ("/server/muon/link", "/server/muon/link/cancel"):
+            check_protection(endpoint, HTTP, addr, TRUSTED_USER)
 
     def test_the_floor_is_unchanged_by_the_level(self, protected):
         """Level 1 adds to the floor and removes nothing from it: a paired

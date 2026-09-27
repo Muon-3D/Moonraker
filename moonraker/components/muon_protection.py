@@ -9,8 +9,9 @@
 #
 # Level 0 (Open) is the shipped default (SEC-1): a browser on the LAN or the
 # hotspot drives the printer with no sign-in. Level 1 (Protected) takes back
-# `/server/aux/*` and `/machine/update/*` from any caller without an identity.
-# The panel and a paired client through the gateway keep them. Enforcement is
+# `/server/aux/*`, `/machine/update/*` and `/server/muon/link/start` from any
+# caller without an identity (`muon_floor.PROTECTED_PREFIXES`). The panel and a
+# paired client through the gateway keep them. Enforcement is
 # `muon_floor.check_protection`, at the same point as the floor; this component
 # only stores the level and changes it.
 #
