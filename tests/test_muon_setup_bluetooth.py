@@ -568,3 +568,128 @@ class TestNearby:
             assert h.setup._nearby is None
             assert changes_since(h, mark) == []
         run(go())
+
+
+# ==========================================================================
+# Write hygiene over Bluetooth
+# ==========================================================================
+
+#: What muon-link-client's HTTP encoder always writes, and the gateway
+#: forwards unchanged (crates/muon-link-client/src/http.rs).
+CLIENT_HEADERS = {"Host": "printer", "Content-Type": "application/json"}
+HOST_REFUSAL = "muon_setup: Host is not this printer"
+
+
+class TestHygiene:
+    def test_a_bluetooth_write_with_the_clients_host_succeeds(self):
+        async def go():
+            h = await Harness(stored=in_setup()).start()
+            result = await h.post("/skip", {"rev": 5, "step": "network"},
+                                  kind="bluetooth", headers=CLIENT_HEADERS)
+            assert result["ok"] is True
+            assert h.doc["steps"]["network"]["status"] == "skipped"
+            claim = await h.post("/driver", {"rev": 6, "kind": "app",
+                                             "client_id": "b1"},
+                                 kind="bluetooth", headers=CLIENT_HEADERS)
+            assert claim["state"]["driver"]["kind"] == "bluetooth"
+        run(go())
+
+    def test_a_bluetooth_write_over_the_websocket_with_that_host_succeeds(self):
+        async def go():
+            h = await Harness(stored=in_setup()).start()
+            result = await h.post("/skip", {"rev": 5, "step": "network"},
+                                  kind="bluetooth", headers=CLIENT_HEADERS,
+                                  websocket=True)
+            assert result["ok"] is True
+        run(go())
+
+    @pytest.mark.parametrize("kind", ["hotspot", "lan", "panel"])
+    def test_the_same_host_from_any_other_caller_is_still_refused(
+        self, kind: str
+    ):
+        async def go():
+            h = await Harness(stored=in_setup()).start()
+            with pytest.raises(ServerError) as info:
+                await h.post("/skip", {"rev": 5, "step": "network"},
+                             kind=kind, headers=CLIENT_HEADERS)
+            assert info.value.status_code == 403
+            assert str(info.value) == HOST_REFUSAL
+            assert h.doc["steps"]["network"]["status"] == "pending"
+            assert h.doc["rev"] == 5
+        run(go())
+
+    def test_the_bluetooth_address_without_the_token_gets_no_exemption(self):
+        """Not `bluetooth`, so `other`: refused as a caller before the Host
+        rule is reached, and nothing changes."""
+        async def go():
+            h = await Harness(stored=in_setup()).start()
+            web = WebRequest("/server/muon/setup/skip",
+                             {"rev": 5, "step": "network"}, RequestType.POST,
+                             None, BLUETOOTH_IP, None, dict(CLIENT_HEADERS))
+            with pytest.raises(ServerError) as info:
+                await h.server.endpoints["/server/muon/setup/skip"][1](web)
+            refused_as(info, "other")
+            assert h.doc["rev"] == 5
+        run(go())
+
+    def test_the_host_rule_itself_is_unchanged_for_other_callers(self):
+        """check_hygiene without the exemption: `printer` is refused with the
+        existing message, as before KAN-436."""
+        web = request("hotspot", "/server/muon/setup/skip", {"rev": 5},
+                      headers=CLIENT_HEADERS)
+        with pytest.raises(ServerError) as info:
+            caller.check_hygiene(web, {"10.42.0.1"})
+        assert str(info.value) == HOST_REFUSAL
+
+    @pytest.mark.parametrize("state", ["in_setup", "complete"])
+    def test_a_remote_caller_is_unchanged(self, state: str):
+        """`remote` may not write, so it is refused as a caller, with or
+        without the client's Host, before and after setup."""
+        async def go():
+            stored = in_setup() if state == "in_setup" else complete()
+            h = await Harness(stored=stored).start()
+            for headers in (CLIENT_HEADERS, GOOD_HEADERS):
+                with pytest.raises(ServerError) as info:
+                    await h.post("/skip", {"rev": stored["rev"],
+                                           "step": "network"},
+                                 kind="remote", headers=headers)
+                refused_as(info, "remote")
+            assert h.doc["rev"] == stored["rev"]
+        run(go())
+
+    def test_bluetooth_still_needs_a_json_content_type(self):
+        async def go():
+            h = await Harness(stored=in_setup()).start()
+            with pytest.raises(ServerError) as info:
+                await h.post("/skip", {"rev": 5, "step": "network"},
+                             kind="bluetooth",
+                             headers={"Host": "printer",
+                                      "Content-Type": "text/plain"})
+            assert info.value.status_code == 415
+            assert str(info.value) == \
+                "muon_setup: writes need Content-Type: application/json"
+            assert h.doc["steps"]["network"]["status"] == "pending"
+        run(go())
+
+    def test_bluetooth_still_has_a_foreign_origin_refused(self):
+        """Only the Host rule is lifted. The client sends no Origin; one that
+        is sent must still name the printer."""
+        async def go():
+            h = await Harness(stored=in_setup()).start()
+            with pytest.raises(ServerError) as info:
+                await h.post("/skip", {"rev": 5, "step": "network"},
+                             kind="bluetooth",
+                             headers=dict(CLIENT_HEADERS,
+                                          Origin="http://evil.example"))
+            assert info.value.status_code == 403
+            assert str(info.value) == "muon_setup: Origin is not this printer"
+        run(go())
+
+    def test_after_setup_the_exemption_opens_nothing(self):
+        async def go():
+            h = await Harness(stored=complete()).start()
+            with pytest.raises(ServerError) as info:
+                await h.post("/card/dismiss", {"rev": 7}, kind="bluetooth",
+                             headers=CLIENT_HEADERS)
+            refused_as(info)
+        run(go())

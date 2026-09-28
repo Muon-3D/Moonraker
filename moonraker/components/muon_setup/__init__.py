@@ -668,7 +668,10 @@ class MuonSetup:
     ) -> str:
         """Classify, authorise and hygiene-check a write. Returns the kind."""
         kind = self.authorise(webreq, allowed)
-        caller.check_hygiene(webreq, self.allowed_hosts())
+        # KAN-436: a `bluetooth` caller cannot choose its Host (see
+        # caller.check_hygiene); every other class keeps the Host rule.
+        caller.check_hygiene(webreq, self.allowed_hosts(),
+                             host_exempt=kind == caller.BLUETOOTH)
         return kind
 
     async def wait_resolved(self, timeout: Optional[float] = None) -> bool:

@@ -261,6 +261,7 @@ def check_hygiene(
     hosts: Set[str],
     component: str = "muon_setup",
     extra_origins: AbstractSet[str] = frozenset(),
+    host_exempt: bool = False,
 ) -> None:
     """Raise 415/403 for a write that fails 02 §3's rules.
 
@@ -270,6 +271,15 @@ def check_hygiene(
     muon_link applies the same rules to its writes. `extra_origins` are whole
     Origin values accepted besides the printer's own names, compared exactly;
     muon_setup passes none.
+
+    `host_exempt` skips the Host allow-list and nothing else. muon_setup sets
+    it for a `bluetooth` caller only (KAN-436): muon-link-client's HTTP
+    encoder always writes `Host: printer` and refuses a caller-supplied Host
+    (crates/muon-link-client/src/http.rs, RESERVED), and the gateway forwards
+    it unchanged, so the app cannot name the printer there. The Host rule is
+    against DNS rebinding from a browser, and a `bluetooth` request carries
+    muon_gateway's one-shot token bound to 192.0.2.2, which no browser page
+    can hold. Content-Type, and Origin when one is sent, are still checked.
     """
     headers: Optional[Mapping[str, str]] = webreq.get_http_headers()
     if headers is None:
@@ -285,9 +295,10 @@ def check_hygiene(
             raise ServerError(
                 f"{component}: writes need Content-Type: application/json", 415
             )
-    host = bare_host(headers.get("Host"))
-    if host is None or host not in hosts:
-        raise ServerError(f"{component}: Host is not this printer", 403)
+    if not host_exempt:
+        host = bare_host(headers.get("Host"))
+        if host is None or host not in hosts:
+            raise ServerError(f"{component}: Host is not this printer", 403)
     if is_websocket:
         return
     origin = headers.get("Origin")
