@@ -265,7 +265,11 @@ class TestWhatAClientIsTold:
         assert status["name"] == "protected"
         assert status["caller_has_identity"] is False
         assert status["changeable_by_caller"] is False
-        assert status["protected_surfaces"] == ["/server/aux", "/machine/update"]
+        assert status["protected_surfaces"] == [
+            "/server/aux",
+            "/machine/update",
+            "/server/muon/link/start",
+        ]
 
     def test_the_panel_is_told_it_can_change_it(self):
         component, _server = _component()

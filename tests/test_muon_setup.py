@@ -738,6 +738,10 @@ class TestWriteHygiene:
         ("http://evil.example", False),
         ("http://nas.local", False),
         ("null", False),
+        # muon_link lets Muon3D's consoles start a link; setup writes stay
+        # the printer's own.
+        ("https://app.muon3d.com", False),
+        ("https://control.muon3d.com", False),
     ])
     def test_an_origin_must_name_the_printer_when_present(
         self, origin: str, ok: bool

@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import ipaddress
 import re
-from typing import TYPE_CHECKING, Any, Iterable, Mapping, Optional, Set
+import socket
+from typing import (
+    TYPE_CHECKING, AbstractSet, Any, Iterable, List, Mapping, Optional, Set
+)
 from urllib.parse import urlsplit
 
 from ... import muon_floor
@@ -160,12 +163,34 @@ def allowed_hosts(hostname: Optional[str], addresses: Iterable[str]) -> Set[str]
     return hosts
 
 
-def check_hygiene(webreq: WebRequest, hosts: Set[str]) -> None:
-    """Raise 415/403 for a setup write that fails 02 §3's rules.
+def printer_hosts(server: Any) -> Set[str]:
+    """allowed_hosts() for this printer: its hostname, and every address the
+    machine component reports for its network interfaces."""
+    addresses: List[str] = []
+    machine = server.lookup_component("machine", None)
+    if machine is not None:
+        network = machine.get_system_info().get("network", {})
+        for info in network.values():
+            for addr in info.get("ip_addresses", []):
+                if isinstance(addr.get("address"), str):
+                    addresses.append(addr["address"])
+    return allowed_hosts(socket.gethostname(), addresses)
+
+
+def check_hygiene(
+    webreq: WebRequest,
+    hosts: Set[str],
+    component: str = "muon_setup",
+    extra_origins: AbstractSet[str] = frozenset(),
+) -> None:
+    """Raise 415/403 for a write that fails 02 §3's rules.
 
     Only a request that arrived over HTTP (plain, or JSON-RPC over HTTP) or a
     websocket has headers to check. An internal call has none and is not a
-    browser.
+    browser. `component` names the refusing component in the error, since
+    muon_link applies the same rules to its writes. `extra_origins` are whole
+    Origin values accepted besides the printer's own names, compared exactly;
+    muon_setup passes none.
     """
     headers: Optional[Mapping[str, str]] = webreq.get_http_headers()
     if headers is None:
@@ -179,13 +204,15 @@ def check_hygiene(webreq: WebRequest, hosts: Set[str]) -> None:
         ctype = (headers.get("Content-Type") or "").strip().lower()
         if not ctype.startswith("application/json"):
             raise ServerError(
-                "muon_setup: writes need Content-Type: application/json", 415
+                f"{component}: writes need Content-Type: application/json", 415
             )
     host = bare_host(headers.get("Host"))
     if host is None or host not in hosts:
-        raise ServerError("muon_setup: Host is not this printer", 403)
+        raise ServerError(f"{component}: Host is not this printer", 403)
     if is_websocket:
         return
     origin = headers.get("Origin")
-    if origin is not None and origin_host(origin) not in hosts:
-        raise ServerError("muon_setup: Origin is not this printer", 403)
+    if origin is None or origin in extra_origins:
+        return
+    if origin_host(origin) not in hosts:
+        raise ServerError(f"{component}: Origin is not this printer", 403)

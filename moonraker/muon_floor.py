@@ -278,9 +278,10 @@ def check_floor(
 # The floor above is what no setting opens. This is what the owner may close.
 # ``SEC-1`` makes Level 0 (Open) the shipped default: anyone who can reach the
 # printer on the LAN or the hotspot may drive it, and KAN-350 made that true by
-# opening ``trusted_clients``. Level 1 (Protected) takes back exactly the
-# surfaces SEC-2 no longer floors -- ``/server/aux/*`` and ``/machine/update/*``
-# -- from any caller that has no identity.
+# opening ``trusted_clients``. Level 1 (Protected) takes back the surfaces
+# SEC-2 no longer floors -- ``/server/aux/*`` and ``/machine/update/*`` -- and
+# starting an account link (``/server/muon/link/start``, MR-6 of the first-run
+# setup spec), from any caller that has no identity.
 #
 # What counts as an identity, and why it is not an address
 # --------------------------------------------------------
@@ -319,12 +320,16 @@ LEVEL_OPEN = 0
 LEVEL_PROTECTED = 1
 LEVEL_NAMES = {LEVEL_OPEN: "open", LEVEL_PROTECTED: "protected"}
 
-#: What Level 1 takes back: the two surfaces SEC-2 no longer floors. Matched on
-#: the registered endpoint, like FLOOR_PREFIXES, so the JSON-RPC methods derived
-#: from these endpoints are covered by the same entry.
+#: What Level 1 takes back: the two surfaces SEC-2 no longer floors, and
+#: starting an account link. Starting one is authority (the setup spec's MR-6),
+#: so a LAN or hotspot browser at Level 1 may not; reading the link and
+#: cancelling the wait stay open. Matched on the registered endpoint, like
+#: FLOOR_PREFIXES, so the JSON-RPC methods derived from these endpoints are
+#: covered by the same entry.
 PROTECTED_PREFIXES = (
     "/server/aux",
     "/machine/update",
+    "/server/muon/link/start",
 )
 
 #: Under a protected prefix, and governed by something else. SEC-8 excludes the
