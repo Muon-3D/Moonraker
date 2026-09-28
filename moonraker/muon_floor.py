@@ -302,7 +302,13 @@ def check_floor(
 #     identity SEC-8 names. Neither half is enough alone: the address without
 #     the token is any request muon-link forwards, and the token is bound to
 #     the sentinel by ``_check_oneshot_token``, so it cannot arrive from
-#     anywhere else.
+#     anywhere else. A Bluetooth connection arrives with ``192.0.2.2``
+#     instead (KAN-436) and is treated the same way. Before setup is complete
+#     muon-link admits an unknown phone over Bluetooth (ADR 0032 D4 rule 2),
+#     so if the level is Protected while setup is not complete, that phone has
+#     an identity here. ADR 0032 asks for exactly this ("remote at all
+#     times"); it is recorded so that nobody reads the token as proof of
+#     pairing in that window.
 #   * NOT a LAN or hotspot browser. ``trusted_clients`` authenticates it as
 #     ``_TRUSTED_USER_`` purely because of where it is, which is exactly what
 #     Level 1 exists to stop counting.
@@ -345,6 +351,17 @@ PROTECTED_EXCLUSIONS = ("/server/aux/dev_mode",)
 #: ``components/muon_gateway.py`` binds its tokens to the same value; a test
 #: asserts the two agree.
 GATEWAY_SENTINEL = ipaddress.ip_address("192.0.2.1")
+#: KAN-436, ADR 0032 D4 rule 3: what muon-link stamps instead when the
+#: connection started on its Bluetooth transport. Also TEST-NET-1, and also
+#: outside ``trusted_clients``. This module treats it exactly as it treats
+#: ``GATEWAY_SENTINEL``, at all times (ADR 0032 D7 "Caller class"): a network
+#: caller the floor refuses, and an identity at Level 1 only together with a
+#: ``muon_gateway`` user. The wider rights a Bluetooth phone gets during setup
+#: are ``muon_setup``'s alone, and stay inside ``/server/muon/setup``.
+BLUETOOTH_SENTINEL = ipaddress.ip_address("192.0.2.2")
+#: Both of muon-link's addresses. ``components/muon_gateway.py`` binds a token
+#: to one of them; a test asserts the two modules agree.
+GATEWAY_ADDRESSES = frozenset({GATEWAY_SENTINEL, BLUETOOTH_SENTINEL})
 #: ``UserInfo.source`` for a user ``muon_gateway`` authenticated.
 GATEWAY_USER_SOURCE = "muon_gateway"
 
@@ -394,7 +411,7 @@ def _is_gateway_address(ip_addr: Optional[Any]) -> bool:
     if ip_addr is None:
         return False
     try:
-        return ipaddress.ip_address(str(ip_addr)) == GATEWAY_SENTINEL
+        return ipaddress.ip_address(str(ip_addr)) in GATEWAY_ADDRESSES
     except ValueError:
         return False
 

@@ -87,7 +87,14 @@ _LANGUAGE_RE = re.compile(r"^[a-z]{2,3}(-[A-Z][a-z]{3})?(-[A-Z]{2})?$")
 _CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 #: 02 §5.11. `app` is the Muon3D phone app (KAN-399), on the hotspot or LAN.
-DRIVER_KINDS = ("panel", "phone", "web", "app")
+#: `bluetooth` is a phone on muon-link's Bluetooth transport (KAN-436, ADR 0032
+#: D4): a Bluetooth caller's claim is stored as `bluetooth` whatever non-panel
+#: kind it names, and no other caller may claim it.
+DRIVER_KINDS = ("panel", "phone", "web", "app", "bluetooth")
+
+#: ADR 0032 D7 "State": `nearby` is cleared this long after the last
+#: Bluetooth request that carried a well-formed code.
+NEARBY_TTL = 20.0
 
 #: A migration signal that cannot say yet (01 §7), as distinct from "no".
 UNSURE = "unsure"
@@ -237,6 +244,11 @@ class MuonSetup:
         self._stations_route = True
         self._clock_from_phone = False
         self._closed = False
+        #: KAN-436: the code from the latest Bluetooth request that carried
+        #: one, and when it came (`nearby_clock`, injectable for tests).
+        self._nearby: Optional[Dict[str, Any]] = None
+        self._nearby_timer: Optional[asyncio.TimerHandle] = None
+        self.nearby_clock: Callable[[], float] = time.monotonic
 
         #: Hooks for the step packages. `hide_when_current[step](doc)` decides
         #: whether a step is hidden at the moment it becomes current (01 §2);
@@ -478,6 +490,8 @@ class MuonSetup:
         self._closed = True
         if self._lapse_timer is not None:
             self._lapse_timer.cancel()
+        if self._nearby_timer is not None:
+            self._nearby_timer.cancel()
         tasks = list(self._tasks)
         if self._op_task is not None:
             tasks.append(self._op_task)
@@ -556,6 +570,8 @@ class MuonSetup:
             doc["cursor"] = FINISH
         public = copy.deepcopy(doc)
         public["driver"] = model.driver_public(doc.get("driver"), self.driver_lease)
+        public["nearby"] = (
+            None if public["state"] == "complete" else self._nearby_public())
         live = self._live
         if live["printer"] is not None:
             public["printer"] = copy.deepcopy(live["printer"])
@@ -573,9 +589,9 @@ class MuonSetup:
         public["region"] = copy.deepcopy(live["region"])
         public["capabilities"] = dict(live["capabilities"])
         # Key order as in 02 §6, for anyone reading a dump.
-        order = ("version", "rev", "state", "cursor", "driver", "op", "printer",
-                 "hotspot", "clock", "region", "capabilities", "card_dismissed",
-                 "steps")
+        order = ("version", "rev", "state", "cursor", "driver", "nearby", "op",
+                 "printer", "hotspot", "clock", "region", "capabilities",
+                 "card_dismissed", "steps")
         return {k: public[k] for k in order if k in public}
 
     def _notify(self) -> None:
@@ -620,13 +636,42 @@ class MuonSetup:
     def allowed_hosts(self) -> Set[str]:
         return caller.printer_hosts(self.server)
 
+    def is_complete(self) -> bool:
+        """Whether setup counts as complete for a caller's rights. True until
+        the migration check has decided, and for a read-only newer state, so
+        a `bluetooth` caller gets the narrower rights while nobody knows."""
+        return (
+            self.doc is None or self.read_only_version is not None
+            or self.doc["state"] == "complete"
+        )
+
+    def classify(self, webreq: WebRequest) -> str:
+        """The caller's kind (02 §3). A `bluetooth` caller's code also
+        refreshes `nearby` here, so every muon_setup request counts: the
+        state read, the options, the driver claim and every write, over
+        HTTP or the websocket."""
+        kind = caller.caller_kind(webreq)
+        if kind == caller.BLUETOOTH:
+            code = caller.ble_code(webreq)
+            if code is not None:
+                self._note_nearby(code)
+        return kind
+
+    def authorise(self, webreq: WebRequest, allowed: FrozenSet[str]) -> str:
+        """Classify and authorise a read or a write. Returns the kind."""
+        kind = self.classify(webreq)
+        caller.require(kind, allowed, self.is_complete())
+        return kind
+
     def begin(
         self, webreq: WebRequest, allowed: FrozenSet[str] = caller.WRITE
     ) -> str:
         """Classify, authorise and hygiene-check a write. Returns the kind."""
-        kind = caller.caller_kind(webreq)
-        caller.require(kind, allowed)
-        caller.check_hygiene(webreq, self.allowed_hosts())
+        kind = self.authorise(webreq, allowed)
+        # KAN-436: a `bluetooth` caller cannot choose its Host (see
+        # caller.check_hygiene); every other class keeps the Host rule.
+        caller.check_hygiene(webreq, self.allowed_hosts(),
+                             host_exempt=kind == caller.BLUETOOTH)
         return kind
 
     async def wait_resolved(self, timeout: Optional[float] = None) -> bool:
@@ -676,6 +721,9 @@ class MuonSetup:
         started_op: Optional[Tuple[str, OpRunner]] = None
         async with self._lock:
             doc = self.doc
+            # A `bluetooth` caller's rights depend on `state`, which may have
+            # become `complete` while this write waited for the lock.
+            caller.require(kind, allowed, self.is_complete())
             if doc["state"] == "complete" and not after_complete:
                 return self.envelope(model.error(
                     "invalid_step", "setup is complete"))
@@ -832,12 +880,12 @@ class MuonSetup:
     # ------------------------------------------------------------------
 
     async def _handle_get(self, webreq: WebRequest) -> Dict[str, Any]:
-        caller.require(caller.caller_kind(webreq), caller.READ_STATE)
+        self.authorise(webreq, caller.READ_STATE)
         await self.wait_resolved(STARTUP_WAIT)
         return self.public_state()
 
     async def _handle_options(self, webreq: WebRequest) -> Dict[str, Any]:
-        caller.require(caller.caller_kind(webreq), caller.READ)
+        self.authorise(webreq, caller.READ)
         options: Dict[str, Any] = {
             "languages": [
                 {"code": code, "endonym": ENDONYMS.get(code, code)}
@@ -871,10 +919,18 @@ class MuonSetup:
         surface = args.get("kind")
         client_id = args.get("client_id")
         if surface not in DRIVER_KINDS:
-            raise ServerError("muon_setup: 'kind' must be panel, phone or web", 400)
-        if (surface == "panel") != (kind in caller.PANEL_ONLY):
+            raise ServerError(
+                "muon_setup: 'kind' must be one of " + ", ".join(DRIVER_KINDS),
+                400)
+        if (surface == "panel") != (kind in caller.PANEL_ONLY) or (
+            surface == "bluetooth" and kind != caller.BLUETOOTH
+        ):
             raise ServerError(
                 f"muon_setup: a {kind} caller cannot drive as {surface}", 403)
+        if kind == caller.BLUETOOTH:
+            # ADR 0032 D4 rule 4: the transport decides, not the body. The
+            # panel says "a phone over Bluetooth" only for one that is.
+            surface = "bluetooth"
         if not (isinstance(client_id, str) and _CLIENT_ID_RE.match(client_id)):
             raise ServerError("muon_setup: 'client_id' is not a valid id", 400)
         if self.read_only_version is not None or not await self.wait_resolved(
@@ -883,6 +939,7 @@ class MuonSetup:
             return self.envelope(model.error(
                 "aux_unavailable", "setup state is not ready yet"))
         async with self._lock:
+            caller.require(kind, caller.WRITE, self.is_complete())
             doc = self.doc
             now = time.time()
             driver = doc.get("driver")
@@ -903,6 +960,55 @@ class MuonSetup:
                 self._notify()
             self._arm_lapse_timer()
         return self.envelope()
+
+    # ------------------------------------------------------------------
+    # `nearby`: a phone connecting over Bluetooth (ADR 0032 D7 "State")
+    # ------------------------------------------------------------------
+
+    def _nearby_public(self) -> Optional[Dict[str, Any]]:
+        record = self._nearby
+        if record is None or self.nearby_clock() - record["seen"] >= NEARBY_TTL:
+            return None
+        return {"code": record["code"]}
+
+    def _note_nearby(self, code: str) -> None:
+        """A `bluetooth` request carried `code`. Announce it if `nearby`
+        changes; a repeat of the same code only moves the 20 s on, and is
+        not announced (like a driver renewal)."""
+        if self.is_complete():
+            return
+        before = self._nearby_public()
+        self._nearby = {"code": code, "seen": self.nearby_clock()}
+        self._arm_nearby_timer(NEARBY_TTL)
+        if self._nearby_public() != before:
+            self._notify()
+
+    def _arm_nearby_timer(self, delay: float) -> None:
+        if self._nearby_timer is not None:
+            self._nearby_timer.cancel()
+        loop = asyncio.get_event_loop()
+        self._nearby_timer = loop.call_later(delay, self._on_nearby_timer)
+
+    def _on_nearby_timer(self) -> None:
+        """Clear `nearby` once NEARBY_TTL has passed since the last code, and
+        announce it: nothing else would tell the panel the phone has gone."""
+        self._nearby_timer = None
+        record = self._nearby
+        if record is None or self._closed:
+            return
+        remaining = record["seen"] + NEARBY_TTL - self.nearby_clock()
+        if remaining > 0:
+            self._arm_nearby_timer(remaining)
+            return
+        self._nearby = None
+        if not self.is_complete():
+            self._notify()
+
+    def _clear_nearby(self) -> None:
+        self._nearby = None
+        if self._nearby_timer is not None:
+            self._nearby_timer.cancel()
+            self._nearby_timer = None
 
     def _arm_lapse_timer(self) -> None:
         # Tell the panel when a phone's claim lapses, since renewals are not
@@ -1012,6 +1118,10 @@ class MuonSetup:
             pass
         if self.doc is None or self.doc["state"] != "complete":
             return
+        # ADR 0032 D7: `nearby` is null once setup is complete. The state
+        # already says so; this drops the code itself, so a reset does not
+        # bring back one from before it.
+        self._clear_nearby()
         self._internal["marker_by"] = "muon_setup"
         if await self._marker_once() == "retry":
             self._start_marker_sync()
