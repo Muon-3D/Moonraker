@@ -68,9 +68,15 @@ class TestWhatIsOnTheFloor:
     that holds on every transport. ``/server/aux/setup``, ``/wifi/ap/auto_off``
     and ``/time`` (KAN-411/412/413) are driven only by muon_setup in-process,
     and nothing else holds them.
+
+    ``/server/database/restore`` follows the same reason. A restore brings back
+    the protection level a backup held, and SEC-6 lets only the panel change
+    the level. SEC-8's own list cannot hold it, because a paired client has an
+    identity there, so the floor is the only place that refuses every network
+    caller.
     """
 
-    def test_the_floor_is_the_battery_commands_and_the_setup_entries(self):
+    def test_the_floor_is_the_battery_commands_setup_and_restore(self):
         """Pinned as an exact tuple, so adding or dropping one is a failure here
         rather than a discovery in the field."""
         assert FLOOR_PREFIXES == (
@@ -83,7 +89,30 @@ class TestWhatIsOnTheFloor:
             "/server/aux/setup",
             "/server/aux/wifi/ap/auto_off",
             "/server/aux/time",
+            "/server/database/restore",
         )
+
+    def test_a_database_restore_is_floored_and_backups_are_not(self):
+        """SEC-6 lets only the panel change the protection level, and a restore
+        brings back whatever level the backup held. So no network caller may
+        restore at any level: not the LAN, not the hotspot, and not a paired
+        client through the gateway, whose identity counts at Level 1 but not
+        here. Taking and listing backups changes nothing the printer runs."""
+        assert is_floor_endpoint("/server/database/restore")
+        for endpoint in (
+            "/server/database/backup",
+            "/server/database/list",
+            "/server/database/item",
+            "/server/database/compact",
+        ):
+            assert not is_floor_endpoint(endpoint), endpoint
+        for addr in (LAN, HOTSPOT, SENTINEL):
+            with pytest.raises(ServerError) as info:
+                check_floor("/server/database/restore", HTTP, addr)
+            assert info.value.status_code == 403
+            assert "only from the printer's own panel" in str(info.value)
+        check_floor("/server/database/restore", HTTP, LOOPBACK)
+        check_floor("/server/database/restore", INTERNAL, None)
 
     def test_the_setup_reset_is_floored_and_nothing_else_of_setup_is(self):
         """07 S11: reset is panel-only. Every other setup route is reachable

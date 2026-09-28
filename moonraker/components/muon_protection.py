@@ -31,10 +31,16 @@
 # WHERE IT IS STORED
 #
 # Moonraker's database, in a namespace registered `forbidden`, so no client can
-# read or write it through /server/database -- the only way to change the level
-# is the panel-only endpoint below. /home/printer_data/database survives an OS
-# update and does not survive a factory reset, which is the lifetime this needs:
-# a reset printer is back at the shipped default, Open.
+# read or write it through /server/database/item. `forbidden` does not cover
+# /server/database/restore, which replaces the whole database and would bring
+# back whatever level a backup held, so that route is in
+# muon_floor.FLOOR_PREFIXES: no network caller may restore at any level. With
+# that, the only way to change the level is the panel-only endpoint below, or
+# a restore made on the device itself.
+#
+# /home/printer_data/database survives an OS update and does not survive a
+# factory reset, which is the lifetime this needs: a reset printer is back at
+# the shipped default, Open.
 #
 # WHAT THIS DOES NOT DO
 #

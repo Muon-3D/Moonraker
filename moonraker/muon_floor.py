@@ -178,6 +178,17 @@ FLOOR_PREFIXES = (
     "/server/aux/setup",
     "/server/aux/wifi/ap/auto_off",
     "/server/aux/time",
+    # SEC-8 / SEC-6. A database restore replaces every namespace, the
+    # `forbidden` ones included, and restarts Moonraker on what it wrote. That
+    # makes it a way to set the protection level: a backup taken while the
+    # printer was Open turns Level 1 back to Open (and rolls first-run setup
+    # back with it), and a backup holding Protected raises the level from the
+    # LAN. SEC-6 lets only the panel change the level, in either direction, so
+    # no network caller may restore at any level -- the gateway included, which
+    # is why this is floor rather than a PROTECTED_PREFIXES entry. Taking,
+    # listing and deleting backups stay open: none of them changes what the
+    # printer runs. The same reason as the entries above: nothing else holds it.
+    "/server/database/restore",
 )
 
 #: The battery routes deliberately NOT floored. Telemetry discloses pack state,
@@ -279,9 +290,10 @@ def check_floor(
 # ``SEC-1`` makes Level 0 (Open) the shipped default: anyone who can reach the
 # printer on the LAN or the hotspot may drive it, and KAN-350 made that true by
 # opening ``trusted_clients``. Level 1 (Protected) takes back the surfaces
-# SEC-2 no longer floors -- ``/server/aux/*`` and ``/machine/update/*`` -- and
+# SEC-2 no longer floors -- ``/server/aux/*`` and ``/machine/update/*`` --
 # starting an account link (``/server/muon/link/start``, MR-6 of the first-run
-# setup spec), from any caller that has no identity.
+# setup spec) and renaming the printer, from any caller that has no identity.
+# PROTECTED_PREFIXES below is the list.
 #
 # What counts as an identity, and why it is not an address
 # --------------------------------------------------------

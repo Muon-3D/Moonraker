@@ -782,6 +782,27 @@ class TestProtectedAfterSetup:
         assert dismissed["ok"] is True
         assert dismissed["state"]["card_dismissed"] is True
 
+    def test_a_refused_cancel_leaves_the_running_join_alone(self):
+        """The table's cancel row runs with no operation, and cancel_op does
+        nothing then, so it cannot show that a refusal leaves a running join
+        alone. This one plants the join the panel started."""
+        async def go():
+            h = await Harness(stored=complete_state()).start()
+            op = {"kind": "join", "id": "op_test", "started": 0.0,
+                  "phase": "associate", "progress": None}
+            h.setup.doc["op"] = copy.deepcopy(op)
+            muon_floor.set_protection_level(muon_floor.LEVEL_PROTECTED)
+            with pytest.raises(ServerError) as info:
+                await h.post("/network/cancel", {}, kind="lan")
+            assert str(info.value) == "muon_setup: protected"
+            assert h.doc["op"] == op
+            # The panel's cancel does stop it, so the refusal above is not
+            # passing only because nothing could have been cancelled.
+            result = await h.post("/network/cancel", {}, kind="panel")
+            assert result["ok"] is True
+            assert h.doc["op"] is None
+        run(go())
+
     def test_reading_the_state_stays_open(self):
         async def go():
             h = await Harness(stored=complete_state()).start()
