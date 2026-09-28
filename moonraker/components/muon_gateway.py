@@ -39,6 +39,15 @@
 # already decided what the paired client may do before it asks for a token, and
 # the user this token carries is an ordinary network user: `muon_floor` still
 # classifies the sentinel as a network caller and still refuses the floor.
+#
+# BLUETOOTH (KAN-436, ADR 0032 D4)
+#
+# A connection that started on muon-link's Bluetooth transport is forwarded
+# with `X-Real-IP: 192.0.2.2` instead. muon-link asks for its token with
+# `"transport": "bluetooth"`, and the token is bound to 192.0.2.2, so it is
+# accepted only on a request that carries that address -- and a paired
+# session's token, bound to 192.0.2.1, is refused there. muon_setup reads the
+# pair (this component's user, 192.0.2.2) as the caller class `bluetooth`.
 
 from __future__ import annotations
 
@@ -52,7 +61,7 @@ import socket
 import stat
 import struct
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional, Set
+from typing import TYPE_CHECKING, Any, Optional, Set, Tuple, Union
 
 from ..common import UserInfo
 
@@ -61,14 +70,26 @@ if TYPE_CHECKING:
 
 #: The address muon-link stamps on every forwarded request (GATE-2(b)).
 SENTINEL = ipaddress.ip_address("192.0.2.1")
+#: KAN-436, ADR 0032 D4 rule 3: the address it stamps instead on a connection
+#: that started on its Bluetooth transport. muon_setup gives a request from
+#: this address with this component's user the caller class `bluetooth`, which
+#: has the hotspot's rights during setup, so a token is bound to it only when
+#: muon-link asks for one with `"transport": "bluetooth"`.
+BLUETOOTH_SENTINEL = ipaddress.ip_address("192.0.2.2")
+#: The `transport` values a token request may name, and the address each binds
+#: the token to. Absent means the paired-session sentinel, as before KAN-436.
+TRANSPORT_ADDRESSES = {"bluetooth": BLUETOOTH_SENTINEL}
 
-#: The longest request line accepted. `{"client":"<64 hex>"}` is 77 bytes.
+#: The longest request line accepted.
+#: `{"client":"<64 hex>","transport":"bluetooth"}` is 101 bytes.
 MAX_REQUEST = 256
 
 #: How long a connected peer may take to send its request.
 READ_TIMEOUT = 2.0
 
 _CLIENT_RE = re.compile(r"^[0-9a-f]{1,64}$")
+
+IPAddress = Union[ipaddress.IPv4Address, ipaddress.IPv6Address]
 
 
 def peer_uid(sock: socket.socket) -> int:
@@ -80,8 +101,16 @@ def peer_uid(sock: socket.socket) -> int:
     return uid
 
 
-def parse_request(line: bytes) -> str:
-    """The client fingerprint from one request line, or ValueError."""
+def parse_token_request(line: bytes) -> Tuple[str, IPAddress]:
+    """The client fingerprint and the address to bind its token to, from one
+    request line, or ValueError.
+
+    `{"client": "<hex>"}` binds to SENTINEL. `{"client": "<hex>",
+    "transport": "bluetooth"}` binds to BLUETOOTH_SENTINEL. Any other
+    `transport` is refused rather than defaulted: a request that names a
+    transport this component does not know must not get a token for one it
+    does.
+    """
     if len(line) > MAX_REQUEST:
         raise ValueError("request too long")
     request = json.loads(line.decode("utf-8"))
@@ -90,7 +119,17 @@ def parse_request(line: bytes) -> str:
     client = request.get("client")
     if not isinstance(client, str) or not _CLIENT_RE.match(client):
         raise ValueError("client must be lower-case hex")
-    return client
+    if "transport" not in request:
+        return client, SENTINEL
+    transport = request["transport"]
+    if not isinstance(transport, str) or transport not in TRANSPORT_ADDRESSES:
+        raise ValueError("unknown transport")
+    return client, TRANSPORT_ADDRESSES[transport]
+
+
+def parse_request(line: bytes) -> str:
+    """The client fingerprint from one request line, or ValueError."""
+    return parse_token_request(line)[0]
 
 
 class MuonGateway:
@@ -143,7 +182,7 @@ class MuonGateway:
                 reader.readline(), timeout=READ_TIMEOUT
             )
             try:
-                client = parse_request(line.rstrip(b"\n"))
+                client, address = parse_token_request(line.rstrip(b"\n"))
             except (ValueError, UnicodeDecodeError) as err:
                 self.refused += 1
                 logging.info("muon_gateway: malformed token request: %s", err)
@@ -155,7 +194,7 @@ class MuonGateway:
                 password="",
                 source="muon_gateway",
             )
-            token = auth.get_oneshot_token(SENTINEL, user)
+            token = auth.get_oneshot_token(address, user)
             self.minted += 1
             await self._reply(writer, {"token": token})
         except asyncio.TimeoutError:

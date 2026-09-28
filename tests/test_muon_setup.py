@@ -1261,9 +1261,9 @@ class TestLiveFields:
         async def go():
             return (await Harness().start()).setup.public_state()
         assert list(run(go())) == [
-            "version", "rev", "state", "cursor", "driver", "op", "printer",
-            "hotspot", "clock", "region", "capabilities", "card_dismissed",
-            "steps"]
+            "version", "rev", "state", "cursor", "driver", "nearby", "op",
+            "printer", "hotspot", "clock", "region", "capabilities",
+            "card_dismissed", "steps"]
 
 
 class TestOptions:
