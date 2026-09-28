@@ -46,12 +46,16 @@
 # (02 §3), with muon_setup's own checks (muon_setup/caller.py):
 #
 #   * over plain HTTP, `Content-Type: application/json`, or 415;
-#   * `Host`, and `Origin` when present, must name this printer, or 403;
+#   * `Host` must name this printer, or 403;
+#   * `Origin`, when present, must name this printer or be exactly one of
+#     Muon3D's own consoles (CONSOLE_ORIGINS), or 403;
 #   * a websocket call has its upgrade request's `Host` checked.
 #
 # Without them a web page a LAN browser visits could start a link and read the
 # code back through DNS rebinding, or decline the owner's pending offer with a
-# plain cross-site form. An in-process call has no headers and passes.
+# plain cross-site form. An in-process call has no headers and passes. The
+# console origins are this component's alone: muon_setup's writes accept only
+# the printer's own names.
 #
 # `start` is rate limited too: at most five a minute from one caller address,
 # and the sixth is a 429. In-process calls are not counted.
@@ -84,6 +88,17 @@ TIMEOUT = 3.0
 MAX_BODY = 16 * 1024
 #: The phases a refused `start` answers with instead of its 409.
 STANDING_PHASES = ("offer", "linked")
+#: Origins besides the printer's own that may start and cancel a link: Muon3D's
+#: first-party account console, which a browser on the LAN uses to fetch the
+#: printer directly. Starting grants nothing until the owner accepts the account
+#: at the panel (LINK-3). Matched exactly as a browser serialises an Origin:
+#: https, this host, the default port. Every other site is still refused, which
+#: is the DNS-rebinding and cross-site defence. muon_setup does not accept these.
+#: Jack's decision, 2026-09-28.
+CONSOLE_ORIGINS = frozenset({
+    "https://app.muon3d.com",
+    "https://control.muon3d.com",
+})
 #: At most START_LIMIT `start` calls per START_WINDOW seconds per caller address.
 START_LIMIT = 5
 START_WINDOW = 60.0
@@ -133,7 +148,8 @@ class MuonLink:
 
     def _check_write(self, web_request: WebRequest) -> None:
         caller.check_hygiene(
-            web_request, caller.printer_hosts(self.server), "muon_link")
+            web_request, caller.printer_hosts(self.server), "muon_link",
+            CONSOLE_ORIGINS)
 
     def _count_start(self, web_request: WebRequest) -> None:
         transport = web_request.get_subscribable()

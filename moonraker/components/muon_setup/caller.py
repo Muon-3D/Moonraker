@@ -11,7 +11,9 @@ from __future__ import annotations
 import ipaddress
 import re
 import socket
-from typing import TYPE_CHECKING, Any, Iterable, List, Mapping, Optional, Set
+from typing import (
+    TYPE_CHECKING, AbstractSet, Any, Iterable, List, Mapping, Optional, Set
+)
 from urllib.parse import urlsplit
 
 from ... import muon_floor
@@ -176,14 +178,19 @@ def printer_hosts(server: Any) -> Set[str]:
 
 
 def check_hygiene(
-    webreq: WebRequest, hosts: Set[str], component: str = "muon_setup"
+    webreq: WebRequest,
+    hosts: Set[str],
+    component: str = "muon_setup",
+    extra_origins: AbstractSet[str] = frozenset(),
 ) -> None:
     """Raise 415/403 for a write that fails 02 §3's rules.
 
     Only a request that arrived over HTTP (plain, or JSON-RPC over HTTP) or a
     websocket has headers to check. An internal call has none and is not a
     browser. `component` names the refusing component in the error, since
-    muon_link applies the same rules to its writes.
+    muon_link applies the same rules to its writes. `extra_origins` are whole
+    Origin values accepted besides the printer's own names, compared exactly;
+    muon_setup passes none.
     """
     headers: Optional[Mapping[str, str]] = webreq.get_http_headers()
     if headers is None:
@@ -205,5 +212,7 @@ def check_hygiene(
     if is_websocket:
         return
     origin = headers.get("Origin")
-    if origin is not None and origin_host(origin) not in hosts:
+    if origin is None or origin in extra_origins:
+        return
+    if origin_host(origin) not in hosts:
         raise ServerError(f"{component}: Origin is not this printer", 403)
