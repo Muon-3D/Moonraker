@@ -180,7 +180,7 @@ async def handle_clock(setup: MuonSetup, webreq: WebRequest) -> Dict[str, Any]:
     that knows the owner's local time.
     """
     from . import AuxMissing, AuxRefused, AuxUnavailable, STARTUP_WAIT
-    setup.begin(webreq, CLOCK_CALLERS)
+    kind = setup.begin(webreq, CLOCK_CALLERS)
     args = webreq.get_args()
     epoch_ms = args.get("epoch_ms")
     tz = args.get("tz")
@@ -189,6 +189,8 @@ async def handle_clock(setup: MuonSetup, webreq: WebRequest) -> Dict[str, Any]:
     if not await setup.wait_resolved(STARTUP_WAIT) or setup.doc is None:
         return setup.envelope(model.error(
             "aux_unavailable", "setup state is not ready yet"))
+    # Not through write(), so the Level 1 check is made here (02 §3).
+    caller.refuse_if_protected(kind, setup.doc["state"])
     if setup.doc["op"] is not None:
         return setup.envelope(model.error(
             "busy", f"{setup.doc['op']['kind']} is running",

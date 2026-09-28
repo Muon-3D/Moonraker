@@ -269,6 +269,7 @@ class TestWhatAClientIsTold:
             "/server/aux",
             "/machine/update",
             "/server/muon/link/start",
+            "/server/muon/identity/name",
         ]
 
     def test_the_panel_is_told_it_can_change_it(self):

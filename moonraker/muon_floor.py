@@ -320,16 +320,21 @@ LEVEL_OPEN = 0
 LEVEL_PROTECTED = 1
 LEVEL_NAMES = {LEVEL_OPEN: "open", LEVEL_PROTECTED: "protected"}
 
-#: What Level 1 takes back: the two surfaces SEC-2 no longer floors, and
-#: starting an account link. Starting one is authority (the setup spec's MR-6),
-#: so a LAN or hotspot browser at Level 1 may not; reading the link and
-#: cancelling the wait stay open. Matched on the registered endpoint, like
-#: FLOOR_PREFIXES, so the JSON-RPC methods derived from these endpoints are
-#: covered by the same entry.
+#: What Level 1 takes back: the two surfaces SEC-2 no longer floors, starting
+#: an account link, and renaming the printer. Starting a link is authority (the
+#: setup spec's MR-6), so a LAN or hotspot browser at Level 1 may not; reading
+#: the link and cancelling the wait stay open. The rename is here because
+#: muon_setup refuses its own `name` step at Level 1 (02 §3), and this route
+#: would otherwise go around it; reading the identity stays open. Matched on
+#: the registered endpoint, like FLOOR_PREFIXES, so the JSON-RPC methods derived
+#: from these endpoints are covered by the same entry. muon_setup's other writes
+#: are not listed: Level 1 takes them only once setup is complete, which a
+#: prefix cannot say, so muon_setup checks them itself.
 PROTECTED_PREFIXES = (
     "/server/aux",
     "/machine/update",
     "/server/muon/link/start",
+    "/server/muon/identity/name",
 )
 
 #: Under a protected prefix, and governed by something else. SEC-8 excludes the

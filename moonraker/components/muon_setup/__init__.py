@@ -654,14 +654,17 @@ class MuonSetup:
         needs_rev: bool = True,
         after_complete: bool = False,
         busy_exempt: bool = False,
+        protection_exempt: bool = False,
     ) -> Dict[str, Any]:
         """Run one state change under 02 §5's rules.
 
         The order of refusals: who you are (403), what you sent (415/403/400),
-        then the domain -- read-only, not yet resolved, complete, `busy`,
-        `stale_rev` -- and only then the step's own handler. A handler returns
-        None for success or a model.error() dict; on an error, any change it
-        made is thrown away.
+        then the domain -- read-only, not yet resolved, protected (403, SEC-8
+        Level 1 once setup is complete), complete, `busy`, `stale_rev` -- and
+        only then the step's own handler. A handler returns None for success
+        or a model.error() dict; on an error, any change it made is thrown
+        away. `protection_exempt` is for the one write here that Level 1
+        leaves open, dismissing the card.
         """
         kind = self.begin(webreq, allowed)
         args = webreq.get_args()
@@ -676,6 +679,8 @@ class MuonSetup:
         started_op: Optional[Tuple[str, OpRunner]] = None
         async with self._lock:
             doc = self.doc
+            if not protection_exempt:
+                caller.refuse_if_protected(kind, doc["state"])
             if doc["state"] == "complete" and not after_complete:
                 return self.envelope(model.error(
                     "invalid_step", "setup is complete"))
@@ -1111,15 +1116,21 @@ class MuonSetup:
         async def handler(ctx: WriteContext) -> Optional[Dict[str, Any]]:
             ctx.doc["card_dismissed"] = True
             return None
-        return await self.write(webreq, handler, after_complete=True)
+        # Level 1 leaves this open (02 §3): hiding the card changes nothing
+        # about the printer.
+        return await self.write(
+            webreq, handler, after_complete=True, protection_exempt=True)
 
     async def _handle_network_cancel(
         self, webreq: WebRequest
     ) -> Dict[str, Any]:
-        self.begin(webreq)
+        kind = self.begin(webreq)
         if not await self.wait_resolved(STARTUP_WAIT) or self.doc is None:
             return self.envelope(model.error(
                 "aux_unavailable", "setup state is not ready yet"))
+        # Not through write(), so the Level 1 check is made here: at Level 1
+        # the LAN may not stop a join the panel started.
+        caller.refuse_if_protected(kind, self.doc["state"])
         await self.cancel_op(("region_apply", "join"))
         return self.envelope()
 

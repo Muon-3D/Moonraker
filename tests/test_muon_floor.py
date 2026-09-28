@@ -435,16 +435,18 @@ def _level_is_reset_after_every_test():
 
 
 class TestWhatLevelOneTakesBack:
-    def test_the_protected_surfaces_are_sec_2s_two_and_starting_a_link(self):
+    def test_the_protected_surfaces_are_sec_2s_two_a_link_and_a_rename(self):
         """SEC-8 names the two SEC-2 released, `/server/aux/*` and
         `/machine/update/*`. The first-run setup spec (MR-6) adds starting an
         account link: that is authority, and a LAN or hotspot browser at Level 1
-        must not have it. Pinned as exact tuples, because the list is the
-        decision."""
+        must not have it. 02 §3 adds the rename, which would otherwise go around
+        muon_setup's own Level 1 refusal of its `name` step. Pinned as exact
+        tuples, because the list is the decision."""
         assert muon_floor.PROTECTED_PREFIXES == (
             "/server/aux",
             "/machine/update",
             "/server/muon/link/start",
+            "/server/muon/identity/name",
         )
         assert muon_floor.PROTECTED_EXCLUSIONS == ("/server/aux/dev_mode",)
 
@@ -460,9 +462,11 @@ class TestWhatLevelOneTakesBack:
             "/machine/update/status",
             "/machine/update/upgrade",
             "/machine/update/recover",
+            "/server/muon/link/start",
+            "/server/muon/identity/name",
         ],
     )
-    def test_every_route_under_the_two_prefixes_is_protected(self, endpoint):
+    def test_every_route_under_a_protected_prefix_is_protected(self, endpoint):
         """Including `/server/aux/proxy`, the generic escape hatch: a Level 1
         that covered the named routes and not the proxy would cover nothing."""
         assert muon_floor.is_protected_endpoint(endpoint)

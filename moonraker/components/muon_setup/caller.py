@@ -49,6 +49,11 @@ RESET = frozenset({PANEL})
 #: Which driver surface a write from each kind of caller claims (01 §3).
 SURFACE_FOR_KIND = {PANEL: "panel", HOTSPOT: "phone", LAN: "web"}
 
+#: SEC-8 Level 1 (02 §3): who loses setup writes once setup is complete. The
+#: panel and in-process calls keep them. A paired client arrives as `remote`,
+#: which may not write setup at all.
+PROTECTED_KINDS = frozenset({HOTSPOT, LAN})
+
 
 def caller_kind(webreq: WebRequest) -> str:
     transport = webreq.get_subscribable()
@@ -75,6 +80,24 @@ def caller_kind(webreq: WebRequest) -> str:
 def require(kind: str, allowed: Iterable[str]) -> None:
     if kind not in allowed:
         raise ServerError(f"muon_setup: not allowed from {kind}", 403)
+
+
+def refuse_if_protected(kind: str, state: str) -> None:
+    """403 `protected` (08) for a LAN or hotspot write to a set-up printer the
+    owner has protected (SEC-8 Level 1, 02 §3).
+
+    Only after `complete`: during setup the phone and the web page are how the
+    printer gets set up at all, and the owner can only protect it from the
+    panel. Read the level on every call, since the panel can change it at any
+    moment. The callers that keep a write -- claiming the driver and
+    dismissing the card -- do not call this.
+    """
+    if (
+        kind in PROTECTED_KINDS
+        and state == "complete"
+        and muon_floor.protection_level() == muon_floor.LEVEL_PROTECTED
+    ):
+        raise ServerError("muon_setup: protected", 403)
 
 
 def _same_address(ip: Any, other: Any) -> bool:
