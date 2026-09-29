@@ -178,6 +178,17 @@ FLOOR_PREFIXES = (
     "/server/aux/setup",
     "/server/aux/wifi/ap/auto_off",
     "/server/aux/time",
+    # SEC-8 / SEC-6. A database restore replaces every namespace, the
+    # `forbidden` ones included, and restarts Moonraker on what it wrote. That
+    # makes it a way to set the protection level: a backup taken while the
+    # printer was Open turns Level 1 back to Open (and rolls first-run setup
+    # back with it), and a backup holding Protected raises the level from the
+    # LAN. SEC-6 lets only the panel change the level, in either direction, so
+    # no network caller may restore at any level -- the gateway included, which
+    # is why this is floor rather than a PROTECTED_PREFIXES entry. Taking,
+    # listing and deleting backups stay open: none of them changes what the
+    # printer runs. The same reason as the entries above: nothing else holds it.
+    "/server/database/restore",
 )
 
 #: The battery routes deliberately NOT floored. Telemetry discloses pack state,
@@ -279,9 +290,10 @@ def check_floor(
 # ``SEC-1`` makes Level 0 (Open) the shipped default: anyone who can reach the
 # printer on the LAN or the hotspot may drive it, and KAN-350 made that true by
 # opening ``trusted_clients``. Level 1 (Protected) takes back the surfaces
-# SEC-2 no longer floors -- ``/server/aux/*`` and ``/machine/update/*`` -- and
+# SEC-2 no longer floors -- ``/server/aux/*`` and ``/machine/update/*`` --
 # starting an account link (``/server/muon/link/start``, MR-6 of the first-run
-# setup spec), from any caller that has no identity.
+# setup spec) and renaming the printer, from any caller that has no identity.
+# PROTECTED_PREFIXES below is the list.
 #
 # What counts as an identity, and why it is not an address
 # --------------------------------------------------------
@@ -320,16 +332,21 @@ LEVEL_OPEN = 0
 LEVEL_PROTECTED = 1
 LEVEL_NAMES = {LEVEL_OPEN: "open", LEVEL_PROTECTED: "protected"}
 
-#: What Level 1 takes back: the two surfaces SEC-2 no longer floors, and
-#: starting an account link. Starting one is authority (the setup spec's MR-6),
-#: so a LAN or hotspot browser at Level 1 may not; reading the link and
-#: cancelling the wait stay open. Matched on the registered endpoint, like
-#: FLOOR_PREFIXES, so the JSON-RPC methods derived from these endpoints are
-#: covered by the same entry.
+#: What Level 1 takes back: the two surfaces SEC-2 no longer floors, starting
+#: an account link, and renaming the printer. Starting a link is authority (the
+#: setup spec's MR-6), so a LAN or hotspot browser at Level 1 may not; reading
+#: the link and cancelling the wait stay open. The rename is here because
+#: muon_setup refuses its own `name` step at Level 1 (02 §3), and this route
+#: would otherwise go around it; reading the identity stays open. Matched on
+#: the registered endpoint, like FLOOR_PREFIXES, so the JSON-RPC methods derived
+#: from these endpoints are covered by the same entry. muon_setup's other writes
+#: are not listed: Level 1 takes them only once setup is complete, which a
+#: prefix cannot say, so muon_setup checks them itself.
 PROTECTED_PREFIXES = (
     "/server/aux",
     "/machine/update",
     "/server/muon/link/start",
+    "/server/muon/identity/name",
 )
 
 #: Under a protected prefix, and governed by something else. SEC-8 excludes the

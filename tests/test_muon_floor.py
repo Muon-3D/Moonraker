@@ -68,9 +68,15 @@ class TestWhatIsOnTheFloor:
     that holds on every transport. ``/server/aux/setup``, ``/wifi/ap/auto_off``
     and ``/time`` (KAN-411/412/413) are driven only by muon_setup in-process,
     and nothing else holds them.
+
+    ``/server/database/restore`` follows the same reason. A restore brings back
+    the protection level a backup held, and SEC-6 lets only the panel change
+    the level. SEC-8's own list cannot hold it, because a paired client has an
+    identity there, so the floor is the only place that refuses every network
+    caller.
     """
 
-    def test_the_floor_is_the_battery_commands_and_the_setup_entries(self):
+    def test_the_floor_is_the_battery_commands_setup_and_restore(self):
         """Pinned as an exact tuple, so adding or dropping one is a failure here
         rather than a discovery in the field."""
         assert FLOOR_PREFIXES == (
@@ -83,7 +89,30 @@ class TestWhatIsOnTheFloor:
             "/server/aux/setup",
             "/server/aux/wifi/ap/auto_off",
             "/server/aux/time",
+            "/server/database/restore",
         )
+
+    def test_a_database_restore_is_floored_and_backups_are_not(self):
+        """SEC-6 lets only the panel change the protection level, and a restore
+        brings back whatever level the backup held. So no network caller may
+        restore at any level: not the LAN, not the hotspot, and not a paired
+        client through the gateway, whose identity counts at Level 1 but not
+        here. Taking and listing backups changes nothing the printer runs."""
+        assert is_floor_endpoint("/server/database/restore")
+        for endpoint in (
+            "/server/database/backup",
+            "/server/database/list",
+            "/server/database/item",
+            "/server/database/compact",
+        ):
+            assert not is_floor_endpoint(endpoint), endpoint
+        for addr in (LAN, HOTSPOT, SENTINEL):
+            with pytest.raises(ServerError) as info:
+                check_floor("/server/database/restore", HTTP, addr)
+            assert info.value.status_code == 403
+            assert "only from the printer's own panel" in str(info.value)
+        check_floor("/server/database/restore", HTTP, LOOPBACK)
+        check_floor("/server/database/restore", INTERNAL, None)
 
     def test_the_setup_reset_is_floored_and_nothing_else_of_setup_is(self):
         """07 S11: reset is panel-only. Every other setup route is reachable
@@ -435,16 +464,18 @@ def _level_is_reset_after_every_test():
 
 
 class TestWhatLevelOneTakesBack:
-    def test_the_protected_surfaces_are_sec_2s_two_and_starting_a_link(self):
+    def test_the_protected_surfaces_are_sec_2s_two_a_link_and_a_rename(self):
         """SEC-8 names the two SEC-2 released, `/server/aux/*` and
         `/machine/update/*`. The first-run setup spec (MR-6) adds starting an
         account link: that is authority, and a LAN or hotspot browser at Level 1
-        must not have it. Pinned as exact tuples, because the list is the
-        decision."""
+        must not have it. 02 §3 adds the rename, which would otherwise go around
+        muon_setup's own Level 1 refusal of its `name` step. Pinned as exact
+        tuples, because the list is the decision."""
         assert muon_floor.PROTECTED_PREFIXES == (
             "/server/aux",
             "/machine/update",
             "/server/muon/link/start",
+            "/server/muon/identity/name",
         )
         assert muon_floor.PROTECTED_EXCLUSIONS == ("/server/aux/dev_mode",)
 
@@ -460,9 +491,11 @@ class TestWhatLevelOneTakesBack:
             "/machine/update/status",
             "/machine/update/upgrade",
             "/machine/update/recover",
+            "/server/muon/link/start",
+            "/server/muon/identity/name",
         ],
     )
-    def test_every_route_under_the_two_prefixes_is_protected(self, endpoint):
+    def test_every_route_under_a_protected_prefix_is_protected(self, endpoint):
         """Including `/server/aux/proxy`, the generic escape hatch: a Level 1
         that covered the named routes and not the proxy would cover nothing."""
         assert muon_floor.is_protected_endpoint(endpoint)

@@ -19,6 +19,7 @@ from typing import Any, Dict, List
 
 import pytest
 
+from moonraker import muon_floor
 from moonraker.common import RequestType, TransportType, WebRequest
 from moonraker.components import muon_setup as pkg
 from moonraker.components.muon_setup import caller, manifest, model, region
@@ -674,6 +675,154 @@ class TestAccess:
         # No address at all (MQTT) is `other`, and may not write.
         web = WebRequest("/x", {}, RequestType.POST, None, None, None)
         assert caller.caller_kind(web) == "other"
+
+
+# ==========================================================================
+# 7b. SEC-8 Level 1 once setup is complete (02 §3, 08 `protected`)
+# ==========================================================================
+
+#: 2026-09-24T12:00:00Z: later than any image's build time, so a clock post is
+#: not refused for being early.
+CLOCK_NOW_MS = 1790251200000
+WRITERS = {"panel", "hotspot", "lan", "internal"}
+
+#: (endpoint, body, callers allowed to make it at all): every write Level 1
+#: takes back from the LAN and the hotspot once setup is complete. Some of them
+#: are refused after `complete` anyway (`invalid_step`); at Level 1 the answer
+#: is `protected` instead, so a browser learns why.
+PROTECTED_WRITES = [
+    ("/goto", {"rev": 5, "step": "language"}, WRITERS),
+    ("/skip", {"rev": 5, "step": "ready"}, WRITERS),
+    ("/finish", {"rev": 5}, WRITERS),
+    ("/language", {"rev": 5, "code": "en"}, WRITERS),
+    ("/name", {"rev": 5, "name": "Workshop"}, WRITERS),
+    ("/timezone", {"rev": 5, "tz": "Europe/London"}, WRITERS),
+    ("/update", {"rev": 5, "action": "later"}, WRITERS),
+    ("/ready", {"rev": 5, "item": "load_filament", "action": "skip"}, WRITERS),
+    ("/network/cancel", {}, WRITERS),
+    ("/clock", {"epoch_ms": CLOCK_NOW_MS}, {"hotspot", "internal"}),
+]
+
+
+def complete_state() -> Dict[str, Any]:
+    """A printer that finished setup with `ready` still on the card."""
+    doc = state_with(
+        language={"status": "done", "value": "en"},
+        network={"status": "skipped"},
+        name={"status": "done", "value": "Walnut"},
+    )
+    doc["state"] = "complete"
+    doc["cursor"] = "finish"
+    return doc
+
+
+class TestProtectedAfterSetup:
+    @pytest.fixture(autouse=True)
+    def _open_after_every_test(self):
+        """The level is module state; put it back so no later test runs at
+        Level 1 by accident."""
+        yield
+        muon_floor.set_protection_level(muon_floor.LEVEL_OPEN)
+
+    @pytest.mark.parametrize("kind", sorted(WRITERS))
+    @pytest.mark.parametrize("level", [muon_floor.LEVEL_OPEN,
+                                       muon_floor.LEVEL_PROTECTED])
+    @pytest.mark.parametrize("complete", [False, True])
+    @pytest.mark.parametrize("endpoint,body,allowed", PROTECTED_WRITES)
+    def test_the_protected_table(
+        self, kind: str, level: int, complete: bool, endpoint: str,
+        body: Any, allowed: set
+    ):
+        """Refused exactly when all three hold: a LAN or hotspot caller, Level
+        1, and setup complete. The panel and in-process calls always pass,
+        and during setup everyone keeps what 02 §3 gives them."""
+        if kind not in allowed:
+            pytest.skip(f"{kind} may not call {endpoint} at any level")
+        refused = (kind in ("hotspot", "lan")
+                   and level == muon_floor.LEVEL_PROTECTED and complete)
+
+        async def go():
+            stored = complete_state() if complete else state_with(
+                language={"status": "done", "value": "en"})
+            h = await Harness(stored=stored).start()
+            muon_floor.set_protection_level(level)
+            before = copy.deepcopy(h.doc)
+            path = f"/server/muon/setup{endpoint}"
+            if refused:
+                with pytest.raises(ServerError) as info:
+                    await h.call(kind, path, copy.deepcopy(body))
+                assert info.value.status_code == 403
+                assert str(info.value) == "muon_setup: protected"
+                # Nothing changed: not the state, not the rev, not Aux.
+                assert h.doc == before
+                assert h.aux.friendly_name is None
+                assert h.aux.posted("/time") == []
+            else:
+                result = await h.call(kind, path, copy.deepcopy(body))
+                assert isinstance(result, dict)
+        run(go())
+
+    @pytest.mark.parametrize("kind,surface", [("hotspot", "phone"),
+                                              ("lan", "web")])
+    def test_claiming_the_driver_and_dismissing_the_card_stay_open(
+        self, kind: str, surface: str
+    ):
+        """02 §3: the two writes Level 1 leaves to the LAN and the hotspot.
+        Neither changes anything about the printer."""
+        async def go():
+            h = await Harness(stored=complete_state()).start()
+            muon_floor.set_protection_level(muon_floor.LEVEL_PROTECTED)
+            driver = await h.post(
+                "/driver", {"kind": surface, "client_id": "c1"}, kind=kind)
+            dismissed = await h.post("/card/dismiss", {"rev": 5}, kind=kind)
+            return driver, dismissed
+        driver, dismissed = run(go())
+        assert driver["ok"] is True
+        assert driver["state"]["driver"]["kind"] == surface
+        assert dismissed["ok"] is True
+        assert dismissed["state"]["card_dismissed"] is True
+
+    def test_a_refused_cancel_leaves_the_running_join_alone(self):
+        """The table's cancel row runs with no operation, and cancel_op does
+        nothing then, so it cannot show that a refusal leaves a running join
+        alone. This one plants the join the panel started."""
+        async def go():
+            h = await Harness(stored=complete_state()).start()
+            op = {"kind": "join", "id": "op_test", "started": 0.0,
+                  "phase": "associate", "progress": None}
+            h.setup.doc["op"] = copy.deepcopy(op)
+            muon_floor.set_protection_level(muon_floor.LEVEL_PROTECTED)
+            with pytest.raises(ServerError) as info:
+                await h.post("/network/cancel", {}, kind="lan")
+            assert str(info.value) == "muon_setup: protected"
+            assert h.doc["op"] == op
+            # The panel's cancel does stop it, so the refusal above is not
+            # passing only because nothing could have been cancelled.
+            result = await h.post("/network/cancel", {}, kind="panel")
+            assert result["ok"] is True
+            assert h.doc["op"] is None
+        run(go())
+
+    def test_reading_the_state_stays_open(self):
+        async def go():
+            h = await Harness(stored=complete_state()).start()
+            muon_floor.set_protection_level(muon_floor.LEVEL_PROTECTED)
+            return await h.get(kind="lan")
+        assert run(go())["state"] == "complete"
+
+    def test_the_level_is_read_on_every_write(self):
+        """The panel can change the level at any moment, and the next write
+        must see it: nothing may cache it at startup."""
+        async def go():
+            h = await Harness(stored=complete_state()).start()
+            muon_floor.set_protection_level(muon_floor.LEVEL_PROTECTED)
+            with pytest.raises(ServerError):
+                await h.post("/skip", {"rev": 5, "step": "ready"}, kind="lan")
+            muon_floor.set_protection_level(muon_floor.LEVEL_OPEN)
+            return await h.post("/skip", {"rev": 5, "step": "ready"}, kind="lan")
+        result = run(go())
+        assert result["ok"] is True
+        assert result["state"]["steps"]["ready"]["status"] == "skipped"
 
 
 class TestWriteHygiene:
