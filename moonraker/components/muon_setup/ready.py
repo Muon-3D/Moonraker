@@ -176,7 +176,7 @@ async def handle_ready(setup: MuonSetup, webreq: WebRequest) -> Dict[str, Any]:
     if action in ("start", "confirm"):
         # 02 §3: these need a person at the printer. Checked first, before
         # `busy`, `stale_rev` or any Klipper query, so a phone always gets 403.
-        caller.require(caller.caller_kind(webreq), caller.PANEL_ONLY)
+        setup.authorise(webreq, caller.PANEL_ONLY)
     # Hiding undefined macros is its own change (on load, on klippy_ready and
     # in the poll). Doing it here would bump `rev` under this very write and
     # answer it `stale_rev`; `start` checks the macro again below instead.
