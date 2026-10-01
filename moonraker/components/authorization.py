@@ -404,10 +404,11 @@ class Authorization:
         sources = ["moonraker"]
         if self.ldap is not None:
             sources.append("ldap")
-        login_req = self.force_logins and len(self.users) > 1
+        req_ip = web_request.ip_addr
+        login_req = muon_floor.login_required(
+            self.force_logins or self.panel_login_set(), len(self.users), req_ip)
         request_trusted: Optional[bool] = None
         user = web_request.get_current_user()
-        req_ip = web_request.ip_addr
         if user is not None and user.username == TRUSTED_USER:
             request_trusted = True
         elif req_ip is not None:
@@ -497,6 +498,10 @@ class Authorization:
         if username in RESERVED_USERS:
             raise self.server.error(
                 f"Invalid Reset Request for user {username}")
+        # MUON, SEC-6: the panel's login changes only at the panel.
+        if username == muon_floor.PANEL_LOGIN_USER:
+            raise self.server.error(
+                "This password can only be changed at the printer's panel.", 403)
         salt = bytes.fromhex(user_info.salt)
         hashed_pass = hashlib.pbkdf2_hmac(
             'sha256', password.encode(), salt, HASH_ITER).hex()
@@ -615,6 +620,10 @@ class Authorization:
         if username in RESERVED_USERS:
             raise self.server.error(
                 f"Invalid Request for reserved user {username}")
+        # MUON, SEC-6: removing the panel's login would remove the password.
+        if username == muon_floor.PANEL_LOGIN_USER:
+            raise self.server.error(
+                "This login can only be removed at the printer's panel.", 403)
         user_info: Optional[UserInfo] = self.users.get(username)
         if user_info is None:
             raise self.server.error(f"No registered user: {username}")
@@ -634,6 +643,44 @@ class Authorization:
             "username": username,
             "action": "user_deleted"
         }
+
+    def panel_login_set(self) -> bool:
+        return muon_floor.PANEL_LOGIN_USER in self.users
+
+    async def set_panel_login(self, password: Optional[str]) -> None:
+        """MUON, SEC-8: create, re-key or remove the panel-managed login.
+
+        Called only by muon_protection, for the panel. Any change logs out every
+        session the old password opened: its JWT key is dropped, so the token
+        no longer decodes, and the logout event closes live websockets.
+        """
+        username = muon_floor.PANEL_LOGIN_USER
+        existing = self.users.get(username)
+        if existing is not None and existing.jwk_id is not None:
+            self.public_jwks.pop(existing.jwk_id, None)
+        if not password:
+            if existing is None:
+                return
+            del self.users[username]
+            async with self.user_table as tx:
+                await tx.execute(
+                    f"DELETE FROM {USER_TABLE} WHERE username = ?", (username,)
+                )
+            event = "authorization:user_deleted"
+        else:
+            salt = secrets.token_bytes(32)
+            hashed_pass = hashlib.pbkdf2_hmac(
+                'sha256', password.encode(), salt, HASH_ITER).hex()
+            self.users[username] = UserInfo(
+                username=username, password=hashed_pass, salt=salt.hex()
+            )
+            await self._sync_user(username)
+            if existing is None:
+                return
+            event = "authorization:user_logged_out"
+        event_loop = self.server.get_event_loop()
+        event_loop.delay_callback(
+            .005, self.server.send_event, event, {'username': username})
 
     def _generate_jwt(self,
                       username: str,
@@ -902,8 +949,11 @@ class Authorization:
                 return self.users[API_USER]
 
         # If the force_logins option is enabled and at least one user is created
-        # then trusted user authentication is disabled
-        if self.force_logins and len(self.users) > 1:
+        # then trusted user authentication is disabled.  MUON: the panel's
+        # password switches it on as well, whatever the config says, and the
+        # panel itself is exempt because it has no way to sign in (MuonOS #87).
+        force_logins = self.force_logins or self.panel_login_set()
+        if muon_floor.login_required(force_logins, len(self.users), ip):
             if not auth_required:
                 return None
             raise HTTPError(401, "Unauthorized, Force Logins Enabled")
