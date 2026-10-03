@@ -125,6 +125,7 @@ class UserSqlDefinition(SqlTableDefinition):
 
 class Authorization:
     def __init__(self, config: ConfigHelper) -> None:
+        self._credential_lock = asyncio.Lock()
         self.server = config.get_server()
         self.login_timeout = config.getint('login_timeout', 90)
         self.force_logins = config.getboolean('force_logins', False)
@@ -377,6 +378,10 @@ class Authorization:
         return ret
 
     async def _handle_logout(self, web_request: WebRequest) -> Dict[str, str]:
+        async with self._credential_lock:
+            return await self._logout_user(web_request)
+
+    async def _logout_user(self, web_request: WebRequest) -> Dict[str, str]:
         user_info = web_request.get_current_user()
         if user_info is None:
             raise self.server.error("No user logged in")
@@ -404,10 +409,11 @@ class Authorization:
         sources = ["moonraker"]
         if self.ldap is not None:
             sources.append("ldap")
-        login_req = self.force_logins and len(self.users) > 1
+        req_ip = web_request.ip_addr
+        login_req = muon_floor.login_required(
+            self.force_logins or self.panel_login_set(), len(self.users), req_ip)
         request_trusted: Optional[bool] = None
         user = web_request.get_current_user()
-        req_ip = web_request.ip_addr
         if user is not None and user.username == TRUSTED_USER:
             request_trusted = True
         elif req_ip is not None:
@@ -497,6 +503,10 @@ class Authorization:
         if username in RESERVED_USERS:
             raise self.server.error(
                 f"Invalid Reset Request for user {username}")
+        # MUON, SEC-6: the panel's login changes only at the panel.
+        if username == muon_floor.PANEL_LOGIN_USER:
+            raise self.server.error(
+                "This password can only be changed at the printer's panel.", 403)
         salt = bytes.fromhex(user_info.salt)
         hashed_pass = hashlib.pbkdf2_hmac(
             'sha256', password.encode(), salt, HASH_ITER).hex()
@@ -512,6 +522,12 @@ class Authorization:
         }
 
     async def _login_jwt_user(
+        self, web_request: WebRequest, create: bool = False
+    ) -> Dict[str, Any]:
+        async with self._credential_lock:
+            return await self._login_jwt_user_locked(web_request, create)
+
+    async def _login_jwt_user_locked(
         self, web_request: WebRequest, create: bool = False
     ) -> Dict[str, Any]:
         username: str = web_request.get_str('username')
@@ -615,6 +631,10 @@ class Authorization:
         if username in RESERVED_USERS:
             raise self.server.error(
                 f"Invalid Request for reserved user {username}")
+        # MUON, SEC-6: removing the panel's login would remove the password.
+        if username == muon_floor.PANEL_LOGIN_USER:
+            raise self.server.error(
+                "This login can only be removed at the printer's panel.", 403)
         user_info: Optional[UserInfo] = self.users.get(username)
         if user_info is None:
             raise self.server.error(f"No registered user: {username}")
@@ -634,6 +654,68 @@ class Authorization:
             "username": username,
             "action": "user_deleted"
         }
+
+    def panel_login_set(self) -> bool:
+        return muon_floor.PANEL_LOGIN_USER in self.users
+
+    async def set_panel_login(self, password: Optional[str]) -> None:
+        """MUON, SEC-8: create, re-key or remove the panel-managed login.
+
+        Called only by muon_protection, for the panel. Any change logs out every
+        session the old password opened: its JWT key is dropped, so the token
+        no longer decodes, and the logout event closes live websockets.
+        """
+        # Login/logout also persist credentials. Keep those writes outside
+        # this transaction so they cannot restore a superseded password.
+        async with self._credential_lock:
+            await self._set_panel_login_locked(password)
+
+    async def _set_panel_login_locked(self, password: Optional[str]) -> None:
+        username = muon_floor.PANEL_LOGIN_USER
+        existing = self.users.get(username)
+        if not password:
+            if existing is None:
+                return
+            await self._persist_panel_login(None)
+            del self.users[username]
+            event = "authorization:user_deleted"
+        else:
+            salt = secrets.token_bytes(32)
+            hashed_pass = hashlib.pbkdf2_hmac(
+                'sha256', password.encode(), salt, HASH_ITER).hex()
+            user = UserInfo(
+                username=username, password=hashed_pass, salt=salt.hex()
+            )
+            await self._persist_panel_login(user)
+            self.users[username] = user
+            if existing is None:
+                return
+            event = "authorization:user_logged_out"
+        if existing.jwk_id is not None:
+            self.public_jwks.pop(existing.jwk_id, None)
+        event_loop = self.server.get_event_loop()
+        event_loop.delay_callback(
+            .005, self.server.send_event, event, {'username': username})
+
+    async def _persist_panel_login(self, user: Optional[UserInfo]) -> None:
+        # The table context does not roll back a failed commit. Explicitly
+        # discard that transaction before another write can commit it later.
+        try:
+            async with self.user_table as tx:
+                if user is None:
+                    await tx.execute(
+                        f"DELETE FROM {USER_TABLE} WHERE username = ?",
+                        (muon_floor.PANEL_LOGIN_USER,)
+                    )
+                else:
+                    vals = user.as_tuple()
+                    placeholders = ",".join("?" * len(vals))
+                    await tx.execute(
+                        f"REPLACE INTO {USER_TABLE} VALUES({placeholders})", vals
+                    )
+        except BaseException:
+            await self.user_table.rollback()
+            raise
 
     def _generate_jwt(self,
                       username: str,
@@ -902,8 +984,11 @@ class Authorization:
                 return self.users[API_USER]
 
         # If the force_logins option is enabled and at least one user is created
-        # then trusted user authentication is disabled
-        if self.force_logins and len(self.users) > 1:
+        # then trusted user authentication is disabled.  MUON: the panel's
+        # password switches it on as well, whatever the config says, and the
+        # panel itself is exempt because it has no way to sign in (MuonOS #87).
+        force_logins = self.force_logins or self.panel_login_set()
+        if muon_floor.login_required(force_logins, len(self.users), ip):
             if not auth_required:
                 return None
             raise HTTPError(401, "Unauthorized, Force Logins Enabled")
