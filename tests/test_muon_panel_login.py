@@ -16,6 +16,7 @@ import hashlib
 import ipaddress
 import json
 import sqlite3
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
@@ -25,6 +26,7 @@ from moonraker import muon_floor
 from moonraker.common import RequestType, UserInfo, WebRequest
 from moonraker.components import authorization as auth_mod
 from moonraker.components import muon_protection
+from moonraker.components.database import SqliteProvider, SqlTableWrapper
 from moonraker.components.authorization import Authorization
 from moonraker.components.muon_protection import MuonProtection
 from moonraker.utils.exceptions import ServerError
@@ -53,6 +55,9 @@ class _Tx:
 
     async def execute(self, sql: str, params: Any = None) -> None:
         self.log.append((sql.split()[0], params))
+
+    async def rollback(self) -> None:
+        pass
 
 
 class _Loop:
@@ -273,6 +278,58 @@ class TestPasswordPersistence:
         with pytest.raises(OSError, match="password storage unavailable"):
             _run(auth.set_panel_login(password))
         self._assert_original(auth, original, keys)
+
+    @pytest.mark.parametrize("operation", ["create", "rekey", "clear"])
+    def test_failed_sqlite_commit_cannot_apply_on_a_later_write(
+        self, operation, monkeypatch
+    ):
+        auth = self._original(operation)
+        original, keys = auth.users.get(LOGIN), dict(auth.public_jwks)
+        connection = sqlite3.connect(":memory:")
+        monkeypatch.setitem(
+            sqlite3.adapters, (list, sqlite3.PrepareProtocol), json.dumps
+        )
+        connection.execute("CREATE TABLE " + auth_mod.UserSqlDefinition.prototype)
+        connection.execute("CREATE TABLE unrelated(value TEXT)")
+        if original is not None:
+            connection.execute(
+                "INSERT INTO authorized_users VALUES(?,?,?,?,?,?,?,?)",
+                original.as_tuple(),
+            )
+        connection.commit()
+        before = connection.execute("SELECT * FROM authorized_users").fetchall()
+
+        # Only the queue/thread boundary is synchronous. The table context,
+        # SQL execution, commit and rollback use the actual production code.
+        provider = SqliteProvider.__new__(SqliteProvider)
+
+        async def dispatch(callback, *args):
+            return callback(connection, *args)
+
+        provider.execute_db_function = dispatch  # type: ignore[method-assign]
+        auth.user_table = SqlTableWrapper(
+            SimpleNamespace(db_provider=provider),  # type: ignore
+            auth_mod.UserSqlDefinition(),
+        )
+
+        def deny_commit(action, argument, *_args):
+            if action == sqlite3.SQLITE_TRANSACTION and argument == "COMMIT":
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        try:
+            connection.set_authorizer(deny_commit)
+            password = None if operation == "clear" else "new password"
+            with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+                _run(auth.set_panel_login(password))
+            self._assert_original(auth, original, keys)
+            connection.set_authorizer(None)
+            connection.execute("INSERT INTO unrelated VALUES('later write')")
+            connection.commit()
+            actual = connection.execute("SELECT * FROM authorized_users").fetchall()
+            assert actual == before
+        finally:
+            connection.close()
 
     @pytest.mark.parametrize("operation", ["login", "logout"])
     def test_session_during_rekey_cannot_restore_old_password(self, operation):

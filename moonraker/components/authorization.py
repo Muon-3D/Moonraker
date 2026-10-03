@@ -676,10 +676,7 @@ class Authorization:
         if not password:
             if existing is None:
                 return
-            async with self.user_table as tx:
-                await tx.execute(
-                    f"DELETE FROM {USER_TABLE} WHERE username = ?", (username,)
-                )
+            await self._persist_panel_login(None)
             del self.users[username]
             event = "authorization:user_deleted"
         else:
@@ -689,14 +686,7 @@ class Authorization:
             user = UserInfo(
                 username=username, password=hashed_pass, salt=salt.hex()
             )
-            # Publish only after the transaction commits. A failed request
-            # must retain both the old credentials and their live sessions.
-            vals = user.as_tuple()
-            placeholders = ",".join("?" * len(vals))
-            async with self.user_table as tx:
-                await tx.execute(
-                    f"REPLACE INTO {USER_TABLE} VALUES({placeholders})", vals
-                )
+            await self._persist_panel_login(user)
             self.users[username] = user
             if existing is None:
                 return
@@ -706,6 +696,26 @@ class Authorization:
         event_loop = self.server.get_event_loop()
         event_loop.delay_callback(
             .005, self.server.send_event, event, {'username': username})
+
+    async def _persist_panel_login(self, user: Optional[UserInfo]) -> None:
+        # The table context does not roll back a failed commit. Explicitly
+        # discard that transaction before another write can commit it later.
+        try:
+            async with self.user_table as tx:
+                if user is None:
+                    await tx.execute(
+                        f"DELETE FROM {USER_TABLE} WHERE username = ?",
+                        (muon_floor.PANEL_LOGIN_USER,)
+                    )
+                else:
+                    vals = user.as_tuple()
+                    placeholders = ",".join("?" * len(vals))
+                    await tx.execute(
+                        f"REPLACE INTO {USER_TABLE} VALUES({placeholders})", vals
+                    )
+        except BaseException:
+            await self.user_table.rollback()
+            raise
 
     def _generate_jwt(self,
                       username: str,
