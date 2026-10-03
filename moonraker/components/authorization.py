@@ -125,6 +125,7 @@ class UserSqlDefinition(SqlTableDefinition):
 
 class Authorization:
     def __init__(self, config: ConfigHelper) -> None:
+        self._credential_lock = asyncio.Lock()
         self.server = config.get_server()
         self.login_timeout = config.getint('login_timeout', 90)
         self.force_logins = config.getboolean('force_logins', False)
@@ -377,6 +378,10 @@ class Authorization:
         return ret
 
     async def _handle_logout(self, web_request: WebRequest) -> Dict[str, str]:
+        async with self._credential_lock:
+            return await self._logout_user(web_request)
+
+    async def _logout_user(self, web_request: WebRequest) -> Dict[str, str]:
         user_info = web_request.get_current_user()
         if user_info is None:
             raise self.server.error("No user logged in")
@@ -519,6 +524,12 @@ class Authorization:
     async def _login_jwt_user(
         self, web_request: WebRequest, create: bool = False
     ) -> Dict[str, Any]:
+        async with self._credential_lock:
+            return await self._login_jwt_user_locked(web_request, create)
+
+    async def _login_jwt_user_locked(
+        self, web_request: WebRequest, create: bool = False
+    ) -> Dict[str, Any]:
         username: str = web_request.get_str('username')
         password: str = web_request.get_str('password')
         source: str = web_request.get_str(
@@ -654,6 +665,12 @@ class Authorization:
         session the old password opened: its JWT key is dropped, so the token
         no longer decodes, and the logout event closes live websockets.
         """
+        # Login/logout also persist credentials. Keep those writes outside
+        # this transaction so they cannot restore a superseded password.
+        async with self._credential_lock:
+            await self._set_panel_login_locked(password)
+
+    async def _set_panel_login_locked(self, password: Optional[str]) -> None:
         username = muon_floor.PANEL_LOGIN_USER
         existing = self.users.get(username)
         if not password:

@@ -14,6 +14,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import ipaddress
+import json
+import sqlite3
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
@@ -77,6 +79,7 @@ class _AuthServer:
 def _authorization(force_logins: bool = True) -> Authorization:
     """An Authorization holding what the M1 config gives it, no more."""
     auth = Authorization.__new__(Authorization)
+    auth._credential_lock = asyncio.Lock()
     auth.server = _AuthServer()  # type: ignore[assignment]
     auth.force_logins = force_logins
     auth.enable_api_key = False
@@ -270,6 +273,77 @@ class TestPasswordPersistence:
         with pytest.raises(OSError, match="password storage unavailable"):
             _run(auth.set_panel_login(password))
         self._assert_original(auth, original, keys)
+
+    @pytest.mark.parametrize("operation", ["login", "logout"])
+    def test_session_during_rekey_cannot_restore_old_password(self, operation):
+        auth = self._original("rekey")
+        auth.default_source = "moonraker"
+        auth.ldap = None
+        auth.login_timeout = 90
+        # Exercise login's normal first-session write against real SQLite.
+        auth.users[LOGIN].jwk_id = None
+        auth.public_jwks.clear()
+
+        async def exercise():
+            started, release = asyncio.Event(), asyncio.Event()
+            connection = sqlite3.connect(":memory:")
+            connection.execute("CREATE TABLE " + auth_mod.UserSqlDefinition.prototype)
+
+            class PausedCommit:
+                owner = None
+
+                async def __aenter__(self):
+                    if self.owner is None:
+                        self.owner = asyncio.current_task()
+                    return self
+
+                async def execute(self, sql, params):
+                    values = tuple(
+                        json.dumps(v) if isinstance(v, list) else v for v in params
+                    )
+                    connection.execute(sql, values)
+
+                async def __aexit__(self, *exc):
+                    if asyncio.current_task() is self.owner:
+                        started.set()
+                        await release.wait()
+                    connection.commit()
+
+            auth.user_table = PausedCommit()  # type: ignore[assignment]
+            changing = asyncio.create_task(auth.set_panel_login("new password"))
+            await started.wait()
+            request = WebRequest(
+                "/access/login", {"username": LOGIN, "password": "original password"},
+                RequestType.POST,
+                type("_T", (), {"transport_type": None})(),  # type: ignore
+                ipaddress.ip_address(LAN), None,
+            )
+            if operation == "logout":
+                request = WebRequest(
+                    "/access/logout", {}, RequestType.POST, request.transport,
+                    ipaddress.ip_address(LAN), auth.users[LOGIN],
+                )
+            session = asyncio.create_task(
+                auth._login_jwt_user(request) if operation == "login"
+                else auth._handle_logout(request)
+            )
+            await asyncio.sleep(0)
+            release.set()
+            outcomes = await asyncio.gather(changing, session, return_exceptions=True)
+            assert outcomes[0] is None
+            if operation == "login":
+                assert isinstance(outcomes[1], ServerError)
+                assert "Invalid Password" in str(outcomes[1])
+            else:
+                assert outcomes[1] == {"username": LOGIN, "action": "user_logged_out"}
+            stored = connection.execute(
+                "SELECT password FROM authorized_users WHERE username = ?", (LOGIN,)
+            ).fetchone()[0]
+            connection.close()
+            assert stored == auth.users[LOGIN].password
+            assert stored == TestSetPanelLogin._hash(auth.users[LOGIN], "new password")
+
+        _run(exercise())
 
 
 class TestTheNetworkCannotChangeIt:
