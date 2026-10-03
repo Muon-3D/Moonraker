@@ -218,6 +218,60 @@ class TestSetPanelLogin:
         assert auth.sql_log == []  # type: ignore[attr-defined]
 
 
+class _FailingTx(_Tx):
+    def __init__(self, log: List[Tuple[str, Any]], phase: str) -> None:
+        super().__init__(log)
+        self.phase = phase
+
+    async def __aenter__(self) -> "_FailingTx":
+        if self.phase == "begin":
+            raise OSError("password storage unavailable")
+        return self
+
+    async def execute(self, sql: str, params: Any = None) -> None:
+        if self.phase == "write":
+            raise OSError("password storage unavailable")
+        await super().execute(sql, params)
+
+    async def __aexit__(self, *exc: Any) -> None:
+        if self.phase == "commit":
+            raise OSError("password storage unavailable")
+
+
+class TestPasswordPersistence:
+    @staticmethod
+    def _original(operation: str) -> Authorization:
+        auth = _authorization()
+        if operation != "create":
+            _run(auth.set_panel_login("original password"))
+            auth.users[LOGIN].jwk_id = "old-key"
+            auth.public_jwks["old-key"] = {}  # type: ignore[assignment]
+        return auth
+
+    @staticmethod
+    def _assert_original(auth: Authorization, original: Any, keys: Any) -> None:
+        assert auth.users.get(LOGIN) is original
+        assert auth.public_jwks == keys
+        assert auth.server.loop.events == []  # type: ignore[attr-defined]
+        if original is None:
+            assert _authenticate(auth, LAN).username == auth_mod.TRUSTED_USER
+        else:
+            with pytest.raises(HTTPError) as excinfo:
+                _authenticate(auth, LAN)
+            assert excinfo.value.status_code == 401
+
+    @pytest.mark.parametrize("operation", ["create", "rekey", "clear"])
+    @pytest.mark.parametrize("phase", ["begin", "write", "commit"])
+    def test_storage_failure_preserves_credentials_and_sessions(self, operation, phase):
+        auth = self._original(operation)
+        original, keys = auth.users.get(LOGIN), dict(auth.public_jwks)
+        auth.user_table = _FailingTx(auth.sql_log, phase)  # type: ignore
+        password = None if operation == "clear" else "new password"
+        with pytest.raises(OSError, match="password storage unavailable"):
+            _run(auth.set_panel_login(password))
+        self._assert_original(auth, original, keys)
+
+
 class TestTheNetworkCannotChangeIt:
     """SEC-6: the network routes that would reset or delete the login refuse
     it, or a LAN caller could take the password away."""

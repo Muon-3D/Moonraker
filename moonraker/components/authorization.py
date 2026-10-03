@@ -656,28 +656,36 @@ class Authorization:
         """
         username = muon_floor.PANEL_LOGIN_USER
         existing = self.users.get(username)
-        if existing is not None and existing.jwk_id is not None:
-            self.public_jwks.pop(existing.jwk_id, None)
         if not password:
             if existing is None:
                 return
-            del self.users[username]
             async with self.user_table as tx:
                 await tx.execute(
                     f"DELETE FROM {USER_TABLE} WHERE username = ?", (username,)
                 )
+            del self.users[username]
             event = "authorization:user_deleted"
         else:
             salt = secrets.token_bytes(32)
             hashed_pass = hashlib.pbkdf2_hmac(
                 'sha256', password.encode(), salt, HASH_ITER).hex()
-            self.users[username] = UserInfo(
+            user = UserInfo(
                 username=username, password=hashed_pass, salt=salt.hex()
             )
-            await self._sync_user(username)
+            # Publish only after the transaction commits. A failed request
+            # must retain both the old credentials and their live sessions.
+            vals = user.as_tuple()
+            placeholders = ",".join("?" * len(vals))
+            async with self.user_table as tx:
+                await tx.execute(
+                    f"REPLACE INTO {USER_TABLE} VALUES({placeholders})", vals
+                )
+            self.users[username] = user
             if existing is None:
                 return
             event = "authorization:user_logged_out"
+        if existing.jwk_id is not None:
+            self.public_jwks.pop(existing.jwk_id, None)
         event_loop = self.server.get_event_loop()
         event_loop.delay_callback(
             .005, self.server.send_event, event, {'username': username})
