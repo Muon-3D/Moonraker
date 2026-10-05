@@ -23,7 +23,7 @@ from tornado.routing import Rule, PathMatches, RuleRouter
 from tornado.http1connection import HTTP1Connection
 from tornado.httpserver import HTTPServer
 from tornado.log import access_log
-from ..utils import ServerError, source_info, parse_ip_address
+from ..utils import ServerError, source_info, parse_ip_address, redact
 from ..utils.real_ip import validate_real_ip_header
 from ..common import (
     JsonRPC,
@@ -678,6 +678,9 @@ class DynamicRequestHandler(AuthorizedRequestHandler):
                     endpoint.startswith("/machine/sudo/password")
                 ):
                     resp = {key: "<sanitized>" for key in args}
+                else:
+                    # MUON: names and secrets never reach the log
+                    resp = redact.redact(args)
             elif isinstance(args, str):
                 if args.startswith("<html>"):
                     resp = "<html>"

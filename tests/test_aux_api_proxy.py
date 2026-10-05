@@ -1204,3 +1204,38 @@ def test_a_rename_does_not_touch_the_endpoint_id():
     body = _identity(dict(DERIVED, endpoint_id=ENDPOINT_ID), override="bench")
     assert body["name"] == "bench"
     assert body["endpoint_id"] == ENDPOINT_ID
+
+
+# --------------------------------------------------------------------------
+# Debug logging never carries a name or a secret (utils/redact.py)
+# --------------------------------------------------------------------------
+
+def test_the_proxy_log_redacts_a_body_but_forwards_it_whole(caplog):
+    # MuonOS#353: the developer-mode waiver's signer is a person's name
+    import logging
+    caplog.set_level(logging.DEBUG, logger="wifi_autoproxy")
+    proxy, server, client = make_proxy()
+    proxy._register_from_spec(SPEC)
+    handler = server.handler_for("/server/aux/dev-mode")
+    asyncio.run(handler(FakeWebRequest("POST", {
+        "enable": True, "signer_name": "Ada Lovelace",
+        "reentry_token": "tok-456"})))
+    assert "Proxying" in caplog.text
+    assert "Ada Lovelace" not in caplog.text
+    assert "tok-456" not in caplog.text
+    assert "<redacted>" in caplog.text
+    # The Aux API still gets the real values
+    assert json.loads(client.last["body"])["signer_name"] == "Ada Lovelace"
+
+
+def test_the_proxy_log_redacts_a_query_but_forwards_it_whole(caplog):
+    import logging
+    caplog.set_level(logging.DEBUG, logger="wifi_autoproxy")
+    proxy, server, client = make_proxy()
+    proxy._register_from_spec({"paths": {"/wifi/check": {"get": {}}}})
+    handler = server.handler_for("/server/aux/wifi/check")
+    asyncio.run(handler(FakeWebRequest("GET", {
+        "ssid": "home", "password": "correct horse"})))
+    assert "correct" not in caplog.text
+    assert "ssid=home" in caplog.text
+    assert "password=correct" in client.last["url"]
