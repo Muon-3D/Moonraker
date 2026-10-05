@@ -325,7 +325,7 @@ class TestOwnerReadings:
         assert refused("updates", LAN, TRUSTED_USER) is not None
         assert refused("protection", LAN, TRUSTED_USER) is not None
 
-    @pytest.mark.parametrize("owner", ["none", "unknown"])
+    @pytest.mark.parametrize("owner", ["none"])
     def test_no_owner_open_is_todays_printer(self, owner: str):
         policy.set_state(state(owner=owner, entry="open", preset="strict"))
         for row in STANDARD:
@@ -335,7 +335,7 @@ class TestOwnerReadings:
             else:
                 assert message is None, (row, message)
 
-    @pytest.mark.parametrize("owner", ["none", "unknown"])
+    @pytest.mark.parametrize("owner", ["none"])
     def test_no_owner_protected_needs_an_approved_device(self, owner: str):
         policy.set_state(state(owner=owner, entry="protected"))
         # the password: signed-out guest rows only
@@ -356,6 +356,94 @@ class TestOwnerReadings:
                 assert message is not None and "panel" in message
             else:
                 assert message is None, (row, message)
+
+
+class TestTheUnknownOwnerWindow:
+    """Before the link answers, the printer must not be more open than its
+    real owner state, whichever that turns out to be (supervisor, #35)."""
+
+    PRINCIPALS = (
+        [policy.Principal("home", "h", 1, "operator", True, False),
+         policy.Principal("password", "p", 1, "operator", True, True)]
+        + [policy.Principal("gateway", "g", level, role, home, True)
+           for level in (1, 2, 3, 4) for role in ("operator", "viewer")
+           for home in (True, False)]
+    )
+
+    @pytest.mark.parametrize("entry", ["open", "protected"])
+    @pytest.mark.parametrize("preset", [None, "relaxed", "standard", "strict"])
+    @pytest.mark.parametrize("overrides", [{}, {"print": 4, "console": 1}])
+    def test_never_more_open_than_any_real_owner(self, entry, preset,
+                                                 overrides):
+        unknown = state(entry=entry, preset=preset, overrides=overrides,
+                        owner="unknown")
+        for principal in self.PRINCIPALS:
+            for action in policy.ACTIONS.values():
+                if not policy.decide_action(action, principal, unknown).allowed:
+                    continue
+                for owner in ("none", "account"):
+                    real = state(entry=entry, preset=preset,
+                                 overrides=overrides, owner=owner)
+                    assert policy.decide_action(action, principal,
+                                                real).allowed, (
+                        principal, action.name, owner)
+
+    def test_open_keeps_the_guest_rows_and_puts_admin_rows_at_the_panel(self):
+        policy.set_state(state(entry="open", owner="unknown"))
+        for row in ("read", "emergency_stop", "print", "files", "motion",
+                    "wifi"):
+            assert refused(row, LAN, TRUSTED_USER) is None, row
+        # an account owner would need a signed-in guest to rename
+        assert refused("rename", LAN, TRUSTED_USER) is not None
+        trusted = gateway("admin", "operator")
+        for row in ("protection", "hotspot", "updates", "console", "config",
+                    "files_others"):
+            message = refused(row, SENTINEL, trusted)
+            assert message is not None and "panel" in message, row
+
+    def test_protected_is_reads_and_the_panel(self):
+        policy.set_state(state(entry="protected", owner="unknown"))
+        assert refused("read", LAN, PASSWORD_USER) is None
+        assert refused("print", LAN, PASSWORD_USER) is not None
+        message = refused("print", SENTINEL, gateway("admin", "operator"))
+        assert message is not None and "panel" in message
+
+    def test_the_component_stays_closed_until_the_link_answers(self):
+        class _Silent:
+            phase = "linked"
+            answers = False
+
+            async def status(self) -> Dict[str, Any]:
+                if not self.answers:
+                    raise ConnectionError("muon-link is not up yet")
+                return {"phase": self.phase}
+
+        server = _Server()
+        _db(server, "muon_protection").values["level"] = 0
+        link = _Silent()
+        server.components["muon_link"] = link
+        protection = MuonProtection(_Config(server))
+        server.components["muon_protection"] = protection
+        access = MuonAccess(_Config(server))
+
+        async def start() -> None:
+            await protection.component_init()
+            await access.component_init()
+            await access.close()
+            policy.set_state(access.access_state())
+
+        asyncio.run(start())
+        assert access.owner == "unknown"
+        trusted = gateway("admin", "operator")
+        assert "panel" in (refused("hotspot", SENTINEL, trusted) or "")
+        link.answers = True
+        asyncio.run(access.refresh_owner())
+        assert access.owner == "account"
+        assert refused("hotspot", SENTINEL, trusted) is None
+        # a later poll that fails keeps the owner last known
+        link.answers = False
+        asyncio.run(access.refresh_owner())
+        assert access.owner == "account"
 
 
 class TestHomeOnly:

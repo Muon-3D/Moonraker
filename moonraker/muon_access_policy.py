@@ -97,6 +97,9 @@ OWNER_ACCOUNT = "account"
 OWNER_ORGANISATION = "organisation"
 #: Not yet known (the link has not answered since start).
 OWNER_UNKNOWN = "unknown"
+#: The owners this printer can derive from its link today. An organisation
+#: owner is not in the link yet.
+DERIVABLE_OWNERS = (OWNER_NONE, OWNER_ACCOUNT)
 OWNERS = (OWNER_NONE, OWNER_ACCOUNT, OWNER_ORGANISATION, OWNER_UNKNOWN)
 
 #: The login Moonraker#32 creates for the printer password. It is
@@ -222,12 +225,23 @@ def required_level(action: Action, state: AccessState) -> int:
     The table, then the readings section 3 gives under it:
 
     * one owner: "member" reads "owner", because there are no members;
-    * no owner (or not known yet): there is no admin, so Protection is the
-      panel's. Under Open every other row is anyone at home, which is what
-      the printer does today (access-model 6, "Identical behaviour"). Under
-      Protected a row above signed-out guest needs an approved device, which
-      the gateway presents at the admin level.
+    * no owner: there is no admin, so Protection is the panel's. Under Open
+      every other row is anyone at home, which is what the printer does today
+      (access-model 6, "Identical behaviour"; section 3's note reads tighter,
+      to be reconciled in the spec). Under Protected a row above signed-out
+      guest needs an approved device, which the gateway presents at the admin
+      level;
+    * owner not known yet (the link has not answered since start): the
+      strictest of what every owner the printer could have would need, and
+      the panel only where that is admin. A gap in knowing the owner never
+      opens the printer more than its real owner would.
     """
+    if state.owner == OWNER_UNKNOWN and not action.delegated:
+        level = max(
+            required_level(action, dataclasses.replace(state, owner=owner))
+            for owner in DERIVABLE_OWNERS
+        )
+        return PANEL if level >= ADMIN else level
     if action.fixed:
         base = action.standard
     else:
@@ -235,6 +249,7 @@ def required_level(action: Action, state: AccessState) -> int:
             action.name, action.level_for(effective_preset(state))
         )
     if state.owner in (OWNER_NONE, OWNER_UNKNOWN):
+        # (OWNER_UNKNOWN only for a delegated row, handled above otherwise)
         if action.name == "protection":
             return PANEL
         if action.delegated:

@@ -24,9 +24,11 @@
 # Is not stored here: it is whoever the printer is linked to (ACC-1, ACC-2).
 # The component asks ``muon_link`` how the link stands at start and every 30 s
 # after, and a linked printer has an account owner. Until the link has
-# answered the owner is "unknown", which the table reads as no owner: what the
-# printer did before this component under Open, and Protection only at the
-# panel under Protected. A printer with no [muon_link] has no owner.
+# answered the owner is "unknown", and each row needs the strictest of what
+# any owner the printer could have would need, with the panel only where that
+# is admin: a boot or a link that does not answer never opens the printer
+# more than its real owner state would. A poll that fails later keeps the
+# owner last known. A printer with no [muon_link] has no owner.
 #
 # WHO MAY CHANGE IT
 #
