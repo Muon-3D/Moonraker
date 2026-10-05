@@ -80,8 +80,11 @@ if TYPE_CHECKING:
 #: The address muon-link stamps on every forwarded request (GATE-2(b)).
 SENTINEL = ipaddress.ip_address("192.0.2.1")
 
-#: The longest request line accepted. `{"client":"<64 hex>"}` is 77 bytes.
-MAX_REQUEST = 256
+#: The longest request line accepted. The longest valid request -- a 64-hex
+#: client, a 128-character principal, the longest level, a role and `home`,
+#: written with json.dumps' default spacing -- is under 300 bytes; this
+#: leaves room for a field or two more without accepting anything unbounded.
+MAX_REQUEST = 512
 
 #: How long a connected peer may take to send its request.
 READ_TIMEOUT = 2.0

@@ -66,6 +66,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 import logging
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
@@ -84,6 +85,7 @@ ENDPOINT = "/server/muon/access"
 EVENT = "muon_access:changed"
 NOTIFY_NAME = "muon_access_changed"
 OWNER_POLL_INTERVAL = 30.0
+IP_ADDRESS_CMD = "ip -json address"
 
 ENTRY_FOR_LEVEL = {
     muon_floor.LEVEL_OPEN: policy.ENTRY_OPEN,
@@ -134,6 +136,8 @@ class MuonAccess:
         self.db = database.register_local_namespace(NAMESPACE, forbidden=True)
         self.record: Dict[str, Any] = new_record(policy.ENTRY_PROTECTED, None)
         self.owner = policy.OWNER_UNKNOWN
+        # Only the hotspot until the interfaces have been read: fail closed.
+        self.home = policy.HomeNetwork()
         self._owner_task: Optional[asyncio.Task] = None
         self._lock = asyncio.Lock()
         # Fail closed until component_init has read the record: Protected.
@@ -150,10 +154,16 @@ class MuonAccess:
             preset=self.record.get("preset"),
             overrides=overrides,
             owner=self.owner,
+            home=self.home,
         )
 
     def _publish(self) -> None:
         policy.set_state(self.access_state())
+        # The entry decides the legacy level too. With the dual write on,
+        # store_level has already set it; with it off, nothing else would,
+        # and check_protection, which runs first, would go on enforcing
+        # whatever muon_protection last read.
+        muon_floor.set_protection_level(LEVEL_FOR_ENTRY[self.record["entry"]])
 
     # -- start ------------------------------------------------------------
 
@@ -186,6 +196,7 @@ class MuonAccess:
             "muon_access: entry %s, preset %s",
             record["entry"], record.get("preset") or "follows the owner",
         )
+        await self.refresh_home()
         await self.refresh_owner()
         self._owner_task = asyncio.create_task(self._poll_owner())
 
@@ -252,7 +263,29 @@ class MuonAccess:
     async def _poll_owner(self) -> None:
         while True:
             await asyncio.sleep(OWNER_POLL_INTERVAL)
+            await self.refresh_home()
             await self.refresh_owner()
+
+    # -- the home network ---------------------------------------------------
+
+    async def read_interfaces(self) -> Any:
+        """`ip -json address`, parsed. Overridden in tests."""
+        shell = self.server.lookup_component("shell_command")
+        cmd = shell.build_shell_command(IP_ADDRESS_CMD)
+        return json.loads(await cmd.run_with_response(log_complete=False))
+
+    async def refresh_home(self) -> None:
+        try:
+            addresses = policy.interface_addresses(await self.read_interfaces())
+        except Exception as err:
+            # Keep the network last read; at start that is the hotspot only.
+            logging.info("muon_access: cannot read the interfaces: %s", err)
+            return
+        home = policy.HomeNetwork.from_interface_addresses(addresses)
+        if home != self.home:
+            logging.info("muon_access: home network %s", home.describe())
+            self.home = home
+            self._publish()
 
     # -- changes -----------------------------------------------------------
 
@@ -319,6 +352,7 @@ class MuonAccess:
             web_request.get_ip_address(),
             web_request.get_current_user(),
             state.entry,
+            state.home,
         )
         result = self.settings()
         result["caller"] = None if principal is None else principal.describe()

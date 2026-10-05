@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import ipaddress
+import json
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
@@ -29,12 +30,28 @@ from moonraker.utils.exceptions import ServerError
 LOOPBACK = ipaddress.ip_address("127.0.0.1")
 LAN = ipaddress.ip_address("192.168.1.50")
 SENTINEL = ipaddress.ip_address("192.0.2.1")
+HOTSPOT = ipaddress.ip_address("10.42.0.23")
+PUBLIC = ipaddress.ip_address("203.0.113.9")
+
+# The printer's own interfaces in these tests: a /24 LAN and an IPv6 /64.
+IP_JSON = [
+    {"ifname": "lo", "addr_info": [
+        {"family": "inet", "local": "127.0.0.1", "prefixlen": 8},
+        {"family": "inet6", "local": "::1", "prefixlen": 128}]},
+    {"ifname": "wlan0", "addr_info": [
+        {"family": "inet", "local": "192.168.1.10", "prefixlen": 24},
+        {"family": "inet6", "local": "2001:db8:1:2::10", "prefixlen": 128},
+        {"family": "inet6", "local": "fe80::1", "prefixlen": 64}]},
+]
 
 TRUSTED_USER = UserInfo("_TRUSTED_USER_", "")
 PASSWORD_USER = UserInfo("admin", "", source="moonraker")
 LEGACY_GATEWAY_USER = GatewayUser(
     "muon-link:0123456789abcdef", "", source="muon_gateway"
 )
+
+HOME = policy.HomeNetwork.from_interface_addresses(
+    policy.interface_addresses(IP_JSON))
 
 LEVELS = ("signed_out_guest", "signed_in_guest", "member", "admin")
 RANK = {name: rank for rank, name in enumerate(LEVELS, start=1)}
@@ -111,6 +128,7 @@ def gateway(level: str, role: str, home: bool = True) -> GatewayUser:
 def state(**kwargs: Any) -> policy.AccessState:
     kwargs.setdefault("entry", policy.ENTRY_PROTECTED)
     kwargs.setdefault("owner", policy.OWNER_ORGANISATION)
+    kwargs.setdefault("home", HOME)
     return policy.AccessState(**kwargs)
 
 
@@ -257,7 +275,7 @@ class TestTheFloorAndThePanel:
 
 class TestPrincipals:
     def test_anyone_at_home_under_open_is_a_signed_out_guest_operator(self):
-        p = policy.resolve_principal(HTTP, LAN, TRUSTED_USER, "open")
+        p = policy.resolve_principal(HTTP, LAN, TRUSTED_USER, "open", HOME)
         assert p is not None
         assert (p.kind, p.level, p.role, p.home, p.identified) == (
             "home", policy.SIGNED_OUT_GUEST, "operator", True, False)
@@ -268,7 +286,7 @@ class TestPrincipals:
         assert message is not None and "Protected" in message
 
     def test_the_password_is_a_signed_out_guest_at_home(self):
-        p = policy.resolve_principal(HTTP, LAN, PASSWORD_USER, "protected")
+        p = policy.resolve_principal(HTTP, LAN, PASSWORD_USER, "protected", HOME)
         assert p is not None
         assert (p.kind, p.level, p.role, p.identified) == (
             "password", policy.SIGNED_OUT_GUEST, "operator", True)
@@ -278,18 +296,18 @@ class TestPrincipals:
     def test_the_password_does_not_work_from_away(self):
         # ACC-16: the same login through the gateway is not admitted
         assert policy.resolve_principal(
-            HTTP, SENTINEL, PASSWORD_USER, "open") is None
+            HTTP, SENTINEL, PASSWORD_USER, "open", HOME) is None
 
     def test_the_gateway_address_without_its_token_is_nobody(self):
         assert policy.resolve_principal(
-            HTTP, SENTINEL, TRUSTED_USER, "open") is None
-        assert policy.resolve_principal(HTTP, SENTINEL, None, "open") is None
+            HTTP, SENTINEL, TRUSTED_USER, "open", HOME) is None
+        assert policy.resolve_principal(HTTP, SENTINEL, None, "open", HOME) is None
 
     def test_no_address_is_nobody(self):
-        assert policy.resolve_principal(None, None, TRUSTED_USER, "open") is None
+        assert policy.resolve_principal(None, None, TRUSTED_USER, "open", HOME) is None
 
     def test_a_token_naming_no_principal_is_the_gateway_as_it_was(self):
-        p = policy.resolve_principal(HTTP, SENTINEL, LEGACY_GATEWAY_USER, "open")
+        p = policy.resolve_principal(HTTP, SENTINEL, LEGACY_GATEWAY_USER, "open", HOME)
         assert p is not None
         assert (p.level, p.role) == (policy.ADMIN, "operator")
 
@@ -305,6 +323,56 @@ class TestPrincipals:
         if panel_login is None:
             pytest.skip("Moonraker#32 (the password) is not merged here")
         assert policy.PASSWORD_LOGIN_USER == panel_login
+
+
+class TestTheHomeNetwork:
+    """ACC-4 and ACC-16, by muon-link#42's rule (Codex P1 on #35)."""
+
+    def test_the_rule(self):
+        subnets = set(HOME.describe())
+        assert subnets == {"10.42.0.0/24", "192.168.1.0/24",
+                           "2001:db8:1:2::/64", "fe80::/64"}
+
+    def test_the_hotspot_is_home_before_anything_is_read(self):
+        assert policy.HomeNetwork().describe() == ["10.42.0.0/24"]
+        assert policy.HomeNetwork().contains(HOTSPOT)
+        assert not policy.HomeNetwork().contains(LAN)
+
+    def test_a_short_ipv4_prefix_is_not_the_home_network(self):
+        home = policy.HomeNetwork.from_interface_addresses(
+            [("10.1.2.3", 7), ("172.16.0.5", 8)])
+        assert home.describe() == ["10.42.0.0/24", "172.0.0.0/8"]
+
+    def test_an_ipv4_mapped_address_is_compared_as_ipv4(self):
+        assert HOME.contains(ipaddress.ip_address("::ffff:192.168.1.77"))
+        assert not HOME.contains(ipaddress.ip_address("::ffff:203.0.113.9"))
+
+    def test_ipv6_is_the_slash_64(self):
+        assert HOME.contains(ipaddress.ip_address("2001:db8:1:2:abcd::1"))
+        assert not HOME.contains(ipaddress.ip_address("2001:db8:1:3::1"))
+
+    def test_the_password_from_a_public_address_is_refused(self):
+        assert policy.resolve_principal(
+            HTTP, PUBLIC, PASSWORD_USER, "protected", HOME) is None
+        policy.set_state(state(entry="protected", owner="account"))
+        message = refused("read", PUBLIC, PASSWORD_USER)
+        assert message is not None and message.startswith(
+            "access-denied:read:")
+        assert refused("read", LAN, PASSWORD_USER) is None
+
+    def test_anyone_at_home_must_be_at_home(self):
+        policy.set_state(state(entry="open", owner="none"))
+        assert refused("print", PUBLIC, TRUSTED_USER) is not None
+        assert refused("print", LAN, TRUSTED_USER) is None
+        assert refused("print", HOTSPOT, TRUSTED_USER) is None
+        assert refused("print", ipaddress.ip_address("2001:db8:1:2::99"),
+                       TRUSTED_USER) is None
+
+    def test_before_the_interfaces_are_read_only_the_hotspot_is_home(self):
+        policy.set_state(state(entry="open", owner="none",
+                               home=policy.HomeNetwork()))
+        assert refused("print", LAN, TRUSTED_USER) is not None
+        assert refused("print", HOTSPOT, TRUSTED_USER) is None
 
 
 class TestOwnerReadings:
@@ -425,6 +493,7 @@ class TestTheUnknownOwnerWindow:
         protection = MuonProtection(_Config(server))
         server.components["muon_protection"] = protection
         access = MuonAccess(_Config(server))
+        _fake_interfaces(access)
 
         async def start() -> None:
             await protection.component_init()
@@ -569,6 +638,26 @@ class TestTheGatewayRequest:
         with pytest.raises(ValueError):
             parse_principal(body)
 
+    def test_the_longest_valid_request_fits(self):
+        # Codex P2 on #35: a 128-character principal did not fit in 256
+        line = json.dumps({
+            "client": "a" * 64, "principal": "p" * 128,
+            "level": "signed_out_guest", "role": "operator", "home": False,
+        }).encode()
+        assert len(line) > 256
+        assert muon_gateway.parse_request(line) == "a" * 64
+        assert parse_principal(line)["principal"] == "p" * 128
+
+    def test_the_request_limit_is_a_limit(self):
+        def padded(size: int) -> bytes:
+            base = b'{"client":"ab","pad":""}'
+            line = base.replace(b'""', b'"' + b"x" * (size - len(base)) + b'"')
+            assert len(line) == size
+            return line
+        assert muon_gateway.parse_request(padded(muon_gateway.MAX_REQUEST)) == "ab"
+        with pytest.raises(ValueError):
+            muon_gateway.parse_request(padded(muon_gateway.MAX_REQUEST + 1))
+
     def test_the_user_is_still_a_gateway_user(self):
         user = gateway("member", "operator")
         assert isinstance(user, UserInfo)
@@ -674,6 +763,7 @@ def _printer(
     server.components["muon_protection"] = protection
     access = MuonAccess(_Config(server))
     server.components["muon_access"] = access
+    _fake_interfaces(access)
 
     async def start() -> None:
         await protection.component_init()
@@ -683,6 +773,15 @@ def _printer(
 
     asyncio.run(start())
     return access, protection, server
+
+
+def _fake_interfaces(access: MuonAccess, ip_json: Any = None,
+                     fail: bool = False) -> None:
+    async def read_interfaces() -> Any:
+        if fail:
+            raise RuntimeError("ip is not there")
+        return IP_JSON if ip_json is None else ip_json
+    access.read_interfaces = read_interfaces  # type: ignore[assignment]
 
 
 def _post(component: Any, ip_addr: Any, args: Dict[str, Any],
@@ -777,11 +876,67 @@ class TestTheDualWrite:
         protection = MuonProtection(_Config(server))
         server.components["muon_protection"] = protection
         access = MuonAccess(_Config(server, dual_write=False))
+        _fake_interfaces(access)
         asyncio.run(protection.component_init())
         asyncio.run(access.component_init())
         asyncio.run(access.close())
         _post(access, LOOPBACK, {"entry": "protected"})
         assert _db(server, "muon_protection").values["level"] == 0
+        # ...but what check_protection enforces follows the entry
+        assert muon_floor.protection_level() == muon_floor.LEVEL_PROTECTED
+
+    def test_without_dual_write_protected_to_open_takes_effect(self):
+        # Codex P2 on #35: check_protection runs before check_access, so a
+        # stale in-memory level would go on refusing after the entry opened.
+        record = {"version": 1, "entry": "protected", "preset": None,
+                  "overrides": {}, "written_level": 1}
+        server = _Server()
+        _db(server, "muon_protection").values["level"] = 1
+        _db(server, "muon_access").values["record"] = record
+        protection = MuonProtection(_Config(server))
+        server.components["muon_protection"] = protection
+        access = MuonAccess(_Config(server, dual_write=False))
+        server.components["muon_access"] = access
+        _fake_interfaces(access)
+        asyncio.run(protection.component_init())
+        asyncio.run(access.component_init())
+        asyncio.run(access.close())
+        api = _api("/server/aux/wifi/connect")
+        with pytest.raises(ServerError):
+            asyncio.run(api.request({}, RequestType.POST, HTTP, LAN,
+                                    TRUSTED_USER))
+        _post(access, LOOPBACK, {"entry": "open"})
+        assert muon_floor.protection_level() == muon_floor.LEVEL_OPEN
+        assert asyncio.run(api.request({}, RequestType.POST, HTTP, LAN,
+                                       TRUSTED_USER))["reached"]
+        # and after a restart, with the old key still saying 1
+        assert _db(server, "muon_protection").values["level"] == 1
+        protection2 = MuonProtection(_Config(server))
+        server.components["muon_protection"] = protection2
+        access2 = MuonAccess(_Config(server, dual_write=False))
+        _fake_interfaces(access2)
+        asyncio.run(protection2.component_init())
+        asyncio.run(access2.component_init())
+        asyncio.run(access2.close())
+        assert muon_floor.protection_level() == muon_floor.LEVEL_OPEN
+
+    def test_the_home_network_is_read_and_kept_when_a_read_fails(self):
+        access, _p, _s = _printer(old_level=0)
+        assert access.home == HOME
+        _fake_interfaces(access, fail=True)
+        asyncio.run(access.refresh_home())
+        assert access.home == HOME
+
+    def test_an_unreadable_interface_list_leaves_only_the_hotspot(self):
+        server = _Server()
+        protection = MuonProtection(_Config(server))
+        server.components["muon_protection"] = protection
+        access = MuonAccess(_Config(server))
+        _fake_interfaces(access, fail=True)
+        asyncio.run(protection.component_init())
+        asyncio.run(access.component_init())
+        asyncio.run(access.close())
+        assert access.home == policy.HomeNetwork()
 
 
 class TestTheSettings:

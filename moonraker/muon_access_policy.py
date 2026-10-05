@@ -47,9 +47,10 @@
 from __future__ import annotations
 
 import dataclasses
+import ipaddress
 import posixpath
 import re
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
 from . import muon_floor
 from .utils.exceptions import ServerError
@@ -194,6 +195,90 @@ ACTIONS: Dict[str, Action] = {row.name: row for row in _ROWS}
 
 
 # ---------------------------------------------------------------------------
+# The home network (ACC-4, ACC-16; SEC-10)
+# ---------------------------------------------------------------------------
+#
+# The printer's LAN and its hotspot. The same rule as muon-link's
+# ``HomeNetwork::from_interface_addresses`` (muon-link#42), so the gateway and
+# Moonraker agree on what "at home" means:
+#
+#   * the hotspot, 10.42.0.0/24 (NetworkManager's shared-mode default), always,
+#     whether or not it is up when the interfaces are read;
+#   * each IPv4 interface address's own prefix, if it is at least /8 (a
+#     misconfigured /0 or /1 would make half the Internet the home network);
+#   * the /64 of each IPv6 address, whatever prefix the interface carries;
+#   * nothing from loopback or unspecified addresses.
+#
+# An IPv4-mapped IPv6 address is compared as the IPv4 address it carries.
+
+Network = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
+HOTSPOT_SUBNET: Network = ipaddress.ip_network("10.42.0.0/24")
+MIN_IPV4_INTERFACE_PREFIX = 8
+
+
+def _canonical(ip_addr: Any) -> Optional[Any]:
+    try:
+        ip = ipaddress.ip_address(str(ip_addr))
+    except ValueError:
+        return None
+    mapped = getattr(ip, "ipv4_mapped", None)
+    return mapped if mapped is not None else ip
+
+
+@dataclasses.dataclass(frozen=True)
+class HomeNetwork:
+    subnets: Tuple[Network, ...] = (HOTSPOT_SUBNET,)
+
+    @classmethod
+    def from_interface_addresses(
+        cls, addresses: Iterable[Tuple[Any, int]]
+    ) -> "HomeNetwork":
+        subnets: List[Network] = [HOTSPOT_SUBNET]
+        for addr, prefix in addresses:
+            ip = _canonical(addr)
+            if ip is None or ip.is_loopback or ip.is_unspecified:
+                continue
+            if ip.version == 4:
+                if not MIN_IPV4_INTERFACE_PREFIX <= prefix <= 32:
+                    continue
+                subnet: Network = ipaddress.ip_network(
+                    f"{ip}/{prefix}", strict=False)
+            else:
+                subnet = ipaddress.ip_network(f"{ip}/64", strict=False)
+            if subnet not in subnets:
+                subnets.append(subnet)
+        return cls(tuple(subnets))
+
+    def contains(self, ip_addr: Any) -> bool:
+        ip = _canonical(ip_addr)
+        if ip is None:
+            return False
+        return any(
+            ip.version == subnet.version and ip in subnet
+            for subnet in self.subnets
+        )
+
+    def describe(self) -> List[str]:
+        return [str(subnet) for subnet in self.subnets]
+
+
+def interface_addresses(ip_json: Any) -> List[Tuple[str, int]]:
+    """(address, prefix) for every address in `ip -json address` output."""
+    found: List[Tuple[str, int]] = []
+    if not isinstance(ip_json, list):
+        return found
+    for interface in ip_json:
+        if not isinstance(interface, dict):
+            continue
+        for info in interface.get("addr_info") or []:
+            local = info.get("local") if isinstance(info, dict) else None
+            prefix = info.get("prefixlen") if isinstance(info, dict) else None
+            if isinstance(local, str) and type(prefix) is int:
+                found.append((local, prefix))
+    return found
+
+
+# ---------------------------------------------------------------------------
 # Settings and the effective level
 # ---------------------------------------------------------------------------
 
@@ -205,6 +290,8 @@ class AccessState:
     preset: Optional[str] = None
     overrides: Mapping[str, int] = dataclasses.field(default_factory=dict)
     owner: str = OWNER_UNKNOWN
+    #: Until the interfaces have been read, only the hotspot is home.
+    home: HomeNetwork = HomeNetwork()
 
 
 def default_preset(owner: str, entry: str) -> str:
@@ -329,8 +416,11 @@ def resolve_principal(
     ip_addr: Optional[Any],
     user: Optional[Any],
     entry: str,
+    home: Optional[HomeNetwork] = None,
 ) -> Optional[Principal]:
     """Who is asking, or None if this caller is not admitted at all."""
+    if home is None:
+        home = HomeNetwork()
     if muon_floor._is_internal(transport):
         return INTERNAL_PRINCIPAL
     if muon_floor.local_address(ip_addr):
@@ -345,6 +435,12 @@ def resolve_principal(
         return None
     if ip_addr is None:
         # No address (MQTT): neither home nor identified.
+        return None
+    if not home.contains(ip_addr):
+        # Reached Moonraker directly from outside the LAN and the hotspot (a
+        # forwarded port, a routed VPN). The password works only from home
+        # (ACC-16), and Open admits an unidentified caller only from home
+        # (ACC-4), so neither is admitted.
         return None
     if _is_password_user(user):
         return Principal(
@@ -594,7 +690,8 @@ def decide_action(
             "this printer is Protected, and this connection is not signed in "
             "with its password, approved or paired"
             if state.entry == ENTRY_PROTECTED
-            else "this connection is not admitted"
+            else "this connection is not from the printer's home network, "
+            "signed in or paired"
         )
         return Decision(False, action.name, reason)
     if principal.level >= PANEL:
@@ -653,7 +750,9 @@ def check_access(
         # The panel is above every level (ACC-10). Checked before the
         # endpoint is classified so the panel never pays for it.
         return
-    principal = resolve_principal(transport, ip_addr, user, current.entry)
+    principal = resolve_principal(
+        transport, ip_addr, user, current.entry, current.home
+    )
     for action in classify(endpoint, request_type, args):
         decision = decide_action(action, principal, current)
         if not decision.allowed:
