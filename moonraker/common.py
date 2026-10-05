@@ -242,7 +242,7 @@ class APIDefinition:
         # arrive here, so a deny placed here covers the websocket's post-upgrade
         # JSON-RPC calls -- which authenticate once and are never matched
         # against a path again -- as well as plain HTTP.  See muon_floor.py.
-        muon_floor.check_floor(self.endpoint, transport, ip_addr)
+        muon_floor.check_floor(self.endpoint, transport, ip_addr, request_type)
         # MUON, SEC-8: the same convergence point, for the level the owner
         # chose. After the floor, so a floor surface keeps the floor's reason.
         muon_floor.check_protection(self.endpoint, transport, ip_addr, user)

@@ -204,6 +204,41 @@ BMS_TELEMETRY_LEFT_OPEN = (
     "/server/aux/bms/capabilities",
 )
 
+#: Moonraker's own account administration: creating, deleting and re-keying a
+#: user, and rotating the API key. Floored by endpoint AND request type, because
+#: the reads under the same endpoints have to stay open (below). Kept apart from
+#: FLOOR_PREFIXES, which MuonOS mirrors into its LAN vhost as ``location ^~``
+#: denies; a method-specific deny is not a prefix deny.
+#:
+#: Why. ``authenticate_request`` checks ``force_logins`` before the trusted-client
+#: list, the M1 config sets ``force_logins``, and ``_API_KEY_USER_`` always holds
+#: one row, so the first human user switches trusted sign-in off for every
+#: caller. The panel signs in by no other route, so from then on it gets 401 on
+#: everything, including whatever could undo it (MuonOS #87). While
+#: ``trusted_clients`` held loopback alone, a LAN caller got 401 before reaching
+#: ``POST /access/user``. KAN-350 opened that list to the LAN and the hotspot,
+#: and one unauthenticated request from any device there became enough. It also
+#: works cross-site: Moonraker reads arguments from the query string, so a
+#: "simple" POST from a page on any web site, open in a browser on the printer's
+#: LAN, needs no preflight. muon-link refuses ``/access/`` to every paired client
+#: (muon-link#6); this is the same refusal for the LAN.
+#:
+#: The same reason as the entries above: nothing else holds them. No Muon client
+#: creates a Moonraker user over the network.
+#:
+#: What stays open. ``GET /access/user``, ``/access/users/list`` and
+#: ``/access/api_key`` are what Fluidd's ``auth/init`` awaits in sequence,
+#: uncaught, so refusing one breaks Fluidd on the LAN. Login, logout,
+#: ``refresh_jwt``, ``info`` and ``oneshot_token`` create no user and change no
+#: one else's credential. That a LAN caller can read the API key is a separate
+#: question from the lockout, and is not settled here.
+FLOOR_REQUESTS = (
+    ("/access/user", "POST"),
+    ("/access/user", "DELETE"),
+    ("/access/user/password", "POST"),
+    ("/access/api_key", "POST"),
+)
+
 # SEC-3: Moonraker answers *who are you*; we answer *what may you do*.
 # ``UserInfo.groups`` defaults to ["admin"] upstream and nothing in Moonraker
 # reads it, so every authenticated user is an administrator.  These are the
@@ -247,6 +282,22 @@ def is_floor_endpoint(endpoint: str) -> bool:
     return False
 
 
+def is_floor_request(endpoint: str, request_type: Optional[Any] = None) -> bool:
+    """Is this request floored, by its endpoint or by endpoint and type together?
+
+    ``request_type`` is a ``RequestType``, read by name to keep this module free
+    of a cycle with ``common``. An endpoint in FLOOR_REQUESTS that arrives with
+    no request type is floored: fail-closed, like the rest of this module.
+    """
+    if is_floor_endpoint(endpoint):
+        return True
+    floored = {rtype for path, rtype in FLOOR_REQUESTS if path == endpoint}
+    if not floored:
+        return False
+    name = getattr(request_type, "name", None)
+    return name is None or name in floored
+
+
 def _is_internal(transport: Optional[Any]) -> bool:
     """True for component-to-component calls.
 
@@ -263,6 +314,7 @@ def check_floor(
     endpoint: str,
     transport: Optional[Any] = None,
     ip_addr: Optional[Any] = None,
+    request_type: Optional[Any] = None,
 ) -> None:
     """Raise 403 when a network caller touches a floor surface.
 
@@ -270,7 +322,7 @@ def check_floor(
     *known* loopback address is treated as remote.  A transport that carries no
     address (MQTT, say) is therefore denied rather than waved through.
     """
-    if not is_floor_endpoint(endpoint):
+    if not is_floor_request(endpoint, request_type):
         return
     if _is_internal(transport):
         return
