@@ -288,7 +288,9 @@ INTERNAL_PRINCIPAL = Principal(
 def _gateway_principal(user: Any) -> Principal:
     level_name = getattr(user, "access_level", None)
     role = getattr(user, "access_role", None)
-    name = getattr(user, "principal", None) or getattr(user, "username", "")
+    name = str(
+        getattr(user, "principal", "") or getattr(user, "username", "") or ""
+    )
     home = getattr(user, "access_home", False) is True
     if level_name is None and role is None:
         # A muon-link that sends no principal: the gateway as it was.
