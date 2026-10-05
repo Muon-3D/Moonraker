@@ -66,6 +66,7 @@
 
 from __future__ import annotations
 
+import bisect
 import math
 import os
 import struct
@@ -437,14 +438,16 @@ class ToolpathBuilder:
         out = bytearray(HEADER.size + LAYER.size * len(layers) + SEGMENT.size * count)
         HEADER.pack_into(out, 0, MAGIC, VERSION, flags, *lo, *hi, scale, len(layers))
         pos = HEADER.size
+        seen: List[float] = []
         for i, layer in enumerate(layers):
             last = layers[i + 1].first if i + 1 < len(layers) else count
             height = layer.height
             if height is None:
                 # Down to the highest layer under this one, or to the bed: the
                 # start G-code's purge can share the first layer's Z.
-                under = [z for z in zs[:i] if z < zs[i] - 1e-6]
-                height = zs[i] - max(under) if under else max(0.0, zs[i])
+                under = bisect.bisect_left(seen, zs[i] - 1e-6)
+                height = zs[i] - seen[under - 1] if under else max(0.0, zs[i])
+            bisect.insort(seen, zs[i])
             LAYER.pack_into(out, pos, zs[i], height, last - layer.first, layer.offset)
             pos += LAYER.size
         x0, y0 = lo[0], lo[1]

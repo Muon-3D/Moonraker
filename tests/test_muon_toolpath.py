@@ -217,6 +217,18 @@ def test_a_layer_comment_holds_through_z_changes() -> None:
     ]
 
 
+def test_heights_measure_down_to_the_highest_layer_under_them() -> None:
+    # Sequential printing: the second object starts again from the bed.
+    gcode = b"M83\n" + b"".join(
+        b";LAYER_CHANGE\n;Z:%s\nG1 Z%s\nG1 X%d E1\n" % (z, z, i + 1)
+        for i, z in enumerate((b"0.2", b"0.4", b"0.6", b"0.2", b"0.4"))
+    )
+    layers = toolpath(gcode)["layers"]
+    assert [round(layer["height"], 3) for layer in layers] == [
+        0.2, 0.2, 0.2, 0.2, 0.2,
+    ]
+
+
 def test_cura_layers_take_z_from_their_first_extrusion() -> None:
     path = toolpath(
         b"M82\n;LAYER:0\nG0 X5 Y5 Z0.3\n;TYPE:WALL-OUTER\nG1 X10 E1\n"
