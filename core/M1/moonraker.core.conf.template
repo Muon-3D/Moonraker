@@ -190,6 +190,11 @@ timeout: 120
 
 [aux_api_proxy]
 
+# B9-MR-1: GET /server/muon/toolpath, a compact drawing of a G-code file for
+# the app's and Fluidd's live model, made at upload by gcode_preprocessor and
+# on first request for older files. Cached under the data path.
+[muon_toolpath]
+
 # KAN-203: the first-run setup state machine. The panel and the phone's /setup
 # page both render it. Spec: specs/m1-first-run-setup in Muon-3D/OrcaSlicer.
 [muon_setup]
