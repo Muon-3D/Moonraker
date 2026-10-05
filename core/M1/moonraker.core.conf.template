@@ -110,10 +110,14 @@ trust_onlink_ipv6: true
 # panel (MuonOS #87). Level 1 instead refuses /server/aux and /machine/update to
 # any caller this list is the only credential for.
 #
-# NOTE on force_logins: authorization.py:883 only honours it when
-# len(self.users) > 1, and _API_KEY_USER_ always occupies one slot, so on a
-# device with no human user created this setting is inert on its own. It is set
-# as defence in depth, not as the control.
+# NOTE on force_logins: authorization.py honours it only when
+# len(self.users) > 1, and _API_KEY_USER_ always occupies one slot, so with no
+# human user it does nothing. It is NOT defence in depth for the panel: the gate
+# runs before the trusted-client check, so the first user created turns trusted
+# sign-in off for every caller, the panel included (MuonOS #87). With this list
+# open to the LAN, what keeps a network caller from creating that user is the
+# floor's FLOOR_REQUESTS (moonraker/muon_floor.py), which refuses the
+# /access account writes to anything off the device.
 force_logins: true
 # WEB-8. The `*://*` development entry that used to end this list is deleted,
 # not commented: a commented-out wildcard is one uncomment away from handing
