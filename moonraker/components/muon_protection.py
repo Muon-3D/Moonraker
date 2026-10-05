@@ -28,6 +28,15 @@
 # to the panel. That is also why a missing or unreadable stored level fails
 # closed to Protected rather than open: the panel can always set it back.
 #
+# WITH [muon_access]
+#
+# The level becomes the entry of `components/muon_access.py` (Open is 0,
+# Protected is 1). This key stays written while an A/B rollback could boot the
+# release before that component, so that release never reopens a Protected
+# printer: `muon_access` writes it with every change of the entry through
+# `store_level`, and the panel's POST here goes through `muon_access` so the
+# two records change together.
+#
 # WHERE IT IS STORED
 #
 # Moonraker's database, in a namespace registered `forbidden`, so no client can
@@ -94,6 +103,35 @@ class MuonProtection:
         )
         self.server.register_notification(EVENT, NOTIFY_NAME)
 
+    async def stored_level(self) -> Any:
+        """The raw stored level, or None if there is none. Raises if the
+        database cannot be read. For muon_access's migration and rollback
+        check, which must see what the release before it would see."""
+        return await self.db.get(LEVEL_KEY, None)
+
+    async def store_level(self, level: int) -> None:
+        """Store the level and enforce it. Raises if the database does not
+        take it, before anything is enforced."""
+        if not muon_floor.is_known_level(level):
+            raise ValueError(f"unknown protection level {level!r}")
+        previous = muon_floor.protection_level()
+        # Store first. A level the database did not take would last only
+        # until the next restart, so refuse it rather than pretend.
+        await self.db.insert(LEVEL_KEY, level)
+        muon_floor.set_protection_level(level)
+        if level != previous:
+            logging.info(
+                "muon_protection: level %d (%s) -> %d (%s)",
+                previous,
+                muon_floor.LEVEL_NAMES[previous],
+                level,
+                muon_floor.LEVEL_NAMES[level],
+            )
+            self.server.send_event(
+                EVENT,
+                {"level": level, "name": muon_floor.LEVEL_NAMES[level]},
+            )
+
     async def component_init(self) -> None:
         try:
             stored = await self.db.get(LEVEL_KEY, muon_floor.LEVEL_OPEN)
@@ -141,23 +179,12 @@ class MuonProtection:
                     f"'level' must be one of {sorted(muon_floor.LEVEL_NAMES)}",
                     400,
                 )
-            previous = muon_floor.protection_level()
-            # Store first. A level the database did not take would last only
-            # until the next restart, so refuse it rather than pretend.
-            await self.db.insert(LEVEL_KEY, level)
-            muon_floor.set_protection_level(level)
-            if level != previous:
-                logging.info(
-                    "muon_protection: level %d (%s) -> %d (%s), set at the panel",
-                    previous,
-                    muon_floor.LEVEL_NAMES[previous],
-                    level,
-                    muon_floor.LEVEL_NAMES[level],
-                )
-                self.server.send_event(
-                    EVENT,
-                    {"level": level, "name": muon_floor.LEVEL_NAMES[level]},
-                )
+            access = self.server.lookup_component("muon_access", None)
+            if access is not None:
+                # The entry and this key change together (access-model 6).
+                await access.set_entry_from_level(level)
+            else:
+                await self.store_level(level)
         return self.status(transport, ip_addr, user)
 
 
