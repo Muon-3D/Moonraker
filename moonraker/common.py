@@ -15,6 +15,7 @@ import time
 from enum import Enum, Flag, auto
 from abc import ABCMeta, abstractmethod
 from .utils import Sentinel
+from .utils import redact
 from .utils import json_wrapper as jsonw
 from .utils.exceptions import ServerError, AgentError
 from . import muon_floor
@@ -742,6 +743,8 @@ class JsonRPC:
                 for field in ["access_token", "api_key"]:
                     if field in params:
                         output["params"][field] = "<sanitized>"
+        # MUON: names and secrets never reach the log (utils/redact.py)
+        output = redact.redact(output)
         logging.debug(f"{trtype} Received::{jsonw.dumps(output).decode()}")
 
     def _log_response(
@@ -756,6 +759,7 @@ class JsonRPC:
             output = copy.deepcopy(resp_obj)
             output["result"] = "<sanitized>"
         self.sanitize_response = False
+        output = redact.redact(output)
         logging.debug(f"{trtype} Response::{jsonw.dumps(output).decode()}")
 
     def register_method(
