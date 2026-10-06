@@ -61,6 +61,7 @@ import logging
 from typing import TYPE_CHECKING, Any, Dict
 
 from .. import muon_floor
+from .. import muon_db
 from ..common import RequestType
 
 if TYPE_CHECKING:
@@ -97,7 +98,7 @@ def parse_stored_level(value: Any) -> int:
 class MuonProtection:
     def __init__(self, config: ConfigHelper) -> None:
         self.server = config.get_server()
-        database = self.server.lookup_component("database")
+        database = self.database = self.server.lookup_component("database")
         self.db = database.register_local_namespace(NAMESPACE, forbidden=True)
         # Fail closed until component_init has read the stored level.
         muon_floor.set_protection_level(muon_floor.LEVEL_PROTECTED)
@@ -110,7 +111,8 @@ class MuonProtection:
         """The raw stored level, or None if there is none. Raises if the
         database cannot be read. For muon_access's migration and rollback
         check, which must see what the release before it would see."""
-        return await self.db.get(LEVEL_KEY, None)
+        _, level = await muon_db.read(self.database, NAMESPACE, LEVEL_KEY)
+        return level
 
     async def store_level(self, level: int) -> None:
         """Store the level and enforce it. Raises if the database does not
@@ -138,11 +140,7 @@ class MuonProtection:
     async def delete_level(self) -> None:
         """Delete the stored level, once muon_access's rollback window is
         over. A key that is already gone is not an error."""
-        try:
-            await self.db.delete(LEVEL_KEY)
-        except self.server.error as err:
-            if getattr(err, "status_code", None) != 404:
-                raise
+        await muon_db.delete(self.database, NAMESPACE, LEVEL_KEY)
 
     # -- release N's guard (access-model section 6, step 3) ----------------
     #
@@ -158,12 +156,8 @@ class MuonProtection:
         if self.server.lookup_component("muon_access", None) is not None:
             return None
         database = self.server.lookup_component("database")
-        try:
-            record = await database.get_item(
-                ACCESS_NAMESPACE, ACCESS_RECORD_KEY, None)
-        except Exception:
-            # No such namespace: muon_access never ran here.
-            return None
+        _, record = await muon_db.read(
+            database, ACCESS_NAMESPACE, ACCESS_RECORD_KEY)
         return record if isinstance(record, dict) else None
 
     async def _follow_access_record(self, level: int) -> None:
@@ -181,15 +175,15 @@ class MuonProtection:
 
     async def component_init(self) -> None:
         try:
-            stored = await self.db.get(LEVEL_KEY, muon_floor.LEVEL_OPEN)
+            found, stored = await muon_db.read(self.database, NAMESPACE, LEVEL_KEY)
+            record = await self._access_record()
         except Exception:
             logging.exception(
                 "muon_protection: cannot read the stored level, "
                 "enforcing Protected until the panel sets one"
             )
             return
-        level = parse_stored_level(stored)
-        record = await self._access_record()
+        level = parse_stored_level(stored) if found else muon_floor.LEVEL_OPEN
         if (
             record is not None
             and record.get("entry") != "open"

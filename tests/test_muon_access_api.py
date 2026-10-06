@@ -21,9 +21,10 @@ from moonraker.components import muon_access_api
 from moonraker.utils.exceptions import ServerError
 
 from muon_access_fakes import (
-    HTTP, LAN, LOOPBACK, SENTINEL, Link, Server, call, caller, printer,
-    restart,
+    HTTP, LAN, LOOPBACK, SENTINEL, Config, Link, Server, call, caller,
+    fake_interfaces, printer, restart,
 )
+from moonraker.components.muon_access import MuonAccess, new_record
 
 FIXTURE = json.loads(
     (pathlib.Path(__file__).parent / "assets" / "muon_access_contract.json")
@@ -174,6 +175,49 @@ class TestTheOtherSettings:
 
 
 class TestConfirmOnThePrinter:
+    @pytest.mark.parametrize("completion", ["expired", "allowed", "refused"])
+    def test_terminal_requests_are_evicted_after_retention(self, monkeypatch,
+                                                          completion):
+        now = [1000.0]
+        monkeypatch.setattr(muon_access_api.time, "time", lambda: now[0])
+        access, server = printer_for(CASES[4])
+        rid = call(server, "request", {"ask": {"kind": "join"}},
+                   who=HOME)["requestId"]
+        if completion == "expired":
+            now[0] += 121
+        else:
+            call(server, "answer", {"request_id": rid,
+                                    "allow": completion == "allowed"},
+                 who=PANEL)
+        assert call(server, "request_status", {"request_id": rid},
+                    who=HOME) == {"status": completion}
+        now[0] += 121
+        call(server, "requests", who=PANEL)
+        assert rid not in access.api.requests
+
+    def test_completed_request_flood_is_bounded(self, monkeypatch):
+        monkeypatch.setattr(muon_access_api.time, "time", lambda: 1000.0)
+        access, server = printer_for(CASES[4])
+        first = None
+        for _ in range(100):
+            rid = call(server, "request", {"ask": {"kind": "join"}},
+                       who=HOME)["requestId"]
+            first = first or rid
+            call(server, "answer", {"request_id": rid, "allow": False},
+                 who=PANEL)
+            assert len(access.api.requests) <= 64
+        assert first not in access.api.requests
+
+    def test_expired_request_flood_is_bounded(self, monkeypatch):
+        now = [1000.0]
+        monkeypatch.setattr(muon_access_api.time, "time", lambda: now[0])
+        access, server = printer_for(CASES[4])
+        for _ in range(10):
+            for _ in range(16):
+                call(server, "request", {"ask": {"kind": "join"}}, who=HOME)
+            now[0] += 121
+        assert len(access.api.requests) <= 64
+
     def test_ask_answer_and_the_change_applies(self):
         access, server = printer_for(CASES[4])   # one owner, Open, a guest
         ask = call(server, "request",
@@ -316,6 +360,26 @@ class TestTheDualWriteStops:
     and times, not releases), so the stop is an explicit flag a later MuonOS
     change sets: dual_write_protection_level False."""
 
+    @pytest.mark.parametrize("written", [1, None])
+    @pytest.mark.parametrize("fail_delete", [False, True])
+    def test_cleanup_without_protection_retries_existing_key(self, written,
+                                                            fail_delete):
+        server = Server()
+        legacy = server.database.ns("muon_protection")
+        legacy.values["level"] = 1
+        legacy.fail_delete = fail_delete
+        server.database.ns("muon_access").values["record"] = new_record(
+            "open", written)
+        access = MuonAccess(Config(server, dual_write=False))
+        fake_interfaces(access)
+
+        async def start():
+            await access.component_init()
+            await access.close()
+        asyncio.run(start())
+        assert ("level" in legacy.values) == fail_delete
+        assert access.record["written_level"] == (written if fail_delete else None)
+
     def test_the_old_key_is_deleted_once_and_never_written_again(self):
         server = Server()
         access, _p, server = printer(server=server, old_level=1)
@@ -349,6 +413,21 @@ class TestTheDualWriteStops:
 
 
 class TestReleaseNsGuard:
+    def test_access_record_read_failure_cannot_open_legacy_level(self):
+        server = Server()
+        server.database.ns("muon_access").values["record"] = new_record(
+            "protected", 0)
+        server.database.ns("muon_access").fail_get = True
+        printer(server=server, old_level=0, with_access=False)
+        assert muon_floor.protection_level() == muon_floor.LEVEL_PROTECTED
+
+    def test_legacy_level_read_failure_cannot_open_access(self):
+        server = Server()
+        server.database.ns("muon_protection").fail_get = True
+        access, _, _ = printer(server=server, old_level=0)
+        assert access.record["entry"] == "protected"
+        assert muon_floor.protection_level() == muon_floor.LEVEL_PROTECTED
+
     """The release before muon_access, or one with [muon_access] left out:
     muon_protection reads the access record and never reopens."""
 

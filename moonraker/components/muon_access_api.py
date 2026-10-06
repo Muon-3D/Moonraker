@@ -61,6 +61,8 @@ REQUEST_NOTIFY = "muon_access_request"
 #: How long a request waits for the panel (design 2.3).
 REQUEST_SECONDS = 120.0
 MAX_PENDING = 16
+MAX_STORED = 64
+RESULT_SECONDS = 120.0
 
 DATA_MODES = ("shared", "accounts", "both")
 ASK_KINDS = ("entry", "join")
@@ -248,9 +250,13 @@ class AccessApi:
 
     def _expire(self) -> None:
         now = time.time()
-        for request in self.requests.values():
+        for rid, request in list(self.requests.items()):
             if request["status"] == "pending" and now > request["expires"]:
                 request["status"] = "expired"
+                request["done_at"] = request["expires"]
+            if (request["status"] != "pending"
+                    and now >= request["done_at"] + RESULT_SECONDS):
+                del self.requests[rid]
 
     async def request(self, web_request: WebRequest) -> Dict[str, Any]:
         principal = self._home_caller(web_request)
@@ -270,6 +276,13 @@ class AccessApi:
         pending = [r for r in self.requests.values() if r["status"] == "pending"]
         if len(pending) >= MAX_PENDING:
             raise self.server.error("Too many requests are waiting.", 429)
+        while len(self.requests) >= MAX_STORED:
+            finished = [r for r in self.requests.values()
+                        if r["status"] != "pending"]
+            if not finished:
+                raise self.server.error("Too many requests are waiting.", 429)
+            oldest = min(finished, key=lambda r: r["done_at"])
+            del self.requests[oldest["requestId"]]
         request_id = f"r{next(self._ids)}-{secrets.token_hex(4)}"
         code = (key_code(principal.name)
                 if principal is not None and principal.kind == "gateway"
@@ -297,7 +310,7 @@ class AccessApi:
     @staticmethod
     def _public(record: Dict[str, Any]) -> Dict[str, Any]:
         return {key: value for key, value in record.items()
-                if key not in ("expires", "requester")}
+                if key not in ("expires", "requester", "done_at")}
 
     def _own(self, web_request: WebRequest) -> Optional[Dict[str, Any]]:
         principal = self._home_caller(web_request)
@@ -344,6 +357,7 @@ class AccessApi:
             # Applied as the panel's own change: dual-written like any other
             await self.access.update({"entry": request["ask"]["entry"]})
         request["status"] = "allowed" if allow else "refused"
+        request["done_at"] = time.time()
         logging.info(
             "muon_access: request %s (%s) %s at the panel",
             request["requestId"], request["ask"], request["status"],
