@@ -33,10 +33,7 @@
 # anyone at home. Their uploads go to the shared drive, not private, and the
 # answer says so: "private": false, "reason": "no-identity" (ACC-34).
 #
-# NOT COVERED HERE
-#
-# Print history and file-list notifications name the file to every client;
-# both are outside a request this module sees. See the PR.
+# History results and notifications use the same uploader privacy rule.
 
 from __future__ import annotations
 
@@ -53,6 +50,7 @@ SHARED = "shared"
 ACCOUNTS = "accounts"
 BOTH = "both"
 NO_IDENTITY = "no-identity"
+HISTORY_UPLOADER = "_muon_private_uploader"
 
 _SAFE = re.compile(r"[^A-Za-z0-9._@+-]")
 
@@ -116,6 +114,8 @@ class FileScope:
     index: Mapping[str, Tag]
     data_mode: str = SHARED
     private_uploads: bool = False
+    index_readable: bool = True
+    history_index: Optional[Mapping[str, Tag]] = None
 
     def own_drive(self, principal: policy.Principal) -> Optional[str]:
         return drive_name(principal.name) if has_account(principal) else None
@@ -133,8 +133,36 @@ class FileScope:
         return True
 
     def hidden_private(self, path: str, principal: policy.Principal) -> bool:
-        tag = self.index.get(path)
-        return tag is not None and tag.private and tag.uploader != principal.name
+        if not self.index_readable:
+            return True
+        paths = [path]
+        # Metadata extracts images under .thumbs using the G-code's stem,
+        # with an optional dimension suffix. Apply every matching tag (two
+        # differently suffixed G-codes can share an image name).
+        directory, name = posixpath.split(path)
+        if posixpath.basename(directory) == ".thumbs":
+            parent = posixpath.dirname(directory)
+            stem = posixpath.splitext(name)[0]
+            for filename in self.index:
+                base = posixpath.splitext(posixpath.basename(filename))[0]
+                if (posixpath.dirname(filename) == parent
+                        and (stem == base or re.fullmatch(
+                            re.escape(base) + r"-\d+x\d+", stem))):
+                    paths.append(filename)
+        return any(tag is not None and tag.private
+                   and tag.uploader != principal.name
+                   for tag in (self.index.get(p) for p in paths))
+
+    def hidden_history(self, path: str, principal: policy.Principal) -> bool:
+        tag = (self.history_index or {}).get(path) or self.index.get(path)
+        return (not self.index_readable or
+                tag is not None and tag.private and tag.uploader != principal.name)
+
+    def hidden_tree(self, path: str, principal: policy.Principal) -> bool:
+        prefix = path.rstrip("/") + "/" if path not in ("", ".") else ""
+        return self.hidden_private(path, principal) or any(
+            p.startswith(prefix)
+            and self.hidden_private(p, principal) for p in self.index)
 
     def readable(self, path: str, principal: policy.Principal) -> bool:
         return (not self.hidden_private(path, principal)
@@ -215,12 +243,18 @@ def printed_files(script: Any) -> list:
 
 
 class FileGuard:
-    def __init__(self, scope: Any, record: Any, error: Any) -> None:
+    def __init__(self, scope: Any, record: Any, error: Any,
+                 persist: Any = None) -> None:
         #: () -> FileScope, the settings and index now
         self.scope = scope
         #: (path, Tag) -> None, records an upload's tag
         self.record = record
         self.error = error
+        self.persist = persist
+
+    async def flush(self) -> None:
+        if self.persist is not None:
+            await self.persist()
 
     def _not_found(self, path: str) -> Exception:
         # Never confirm a file exists that the caller may not see
@@ -228,11 +262,14 @@ class FileGuard:
 
     def _read(self, scope: FileScope, path: Optional[str],
               principal: policy.Principal) -> None:
-        if path is not None and not scope.readable(path, principal):
+        if path is not None and (not scope.readable(path, principal)
+                                 or scope.hidden_tree(path, principal)):
             raise self._not_found(path)
 
     def _write(self, scope: FileScope, path: Optional[str],
                principal: policy.Principal) -> None:
+        if path is not None and scope.hidden_tree(path, principal):
+            raise self._not_found(path)
         if path is not None and not scope.in_scope(path, principal):
             raise self.error(f"'{path}' is in another account's drive.", 403)
 
@@ -320,6 +357,8 @@ class FileGuard:
     @staticmethod
     def _dir_visible(scope: FileScope, path: str,
                      principal: policy.Principal) -> bool:
+        if not scope.index_readable:
+            return False
         if path == DRIVES:
             return is_admin(principal) or scope.own_drive(principal) is not None
         return scope.in_scope(path + "/x", principal)
@@ -329,8 +368,10 @@ class FileGuard:
                result: Any) -> Any:
         scope = self.scope()
         method = getattr(request_type, "name", None)
+        if endpoint in ("/server/history/list", "/server/history/job"):
+            return self.history_result(scope, principal, result)
         if (endpoint == "/server/files/list"
-                and args.get("root", "gcodes") == "gcodes"
+                and str(args.get("root", "gcodes")).lower() == "gcodes"
                 and isinstance(result, list)):
             return [item for item in result
                     if not isinstance(item, dict)
@@ -389,23 +430,128 @@ class FileGuard:
                               private=tag.private)
         return result
 
+    @staticmethod
+    def history_result(scope: FileScope, principal: policy.Principal,
+                       result: Any) -> Any:
+        if not isinstance(result, dict):
+            return result
+
+        def redact(job: Any) -> Any:
+            if not isinstance(job, dict):
+                return job
+            metadata = job.get("metadata") or {}
+            if HISTORY_UPLOADER in metadata:
+                uploader = metadata[HISTORY_UPLOADER]
+                hidden_name = (not scope.index_readable or
+                               uploader is not None and uploader != principal.name)
+            else:
+                hidden_name = scope.hidden_history(
+                    relative(job.get("filename")) or "", principal)
+            if not hidden_name:
+                if HISTORY_UPLOADER in metadata:
+                    metadata = dict(metadata)
+                    del metadata[HISTORY_UPLOADER]
+                    return dict(job, metadata=metadata)
+                return job
+            hidden = dict(job, filename="private file", exists=False)
+            hidden.pop("metadata", None)
+            hidden.pop("thumbnails", None)
+            return hidden
+
+        out = dict(result)
+        if isinstance(out.get("jobs"), list):
+            out["jobs"] = [redact(job) for job in out["jobs"]]
+        if "job" in out:
+            out["job"] = redact(out["job"])
+        return out
+
+    def notification(self, name: str, data: Any,
+                     principal: policy.Principal) -> Any:
+        scope = self.scope()
+        if name == "history_changed":
+            return [self.history_result(scope, principal, item) for item in data]
+        if name != "filelist_changed":
+            return data
+        for info in data:
+            if not isinstance(info, dict):
+                continue
+            for key in ("item", "source_item"):
+                item = info.get(key) or {}
+                if item.get("root") == "gcodes":
+                    path = relative(item.get("path")) or ""
+                    # History tags keep move/delete source names protected
+                    # even after the current index has followed the event.
+                    if (scope.hidden_tree(path, principal)
+                            or scope.hidden_history(path, principal)
+                            or any(p.startswith(path.rstrip("/") + "/")
+                                   and scope.hidden_history(p, principal)
+                                   for p in scope.history_index or {})):
+                        return None
+        return data
+
     def plan_upload(self, principal: policy.Principal,
                     form_args: Dict[str, Any]) -> Optional[Any]:
-        if form_args.get("root", "gcodes") != "gcodes":
+        root = str(form_args.get("root", "gcodes")).lower()
+        form_args["root"] = root
+        if root != "gcodes":
             return None
         try:
-            directory, tag, answer = self.scope().upload(
+            scope = self.scope()
+            directory, tag, answer = scope.upload(
                 principal, form_args.get("path", ""))
         except ValueError:
             raise self.error(
                 "Uploads may not go to another account's drive.", 403)
-        form_args["path"] = directory
-        return (tag, answer)
+        filename = str(form_args.get("filename", "")).strip().lstrip("/")
+        destination = posixpath.normpath(posixpath.join(directory, filename))
+        if destination == ".." or destination.startswith("../"):
+            raise self.error("Uploads may not leave the G-code root.", 403)
+        effective = destination
+        if posixpath.splitext(effective)[1].lower() == ".ufp":
+            effective = posixpath.splitext(effective)[0] + ".gcode"
+        self._write(scope, effective, principal)
+        form_args["path"], form_args["filename"] = posixpath.split(destination)
+        return (tag, answer, effective)
+
+    async def prepare_upload(self, plan: Any) -> None:
+        tag, _answer, path = plan
+        if tag is not None:
+            self.record(path, tag)
+            await self.flush()
+
+    async def prepare_operation(self, endpoint: str, args: Mapping[str, Any],
+                                principal: policy.Principal) -> None:
+        """Reserve destination tags before file_manager writes or notifies."""
+        self.check(endpoint, None, args, principal)
+        scope = self.scope()
+        dest = gcodes_path(args.get("dest"))
+        if dest is None:
+            return
+        changed = False
+        if endpoint in ("/server/files/copy", "/server/files/move"):
+            source = gcodes_path(args.get("source"))
+            if source is not None:
+                prefix = source.rstrip("/") + "/"
+                for path, tag in list(scope.index.items()):
+                    if path == source or path.startswith(prefix):
+                        suffix = path[len(source):]
+                        self.record(dest.rstrip("/") + suffix, tag)
+                        changed = True
+        elif endpoint == "/server/files/zip":
+            items = [gcodes_path(i) for i in args.get("items") or []]
+            if any(tag.private for path, tag in scope.index.items()
+                   for item in items if item is not None
+                   and (path == item or path.startswith(item.rstrip("/") + "/"))):
+                self.record(dest, Tag(principal.name, True))
+                changed = True
+        if changed:
+            await self.flush()
 
     def finish_upload(self, plan: Any, result: Any) -> Dict[str, Any]:
-        tag, answer = plan
+        tag, answer, expected = plan
         item = result.get("item", {}) if isinstance(result, dict) else {}
         path = item.get("path")
         if tag is not None and isinstance(path, str):
-            self.record(path, tag)
+            if relative(path) != expected or self.scope().index.get(path) != tag:
+                raise self.error("Upload did not use its reserved destination.", 500)
         return dict(answer)

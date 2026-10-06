@@ -1084,8 +1084,11 @@ class FileUploadHandler(AuthorizedRequestHandler):
         logging.debug(debug_msg)
         logging.info(f"Processing Uploaded File: {mp_fname}")
         try:
+            # Persist the tag before the file or its notifications are visible.
+            await muon_access_policy.prepare_upload(plan)
             result = await self.file_manager.finalize_upload(form_args)
         except ServerError as e:
+            self._remove_temp_file()
             raise tornado.web.HTTPError(
                 e.status_code, str(e))
         result.update(muon_access_policy.finish_upload(plan, result))

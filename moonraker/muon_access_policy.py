@@ -836,8 +836,11 @@ def filter_result(
         return coro
 
     async def filtered() -> Any:
-        return guard.filter(endpoint, request_type, args or {}, principal,
-                            await coro)
+        result = guard.filter(endpoint, request_type, args or {}, principal,
+                              await coro)
+        if endpoint in ("/server/files/copy", "/server/files/zip"):
+            await guard.flush()
+        return result
     return filtered()
 
 
@@ -848,6 +851,29 @@ def plan_upload(ip_addr: Optional[Any], user: Optional[Any],
     if principal is None or _files is None:
         return None
     return _files.plan_upload(principal, form_args)
+
+
+async def prepare_upload(plan: Optional[Any]) -> None:
+    """Persist uploader privacy before file_manager publishes the file."""
+    if plan is not None and _files is not None:
+        await _files.prepare_upload(plan)
+
+
+async def prepare_file_operation(web_request: Any, args: Mapping[str, Any]) -> None:
+    principal = _file_principal(
+        web_request.transport, web_request.get_ip_address(),
+        web_request.get_current_user())
+    if principal is not None and _files is not None:
+        await _files.prepare_operation(web_request.get_endpoint(), args, principal)
+
+
+def filter_notification(name: str, data: Any, connection: Any) -> Any:
+    if _files is None or name not in ("filelist_changed", "history_changed"):
+        return data
+    principal = _file_principal(connection, connection.ip_addr, connection.user_info)
+    if principal is None:
+        return None
+    return _files.notification(name, data, principal)
 
 
 def finish_upload(plan: Optional[Any], result: Any) -> Dict[str, Any]:

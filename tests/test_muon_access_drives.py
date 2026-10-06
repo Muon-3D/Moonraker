@@ -81,9 +81,11 @@ def upload(path: str, name: str, who: Any, root: str = "gcodes") -> Dict[str, An
     transport, ip, user = who
     form_args = {"root": root, "path": path, "filename": name}
     plan = policy.plan_upload(ip, user, form_args)
+    asyncio.run(policy.prepare_upload(plan))
     directory = form_args["path"].strip("/")
+    name = form_args["filename"]
     final = f"{directory}/{name}" if directory else name
-    result: Dict[str, Any] = {"item": {"root": root, "path": final},
+    result: Dict[str, Any] = {"item": {"root": form_args["root"], "path": final},
                               "action": "create_file"}
     result.update(policy.finish_upload(plan, result))
     return result
