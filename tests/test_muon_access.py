@@ -502,6 +502,7 @@ class TestTheUnknownOwnerWindow:
             await access.component_init()
             await access.close()
             policy.set_state(access.access_state())
+            policy.set_files(access.guard)
 
         asyncio.run(start())
         assert access.owner == "unknown"
@@ -714,6 +715,7 @@ class _Server:
     def __init__(self) -> None:
         self.components: Dict[str, Any] = {"database": _Database()}
         self.events: List[Tuple[str, Tuple[Any, ...]]] = []
+        self.event_handlers: Dict[str, List[Any]] = {}
 
     def lookup_component(self, name: str, default: Any = None) -> Any:
         return self.components.get(name, default)
@@ -726,6 +728,9 @@ class _Server:
 
     def register_notification(self, *args: Any) -> None:
         pass
+
+    def register_event_handler(self, event: str, callback: Any) -> None:
+        self.event_handlers.setdefault(event, []).append(callback)
 
     def send_event(self, event: str, *args: Any) -> None:
         self.events.append((event, args))
@@ -772,6 +777,7 @@ def _printer(
         await access.component_init()
         await access.close()   # stop the owner poll; state stays published
         policy.set_state(access.access_state())
+        policy.set_files(access.guard)
 
     asyncio.run(start())
     return access, protection, server
@@ -836,6 +842,7 @@ class TestTheDualWrite:
         access, protection, server = _printer(old_level=0, link="linked")
         old = _db(server, "muon_protection")
         policy.set_state(access.access_state())
+        policy.set_files(access.guard)
         _post(access, LOOPBACK, {"entry": "protected"})
         assert old.values["level"] == 1
         assert muon_floor.protection_level() == muon_floor.LEVEL_PROTECTED

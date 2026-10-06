@@ -110,6 +110,7 @@ class Server:
         self.components: Dict[str, Any] = {"database": self.database}
         self.handlers: Dict[str, Tuple[List[str], Any]] = {}
         self.events: List[Tuple[str, Tuple[Any, ...]]] = []
+        self.event_handlers: Dict[str, List[Any]] = {}
 
     def lookup_component(self, name: str, default: Any = None) -> Any:
         return self.components.get(name, default)
@@ -122,6 +123,9 @@ class Server:
 
     def register_notification(self, *args: Any) -> None:
         pass
+
+    def register_event_handler(self, event: str, callback: Any) -> None:
+        self.event_handlers.setdefault(event, []).append(callback)
 
     def send_event(self, event: str, *args: Any) -> None:
         self.events.append((event, args))
@@ -190,6 +194,7 @@ def printer(
             await access.component_init()
             await access.close()   # stop the poll; publish the state again
             policy.set_state(access.access_state())
+            policy.set_files(access.guard)
 
     asyncio.run(start())
     return access, protection, server
