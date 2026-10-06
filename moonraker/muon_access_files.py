@@ -356,10 +356,10 @@ class FileGuard:
             # file_manager's copy event names no source, so the tags are
             # copied here: a private file's copy stays private
             source = gcodes_path(args.get("source"))
-            dest = gcodes_path((result.get("item") or {}).get("path") and
-                               "gcodes/" + result["item"]["path"])
-            if (source is not None and dest is not None
-                    and (result.get("item") or {}).get("root") == "gcodes"):
+            copied = result.get("item") or {}
+            dest = (relative(copied.get("path"))
+                    if copied.get("root") == "gcodes" else None)
+            if source is not None and dest is not None:
                 prefix = source.rstrip("/") + "/"
                 for path, tag in list(scope.index.items()):
                     if path == source:
@@ -370,14 +370,14 @@ class FileGuard:
             return result
         if endpoint == "/server/files/zip" and isinstance(result, dict):
             # An archive of a private file is private to who made it
-            dest = (result.get("destination") or {})
+            archive: Dict[str, Any] = result.get("destination") or {}
             items = [gcodes_path(i) for i in args.get("items") or []]
             holds_private = any(
                 tag.private for path, tag in scope.index.items()
                 for item in items if item is not None
                 and (path == item or path.startswith(item.rstrip("/") + "/")))
-            if holds_private and dest.get("root") == "gcodes":
-                self.record(str(dest.get("path", "")),
+            if holds_private and archive.get("root") == "gcodes":
+                self.record(str(archive.get("path", "")),
                             Tag(principal.name, True))
             return result
         if endpoint == "/server/files/metadata" and isinstance(result, dict):
