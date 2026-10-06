@@ -19,6 +19,18 @@
 #
 # `server.muon.access.*` (AB-MR-2) is components/muon_access_api.py.
 #
+# DRIVES AND PRIVATE UPLOADS (AB-MR-3)
+#
+# The rules are muon_access_files.py. This component keeps their index: for
+# each upload from a caller with an identity, its uploader and whether it is
+# private, keyed by its path under gcodes, in the `muon_access_files`
+# namespace (forbidden, like the record). It follows the files: a move or a
+# rename carries the tag and a delete drops it (file_manager's events); a copy
+# takes its source's tags and a zip holding a private file is private to who
+# made it (muon_access_files.FileGuard, from the request's own answer). It
+# is kept here rather than in gcode metadata, which a metadata rescan
+# rewrites; `server.files.metadata` still answers with the tag.
+#
 # The decision itself is ``muon_access_policy.check_access``, which
 # ``APIDefinition.request`` calls after ``muon_floor``'s checks. This component
 # only stores the settings and hands them to it.
@@ -93,6 +105,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from .muon_access_api import DATA_MODES, AccessApi
 
+from .. import muon_access_files as files
 from .. import muon_access_policy as policy
 from .. import muon_floor
 from .. import muon_db
@@ -104,6 +117,8 @@ if TYPE_CHECKING:
 
 NAMESPACE = "muon_access"
 RECORD_KEY = "record"
+FILES_NAMESPACE = "muon_access_files"
+FILES_KEY = "index"
 RECORD_VERSION = 1
 ENDPOINT = "/server/muon/access"
 EVENT = "muon_access:changed"
@@ -164,6 +179,18 @@ class MuonAccess:
             )
         database = self.database = self.server.lookup_component("database")
         self.db = database.register_local_namespace(NAMESPACE, forbidden=True)
+        self.files_db = database.register_local_namespace(
+            FILES_NAMESPACE, forbidden=True)
+        #: path under gcodes -> its uploader and whether it is private
+        self.index: Dict[str, files.Tag] = {}
+        self.history_index: Dict[str, files.Tag] = {}
+        self._index_readable = False
+        self._index_lock = asyncio.Lock()
+        self.guard = files.FileGuard(
+            self.file_scope, self.record_tag, self.server.error, self.save_index)
+        policy.set_files(self.guard)
+        self.server.register_event_handler(
+            "file_manager:filelist_changed", self._on_files_changed)
         self.record: Dict[str, Any] = new_record(policy.ENTRY_PROTECTED, None)
         self.owner = policy.OWNER_UNKNOWN
         #: The linked account, when the link names one.
@@ -247,6 +274,7 @@ class MuonAccess:
             "muon_access: entry %s, preset %s",
             record["entry"], record.get("preset") or "follows the owner",
         )
+        await self.load_index()
         await self.refresh_home()
         await self.refresh_owner()
         self._owner_task = asyncio.create_task(self._poll_owner())
@@ -502,11 +530,121 @@ class MuonAccess:
                 await self._update(changes)
         return self.status(web_request)
 
+    # -- drives and private uploads ---------------------------------------------
+
+    def file_scope(self) -> files.FileScope:
+        return files.FileScope(
+            self.index, self.data_mode(), self.private_uploads(),
+            self._index_readable, self.history_index)
+
+    async def load_index(self) -> None:
+        try:
+            found, stored = await muon_db.read(
+                self.database, FILES_NAMESPACE, FILES_KEY)
+            stored = stored if found else {}
+            if not isinstance(stored, dict):
+                raise ValueError("invalid upload index")
+            # Earlier builds stored only current paths. Keep those tags when
+            # migrating to the envelope that also protects historical names.
+            if stored.get("version") == 1:
+                current = stored["files"]
+                historical = stored["history"]
+            else:
+                current = historical = stored
+            self.index = self._parse_index(current)
+            self.history_index = {p: t for p, t in self._parse_index(
+                historical).items() if t.private}
+        except Exception:
+            self._index_readable = False
+            logging.exception("muon_access: cannot read the upload index")
+            return
+        self._index_readable = True
+
+    @staticmethod
+    def _parse_index(stored: Any) -> Dict[str, files.Tag]:
+        if not isinstance(stored, dict):
+            raise ValueError("invalid upload index")
+        index: Dict[str, files.Tag] = {}
+        for path, tag in stored.items():
+            if (not isinstance(path, str) or not isinstance(tag, dict)
+                    or not isinstance(tag.get("uploader"), str)
+                    or not isinstance(tag.get("private"), bool)):
+                raise ValueError("invalid upload tag")
+            index[path] = files.Tag(tag["uploader"], tag["private"])
+        return index
+
+    async def save_index(self) -> None:
+        async with self._index_lock:
+            if not self._index_readable:
+                raise self.server.error("Upload index is unreadable.", 500)
+            body = {"version": 1,
+                    "files": {p: t.as_dict() for p, t in self.index.items()},
+                    "history": {p: t.as_dict()
+                                for p, t in self.history_index.items()}}
+            try:
+                await self.files_db.insert(FILES_KEY, body)
+            except Exception as err:
+                self._index_readable = False
+                raise self.server.error("Cannot store the upload index.", 500) from err
+
+    def _save_index(self) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # Not in the event loop (a test): the caller awaits save_index()
+            return
+
+        async def store() -> None:
+            try:
+                await self.save_index()
+            except Exception:
+                logging.exception("muon_access: cannot store the upload index")
+        loop.create_task(store())
+
+    def record_tag(self, path: str, tag: files.Tag) -> None:
+        self.index[path] = tag
+        if tag.private:
+            previous = self.history_index.get(path)
+            self.history_index[path] = (
+                files.Tag("", True) if previous is not None
+                and previous.uploader != tag.uploader else tag)
+
+    def _on_files_changed(self, info: Dict[str, Any]) -> None:
+        item = info.get("item") or {}
+        source = info.get("source_item") or {}
+        if item.get("root") != "gcodes":
+            return
+        action = info.get("action")
+        path = str(item.get("path", ""))
+        source_path = str(source.get("path", ""))
+        changed = False
+        if action == "delete_file":
+            changed = self.index.pop(path, None) is not None
+        elif action == "delete_dir":
+            prefix = path.rstrip("/") + "/"
+            for key in [k for k in self.index if k.startswith(prefix)]:
+                del self.index[key]
+                changed = True
+        elif action == "move_file" and source.get("root") == "gcodes":
+            tag = self.index.pop(source_path, None)
+            if tag is not None:
+                self.record_tag(path, tag)
+                changed = True
+        elif action == "move_dir" and source.get("root") == "gcodes":
+            old = source_path.rstrip("/") + "/"
+            new = path.rstrip("/") + "/"
+            for key in [k for k in self.index if k.startswith(old)]:
+                self.record_tag(new + key[len(old):], self.index.pop(key))
+                changed = True
+        if changed:
+            self._save_index()
+
     async def close(self) -> None:
         if self._owner_task is not None:
             self._owner_task.cancel()
             self._owner_task = None
         policy.set_state(None)
+        policy.set_files(None)
 
 
 def load_component(config: ConfigHelper) -> MuonAccess:

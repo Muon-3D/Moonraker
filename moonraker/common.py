@@ -253,11 +253,15 @@ class APIDefinition:
         muon_access_policy.check_access(
             self.endpoint, request_type, args, transport, ip_addr, user
         )
-        return self.callback(
-            WebRequest(
-                self.endpoint, args, request_type, transport, ip_addr, user,
-                http_headers
-            )
+        # MUON, ACC-30/31: listings show only the files this caller may see.
+        return muon_access_policy.filter_result(
+            self.endpoint, request_type, args, transport, ip_addr, user,
+            self.callback(
+                WebRequest(
+                    self.endpoint, args, request_type, transport, ip_addr,
+                    user, http_headers
+                )
+            ),
         )
 
     @property

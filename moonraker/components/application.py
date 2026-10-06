@@ -807,6 +807,16 @@ class FileRequestHandler(AuthorizedFileHandler):
         self.finish(jsonw.dumps({'result': filename}))
 
     async def get(self, path: str, include_body: bool = True) -> None:
+        # MUON, ACC-31: a download is a read of that file, and this handler
+        # does not pass APIDefinition.request.
+        app_: MoonrakerApp = self.server.lookup_component("application")
+        _check_file_access(
+            self.request, self.current_user, "/server/files/download",
+            RequestType.GET,
+            {"path": url_unescape(
+                app_.parse_endpoint(self.request.path or "").lstrip("/")
+                .split("/", 2)[-1], plus=False)},
+        )
         # Set up our path instance variables.
         self.path = self.parse_url_path(path)
         del path  # make sure we don't refer to path instead of self.path again
@@ -1048,6 +1058,15 @@ class FileUploadHandler(AuthorizedRequestHandler):
         form_args['filename'] = mp_fname
         form_args['tmp_file_path'] = self._file.filename
         try:
+            # MUON, ACC-30/34: the drive it goes to and its uploader tag
+            plan = muon_access_policy.plan_upload(
+                parse_ip_address(self.request.remote_ip or ""),
+                self.current_user, form_args,
+            )
+        except ServerError as e:
+            self._remove_temp_file()
+            raise tornado.web.HTTPError(e.status_code, reason=str(e)) from e
+        try:
             _check_file_access(
                 self.request, self.current_user, "/server/files/upload",
                 RequestType.POST,
@@ -1065,10 +1084,14 @@ class FileUploadHandler(AuthorizedRequestHandler):
         logging.debug(debug_msg)
         logging.info(f"Processing Uploaded File: {mp_fname}")
         try:
+            # Persist the tag before the file or its notifications are visible.
+            await muon_access_policy.prepare_upload(plan)
             result = await self.file_manager.finalize_upload(form_args)
         except ServerError as e:
+            self._remove_temp_file()
             raise tornado.web.HTTPError(
                 e.status_code, str(e))
+        result.update(muon_access_policy.finish_upload(plan, result))
         # Return 201 and add the Location Header
         item: Dict[str, Any] = result.get('item', {})
         root: Optional[str] = item.get('root', None)

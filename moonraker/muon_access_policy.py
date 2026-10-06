@@ -687,6 +687,15 @@ def classify(
 # ---------------------------------------------------------------------------
 
 _state: Optional[AccessState] = None
+#: Drives and private uploads (muon_access_files.FileGuard), when the
+#: component has set them up. Checked after the table, for every principal
+#: but an in-process call: the panel too (design 2.7).
+_files: Optional[Any] = None
+
+
+def set_files(guard: Optional[Any]) -> None:
+    global _files
+    _files = guard
 
 
 def set_state(state: Optional[AccessState]) -> None:
@@ -772,9 +781,14 @@ def check_access(
     current = _state
     if current is None:
         return
-    if muon_floor._is_internal(transport) or muon_floor.local_address(ip_addr):
+    if muon_floor._is_internal(transport):
+        return
+    if muon_floor.local_address(ip_addr):
         # The panel is above every level (ACC-10). Checked before the
-        # endpoint is classified so the panel never pays for it.
+        # endpoint is classified so the panel never pays for it. Private
+        # files still hide from it (design 2.7).
+        if _files is not None:
+            _files.check(endpoint, request_type, args or {}, PANEL_PRINCIPAL)
         return
     principal = resolve_principal(
         transport, ip_addr, user, current.entry, current.home
@@ -782,10 +796,91 @@ def check_access(
     actions = classify(endpoint, request_type, args)
     if principal is None and at_home_unadmitted(actions, ip_addr, current):
         return
+    if _files is not None and principal is not None:
+        actions = _files.adjust(actions, endpoint, request_type, args or {},
+                                principal)
     for action in actions:
         decision = decide_action(action, principal, current)
         if not decision.allowed:
             raise refusal(decision)
+    if _files is not None and principal is not None:
+        _files.check(endpoint, request_type, args or {}, principal)
+
+
+def _file_principal(
+    transport: Optional[Any], ip_addr: Optional[Any], user: Optional[Any]
+) -> Optional[Principal]:
+    current = _state
+    if current is None or _files is None or muon_floor._is_internal(transport):
+        return None
+    if muon_floor.local_address(ip_addr):
+        return PANEL_PRINCIPAL
+    return resolve_principal(transport, ip_addr, user, current.entry,
+                             current.home)
+
+
+def filter_result(
+    endpoint: str,
+    request_type: Optional[Any],
+    args: Optional[Mapping[str, Any]],
+    transport: Optional[Any],
+    ip_addr: Optional[Any],
+    user: Optional[Any],
+    coro: Any,
+) -> Any:
+    """The handler's coroutine, with listings filtered to what the caller
+    may see. The coroutine itself when nothing applies."""
+    principal = _file_principal(transport, ip_addr, user)
+    guard = _files
+    if principal is None or guard is None:
+        return coro
+
+    async def filtered() -> Any:
+        result = guard.filter(endpoint, request_type, args or {}, principal,
+                              await coro)
+        if endpoint in ("/server/files/copy", "/server/files/zip"):
+            await guard.flush()
+        return result
+    return filtered()
+
+
+def plan_upload(ip_addr: Optional[Any], user: Optional[Any],
+                form_args: Dict[str, Any]) -> Optional[Any]:
+    """Where an upload goes, and its tag (rewrites form_args["path"])."""
+    principal = _file_principal(None, ip_addr, user)
+    if principal is None or _files is None:
+        return None
+    return _files.plan_upload(principal, form_args)
+
+
+async def prepare_upload(plan: Optional[Any]) -> None:
+    """Persist uploader privacy before file_manager publishes the file."""
+    if plan is not None and _files is not None:
+        await _files.prepare_upload(plan)
+
+
+async def prepare_file_operation(web_request: Any, args: Mapping[str, Any]) -> None:
+    principal = _file_principal(
+        web_request.transport, web_request.get_ip_address(),
+        web_request.get_current_user())
+    if principal is not None and _files is not None:
+        await _files.prepare_operation(web_request.get_endpoint(), args, principal)
+
+
+def filter_notification(name: str, data: Any, connection: Any) -> Any:
+    if _files is None or name not in ("filelist_changed", "history_changed"):
+        return data
+    principal = _file_principal(connection, connection.ip_addr, connection.user_info)
+    if principal is None:
+        return None
+    return _files.notification(name, data, principal)
+
+
+def finish_upload(plan: Optional[Any], result: Any) -> Dict[str, Any]:
+    """What the upload's answer adds: "private", and why not."""
+    if plan is None or _files is None:
+        return {}
+    return _files.finish_upload(plan, result)
 
 
 def at_home_unadmitted(

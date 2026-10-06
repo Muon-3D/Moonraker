@@ -8,6 +8,7 @@ from __future__ import annotations
 import time
 import logging
 from asyncio import Lock
+from ..muon_access_files import HISTORY_UPLOADER
 from ..common import (
     JobEvent,
     RequestType,
@@ -507,7 +508,20 @@ class History:
             return
         filename: str = self.current_job.filename
         mdst = self.file_manager.get_metadata_storage()
-        metadata: Dict[str, Any] = mdst.get(filename, {})
+        metadata: Dict[str, Any] = dict(mdst.get(filename, {}))
+        access = self.server.lookup_component("muon_access", None)
+        if access is not None:
+            # A path can be renamed, deleted or reused by another uploader.
+            # Keep the print's privacy with the job, independently of the path.
+            previous = self.current_job.metadata
+            if HISTORY_UPLOADER in previous:
+                uploader = previous[HISTORY_UPLOADER]
+            elif not access.file_scope().index_readable:
+                uploader = ""
+            else:
+                tag = access.index.get(filename)
+                uploader = tag.uploader if tag is not None and tag.private else None
+            metadata[HISTORY_UPLOADER] = uploader
         # We don't need to store these fields in the
         # job metadata, as they are redundant
         metadata.pop('print_start_time', None)
