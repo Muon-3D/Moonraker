@@ -26,6 +26,7 @@ from tornado.log import access_log
 from ..utils import ServerError, source_info, parse_ip_address, redact
 from ..utils.real_ip import validate_real_ip_header
 from .. import muon_access_policy
+from .. import muon_floor
 from ..common import (
     JsonRPC,
     WebRequest,
@@ -961,11 +962,13 @@ def _check_file_access(
     request_type: RequestType,
     args: Dict[str, Any],
 ) -> None:
-    """The level table for the file handlers that bypass APIDefinition."""
+    """The level table for the file handlers that bypass APIDefinition, and
+    the Bluetooth setup rule (KAN-436), which they would bypass too."""
+    ip_addr = parse_ip_address(request.remote_ip or "")
     try:
+        muon_floor.check_bluetooth(endpoint, None, ip_addr)
         muon_access_policy.check_access(
-            endpoint, request_type, args, None,
-            parse_ip_address(request.remote_ip or ""), user,
+            endpoint, request_type, args, None, ip_addr, user,
         )
     except ServerError as e:
         raise tornado.web.HTTPError(e.status_code, reason=str(e)) from e

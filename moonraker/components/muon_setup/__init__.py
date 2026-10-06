@@ -38,6 +38,7 @@ from urllib.parse import urlencode
 
 from . import caller, clock, language, manifest, model, name, ready, region, update
 from .model import DONE, FINISH, HIDDEN, PENDING, SKIPPED
+from ... import muon_floor
 from ...utils.exceptions import ServerError
 
 if TYPE_CHECKING:
@@ -249,6 +250,9 @@ class MuonSetup:
         self._nearby: Optional[Dict[str, Any]] = None
         self._nearby_timer: Optional[asyncio.TimerHandle] = None
         self.nearby_clock: Callable[[], float] = time.monotonic
+        # KAN-436: muon_floor holds a phone on Bluetooth to the setup routes
+        # until setup is complete, and asks this component when it is.
+        muon_floor.set_setup_complete_source(self.complete_for_floor)
 
         #: Hooks for the step packages. `hide_when_current[step](doc)` decides
         #: whether a step is hidden at the moment it becomes current (01 §2);
@@ -488,6 +492,8 @@ class MuonSetup:
 
     async def close(self) -> None:
         self._closed = True
+        if muon_floor._setup_complete_source == self.complete_for_floor:
+            muon_floor.set_setup_complete_source(None)
         if self._lapse_timer is not None:
             self._lapse_timer.cancel()
         if self._nearby_timer is not None:
@@ -644,6 +650,13 @@ class MuonSetup:
             self.doc is None or self.read_only_version is not None
             or self.doc["state"] == "complete"
         )
+
+    def complete_for_floor(self) -> bool:
+        """For muon_floor.check_bluetooth: complete once the state says so,
+        a newer build's read-only state included. Unlike is_complete, "not
+        known yet" is NOT complete: there the narrower side is the other one,
+        a Bluetooth phone held to the setup routes."""
+        return self.doc is not None and self.doc["state"] == "complete"
 
     def classify(self, webreq: WebRequest) -> str:
         """The caller's kind (02 §3). A `bluetooth` caller's code also

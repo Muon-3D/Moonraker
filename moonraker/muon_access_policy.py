@@ -38,6 +38,20 @@
 #   * any other caller on the LAN or the hotspot, while the entry is Open: a
 #     signed-out guest with Operator, "anyone at home" (ACC-7). While the entry
 #     is Protected it is not admitted (ACC-5).
+#   * KAN-436, ADR 0032 D4: a phone setting the printer up over Bluetooth,
+#     which muon-link forwards as 192.0.2.2 with the gateway's token while
+#     setup is not complete. It may be a stranger in radio range, so it gets
+#     the least there is: the principal `bluetooth`, a signed-out guest, never
+#     on the home network, never identified, never trusted, and allowed
+#     exactly the setup routes (muon_floor.BLUETOOTH_SETUP_PREFIXES, which
+#     muon_setup and muon_link police per caller themselves) and nothing in
+#     the table besides, whatever the token carries. muon_floor.check_bluetooth
+#     already refuses the rest before this module; this holds it again, and
+#     keeps the capability list and the file and notification filters honest.
+#     Once setup is complete, 192.0.2.2 is a paired client whose connection
+#     started on Bluetooth (muon-link admits no stranger then): it is decided
+#     as a paired client through the gateway, except that it is never on the
+#     home network, whatever its token says.
 #
 # Nobody else is admitted: a request from the gateway's address without the
 # gateway's token, or with no address at all (MQTT), is refused everything.
@@ -376,7 +390,7 @@ def overridable(action_name: str) -> bool:
 
 @dataclasses.dataclass(frozen=True)
 class Principal:
-    #: panel, internal, gateway, password or home
+    #: panel, internal, gateway, password, home or bluetooth
     kind: str
     name: str
     level: int
@@ -418,6 +432,38 @@ def _gateway_principal(user: Any) -> Principal:
     return Principal("gateway", name, level, role, home, True)
 
 
+#: KAN-436: the principal of a phone setting the printer up over Bluetooth.
+BLUETOOTH = "bluetooth"
+#: The rows of the table a Bluetooth setup principal may do: muon_setup's and
+#: the link's, both delegated to the component behind them. What it may reach
+#: is decided by endpoint (muon_floor.BLUETOOTH_SETUP_PREFIXES); these are
+#: only what the capability list reports.
+BLUETOOTH_ACTIONS = frozenset(("setup", "owner"))
+BLUETOOTH_REASON = (
+    "a phone setting this printer up over Bluetooth reaches the setup routes "
+    "only"
+)
+#: The one notification a Bluetooth setup principal is sent, were it ever to
+#: hold a websocket (muon_floor refuses it one): muon_setup's own.
+BLUETOOTH_NOTIFICATIONS = frozenset(("muon_setup_changed",))
+
+
+def _bluetooth_principal(
+    transport: Optional[Any], ip_addr: Optional[Any], user: Any
+) -> Principal:
+    """192.0.2.2 with the gateway's token. Before setup is complete, the
+    Bluetooth setup principal: the lowest level, a Viewer's role, not home,
+    not identified, whatever the token names. After, the paired client the
+    token names, never on the home network."""
+    if muon_floor.bluetooth_setup_caller(transport, ip_addr):
+        name = str(getattr(user, "username", "") or "")
+        return Principal(
+            BLUETOOTH, f"bluetooth:{name}", SIGNED_OUT_GUEST, VIEWER, False,
+            False,
+        )
+    return dataclasses.replace(_gateway_principal(user), home=False)
+
+
 def _is_password_user(user: Any) -> bool:
     return (
         user is not None
@@ -445,6 +491,8 @@ def resolve_principal(
             user is not None
             and getattr(user, "source", None) == muon_floor.GATEWAY_USER_SOURCE
         ):
+            if muon_floor.is_bluetooth_address(ip_addr):
+                return _bluetooth_principal(transport, ip_addr, user)
             return _gateway_principal(user)
         # From away with no token: nobody is admitted anonymously (SEC-1).
         return None
@@ -731,6 +779,12 @@ def decide_action(
         return Decision(False, action.name, reason)
     if principal.level >= PANEL:
         return Decision(True, action.name)
+    if principal.kind == BLUETOOTH:
+        # Before the role, the level or any setting: no preset or override
+        # gives a phone being set up over Bluetooth more (KAN-436).
+        if action.name in BLUETOOTH_ACTIONS:
+            return Decision(True, action.name)
+        return Decision(False, action.name, BLUETOOTH_REASON)
     if principal.role == VIEWER and not (action.read or action.viewer_allowed):
         return Decision(False, action.name, "a Viewer can only watch")
     if action.delegated:
@@ -794,6 +848,13 @@ def check_access(
         transport, ip_addr, user, current.entry, current.home
     )
     actions = classify(endpoint, request_type, args)
+    if principal is not None and principal.kind == BLUETOOTH:
+        # KAN-436: the setup routes, by endpoint, and nothing else. Their
+        # reads classify as "read", which the table could refuse under a
+        # strict preset; muon_setup and muon_link decide their own callers.
+        if muon_floor.is_bluetooth_setup_endpoint(endpoint):
+            return
+        raise refusal(Decision(False, actions[0].name, BLUETOOTH_REASON))
     if principal is None and at_home_unadmitted(actions, ip_addr, current):
         return
     if _files is not None and principal is not None:
@@ -868,6 +929,15 @@ async def prepare_file_operation(web_request: Any, args: Mapping[str, Any]) -> N
 
 
 def filter_notification(name: str, data: Any, connection: Any) -> Any:
+    current = _state
+    if (
+        current is not None
+        and muon_floor.bluetooth_setup_caller(connection, connection.ip_addr)
+        and name not in BLUETOOTH_NOTIFICATIONS
+    ):
+        # KAN-436: muon_floor refuses a Bluetooth phone a websocket while
+        # setup is open; were one ever open, it hears muon_setup and no more.
+        return None
     if _files is None or name not in ("filelist_changed", "history_changed"):
         return data
     principal = _file_principal(connection, connection.ip_addr, connection.user_info)
