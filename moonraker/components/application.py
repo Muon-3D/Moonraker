@@ -616,9 +616,10 @@ class DynamicRequestHandler(AuthorizedRequestHandler):
         func = type_funcs[hint]
         try:
             converted = func(value)
-        except Exception:
-            logging.exception("Argument conversion error: Hint: "
-                              f"{hint}, Arg: {value}")
+        except Exception as error:
+            # Values and conversion exception messages may carry credentials.
+            logging.error("Argument conversion error: Hint: %s, Error: %s",
+                          hint, type(error).__name__)
             return value
         return converted
 
