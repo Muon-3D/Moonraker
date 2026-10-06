@@ -95,6 +95,7 @@ from .muon_access_api import DATA_MODES, AccessApi
 
 from .. import muon_access_policy as policy
 from .. import muon_floor
+from .. import muon_db
 from ..common import RequestType
 
 if TYPE_CHECKING:
@@ -161,7 +162,7 @@ class MuonAccess:
                 "[muon_access] needs [muon_protection] while it writes the "
                 "entry to muon_protection.level for rollback"
             )
-        database = self.server.lookup_component("database")
+        database = self.database = self.server.lookup_component("database")
         self.db = database.register_local_namespace(NAMESPACE, forbidden=True)
         self.record: Dict[str, Any] = new_record(policy.ENTRY_PROTECTED, None)
         self.owner = policy.OWNER_UNKNOWN
@@ -201,7 +202,7 @@ class MuonAccess:
 
     async def component_init(self) -> None:
         try:
-            stored = await self.db.get(RECORD_KEY, None)
+            _, stored = await muon_db.read(self.database, NAMESPACE, RECORD_KEY)
             old_level = await self._old_level()
         except Exception:
             logging.exception(
@@ -221,7 +222,9 @@ class MuonAccess:
             )
             self._publish()
             return
-        if not self.dual_write and record.get("written_level") is not None:
+        if not self.dual_write and (
+            old_level is not None or record.get("written_level") is not None
+        ):
             # The rollback window is over: the old key goes, once.
             try:
                 await self.protection_delete_level()
@@ -250,12 +253,16 @@ class MuonAccess:
 
     async def _old_level(self) -> Optional[int]:
         if self.protection is None:
-            return None
+            _, level = await muon_db.read(
+                self.database, "muon_protection", "level")
+            return level
         return await self.protection.stored_level()
 
     async def protection_delete_level(self) -> None:
         if self.protection is not None:
             await self.protection.delete_level()
+        else:
+            await muon_db.delete(self.database, "muon_protection", "level")
 
     def _reconcile(
         self, stored: Any, old_level: Optional[int]

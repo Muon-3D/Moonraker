@@ -40,7 +40,7 @@ class Namespace:
 
     async def get(self, key: str, default: Any = None) -> Any:
         if self.fail_get:
-            raise RuntimeError("database unreadable")
+            return default  # Like get_item: a default swallows read errors.
         return self.values.get(key, default)
 
     async def insert(self, key: str, value: Any) -> None:
@@ -63,6 +63,19 @@ class Database:
 
     def ns(self, name: str) -> Namespace:
         return self.namespaces.setdefault(name, Namespace())
+
+    async def get_batch(self, namespace: str, keys: List[str]) -> Dict[str, Any]:
+        ns = self.ns(namespace)
+        if ns.fail_get:
+            raise RuntimeError("database unreadable")
+        return {key: ns.values[key] for key in keys if key in ns.values}
+
+    async def delete_batch(self, namespace: str, keys: List[str]) -> None:
+        ns = self.ns(namespace)
+        if ns.fail_delete:
+            raise RuntimeError("database read-only")
+        for key in keys:
+            ns.values.pop(key, None)
 
     def register_local_namespace(
         self, namespace: str, forbidden: bool = False, parse_keys: bool = False
