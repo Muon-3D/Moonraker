@@ -23,8 +23,9 @@ from tornado.routing import Rule, PathMatches, RuleRouter
 from tornado.http1connection import HTTP1Connection
 from tornado.httpserver import HTTPServer
 from tornado.log import access_log
-from ..utils import ServerError, source_info, parse_ip_address
+from ..utils import ServerError, source_info, parse_ip_address, redact
 from ..utils.real_ip import validate_real_ip_header
+from .. import muon_access_policy
 from ..common import (
     JsonRPC,
     WebRequest,
@@ -615,9 +616,10 @@ class DynamicRequestHandler(AuthorizedRequestHandler):
         func = type_funcs[hint]
         try:
             converted = func(value)
-        except Exception:
-            logging.exception("Argument conversion error: Hint: "
-                              f"{hint}, Arg: {value}")
+        except Exception as error:
+            # Values and conversion exception messages may carry credentials.
+            logging.error("Argument conversion error: Hint: %s, Error: %s",
+                          hint, type(error).__name__)
             return value
         return converted
 
@@ -678,6 +680,9 @@ class DynamicRequestHandler(AuthorizedRequestHandler):
                     endpoint.startswith("/machine/sudo/password")
                 ):
                     resp = {key: "<sanitized>" for key in args}
+                else:
+                    # MUON: names and secrets never reach the log
+                    resp = redact.redact(args)
             elif isinstance(args, str):
                 if args.startswith("<html>"):
                     resp = "<html>"
@@ -787,6 +792,12 @@ class FileRequestHandler(AuthorizedFileHandler):
         endpoint = app.parse_endpoint(self.request.path or "")
         path = endpoint.lstrip("/").split("/", 2)[-1]
         path = url_unescape(path, plus=False)
+        # MUON, ACC-23: this handler does not pass APIDefinition.request, so
+        # the level table is applied here, as a delete_file of the same path.
+        _check_file_access(
+            self.request, self.current_user, "/server/files/delete_file",
+            RequestType.DELETE, {"path": path},
+        )
         file_manager: FileManager
         file_manager = self.server.lookup_component('file_manager')
         try:
@@ -797,6 +808,16 @@ class FileRequestHandler(AuthorizedFileHandler):
         self.finish(jsonw.dumps({'result': filename}))
 
     async def get(self, path: str, include_body: bool = True) -> None:
+        # MUON, ACC-31: a download is a read of that file, and this handler
+        # does not pass APIDefinition.request.
+        app_: MoonrakerApp = self.server.lookup_component("application")
+        _check_file_access(
+            self.request, self.current_user, "/server/files/download",
+            RequestType.GET,
+            {"path": url_unescape(
+                app_.parse_endpoint(self.request.path or "").lstrip("/")
+                .split("/", 2)[-1], plus=False)},
+        )
         # Set up our path instance variables.
         self.path = self.parse_url_path(path)
         del path  # make sure we don't refer to path instead of self.path again
@@ -933,6 +954,23 @@ class FileRequestHandler(AuthorizedFileHandler):
     def _get_cached_version(cls, abs_path: str) -> Optional[str]:
         return None
 
+def _check_file_access(
+    request: tornado.httputil.HTTPServerRequest,
+    user: Any,
+    endpoint: str,
+    request_type: RequestType,
+    args: Dict[str, Any],
+) -> None:
+    """The level table for the file handlers that bypass APIDefinition."""
+    try:
+        muon_access_policy.check_access(
+            endpoint, request_type, args, None,
+            parse_ip_address(request.remote_ip or ""), user,
+        )
+    except ServerError as e:
+        raise tornado.web.HTTPError(e.status_code, reason=str(e)) from e
+
+
 @tornado.web.stream_request_body
 class FileUploadHandler(AuthorizedRequestHandler):
     def initialize(self,
@@ -959,6 +997,13 @@ class FileUploadHandler(AuthorizedRequestHandler):
         fm: FileManager = self.server.lookup_component("file_manager")
         fm.check_write_enabled()
         if self.request.method == "POST":
+            # MUON, ACC-23: uploads do not pass APIDefinition.request. Refuse
+            # before the body arrives when the caller may not upload to the
+            # gcodes root at all; post() checks the root it names.
+            _check_file_access(
+                self.request, self.current_user, "/server/files/upload",
+                RequestType.POST, {},
+            )
             assert isinstance(self.request.connection, HTTP1Connection)
             self.request.connection.set_max_body_size(self.max_upload_size)
             tmpname = self.file_manager.gen_temp_upload_path()
@@ -1013,6 +1058,25 @@ class FileUploadHandler(AuthorizedRequestHandler):
                 form_args[name] = target.value.decode()
         form_args['filename'] = mp_fname
         form_args['tmp_file_path'] = self._file.filename
+        try:
+            # MUON, ACC-30/34: the drive it goes to and its uploader tag
+            plan = muon_access_policy.plan_upload(
+                parse_ip_address(self.request.remote_ip or ""),
+                self.current_user, form_args,
+            )
+        except ServerError as e:
+            self._remove_temp_file()
+            raise tornado.web.HTTPError(e.status_code, reason=str(e)) from e
+        try:
+            _check_file_access(
+                self.request, self.current_user, "/server/files/upload",
+                RequestType.POST,
+                {"root": form_args.get("root", "gcodes"),
+                 "print": form_args.get("print", "false")},
+            )
+        except tornado.web.HTTPError:
+            self._remove_temp_file()
+            raise
         debug_msg = "\nFile Upload Arguments:"
         for name, value in form_args.items():
             debug_msg += f"\n{name}: {value}"
@@ -1021,10 +1085,14 @@ class FileUploadHandler(AuthorizedRequestHandler):
         logging.debug(debug_msg)
         logging.info(f"Processing Uploaded File: {mp_fname}")
         try:
+            # Persist the tag before the file or its notifications are visible.
+            await muon_access_policy.prepare_upload(plan)
             result = await self.file_manager.finalize_upload(form_args)
         except ServerError as e:
+            self._remove_temp_file()
             raise tornado.web.HTTPError(
                 e.status_code, str(e))
+        result.update(muon_access_policy.finish_upload(plan, result))
         # Return 201 and add the Location Header
         item: Dict[str, Any] = result.get('item', {})
         root: Optional[str] = item.get('root', None)

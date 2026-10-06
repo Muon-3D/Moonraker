@@ -319,6 +319,14 @@ class GCodePreprocessorComponent:
         await self._invoke_preprocessor(path)
         eventloop = self.server.get_event_loop()
         await eventloop.run_in_thread(self._write_marker, path)
+        # B9-MR-1. The bytes are final here -- excluded-zone pass done, marker
+        # written -- so this is where the drawing of the part is made, and its
+        # file offsets are the ones Klipper will report. muon_toolpath opens
+        # the file before returning and reads it in the background, so the
+        # upload does not wait for it; it never raises.
+        toolpath = self.server.lookup_component("muon_toolpath", None)
+        if toolpath is not None:
+            toolpath.build_soon(path)
 
     async def ensure_verified(self, filename: str) -> None:
         """Print-time gate.  ``filename`` is relative to the gcodes root.

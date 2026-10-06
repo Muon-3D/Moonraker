@@ -15,8 +15,10 @@ import time
 from enum import Enum, Flag, auto
 from abc import ABCMeta, abstractmethod
 from .utils import Sentinel
+from .utils import redact
 from .utils import json_wrapper as jsonw
 from .utils.exceptions import ServerError, AgentError
+from . import muon_access_policy
 from . import muon_floor
 
 # Annotation imports
@@ -242,15 +244,24 @@ class APIDefinition:
         # arrive here, so a deny placed here covers the websocket's post-upgrade
         # JSON-RPC calls -- which authenticate once and are never matched
         # against a path again -- as well as plain HTTP.  See muon_floor.py.
-        muon_floor.check_floor(self.endpoint, transport, ip_addr)
+        muon_floor.check_floor(self.endpoint, transport, ip_addr, request_type)
         # MUON, SEC-8: the same convergence point, for the level the owner
         # chose. After the floor, so a floor surface keeps the floor's reason.
         muon_floor.check_protection(self.endpoint, transport, ip_addr, user)
-        return self.callback(
-            WebRequest(
-                self.endpoint, args, request_type, transport, ip_addr, user,
-                http_headers
-            )
+        # MUON, ACC-23: the level table, once the floor and the level have
+        # passed. A no-op without [muon_access]. See muon_access_policy.py.
+        muon_access_policy.check_access(
+            self.endpoint, request_type, args, transport, ip_addr, user
+        )
+        # MUON, ACC-30/31: listings show only the files this caller may see.
+        return muon_access_policy.filter_result(
+            self.endpoint, request_type, args, transport, ip_addr, user,
+            self.callback(
+                WebRequest(
+                    self.endpoint, args, request_type, transport, ip_addr,
+                    user, http_headers
+                )
+            ),
         )
 
     @property
@@ -742,6 +753,8 @@ class JsonRPC:
                 for field in ["access_token", "api_key"]:
                     if field in params:
                         output["params"][field] = "<sanitized>"
+        # MUON: names and secrets never reach the log (utils/redact.py)
+        output = redact.redact(output)
         logging.debug(f"{trtype} Received::{jsonw.dumps(output).decode()}")
 
     def _log_response(
@@ -756,6 +769,7 @@ class JsonRPC:
             output = copy.deepcopy(resp_obj)
             output["result"] = "<sanitized>"
         self.sanitize_response = False
+        output = redact.redact(output)
         logging.debug(f"{trtype} Response::{jsonw.dumps(output).decode()}")
 
     def register_method(

@@ -48,6 +48,22 @@
 # accepted only on a request that carries that address -- and a paired
 # session's token, bound to 192.0.2.1, is refused there. muon_setup reads the
 # pair (this component's user, 192.0.2.2) as the caller class `bluetooth`.
+#
+# THE PRINCIPAL (ACC-7, ACC-11; access-model section 5)
+#
+# muon-link may also say who the client is, for `muon_access`'s level table:
+#
+#     {"client": "<hex>", "principal": "<id>", "level": "member",
+#      "role": "operator", "home": false}
+#
+# `level` is one of signed_out_guest, signed_in_guest, member or admin, and
+# `role` is operator or viewer; the two come together or not at all.
+# `principal` names the person or device (default: the client), and `home`
+# says the session's path is on the printer's own network (default: false, so
+# a home-only action is refused unless muon-link vouches for the path). The
+# user the token carries holds them, and a request is decided on them. A
+# request without them is the gateway as it was: muon-link's policy is the
+# only limit, and `muon_access` treats it as admin with Operator.
 
 from __future__ import annotations
 
@@ -60,9 +76,11 @@ import re
 import socket
 import stat
 import struct
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional, Set, Tuple, Union
 
+from .. import muon_access_policy
 from ..common import UserInfo
 
 if TYPE_CHECKING:
@@ -80,14 +98,29 @@ BLUETOOTH_SENTINEL = ipaddress.ip_address("192.0.2.2")
 #: the token to. Absent means the paired-session sentinel, as before KAN-436.
 TRANSPORT_ADDRESSES = {"bluetooth": BLUETOOTH_SENTINEL}
 
-#: The longest request line accepted.
-#: `{"client":"<64 hex>","transport":"bluetooth"}` is 101 bytes.
-MAX_REQUEST = 256
+#: The longest request line accepted. The longest valid request -- a 64-hex
+#: client, a 128-character principal, the longest level, a role, `home` and
+#: `"transport": "bluetooth"`, written with json.dumps' default spacing -- is
+#: under 350 bytes; this leaves room for a field or two more without accepting
+#: anything unbounded.
+MAX_REQUEST = 512
 
 #: How long a connected peer may take to send its request.
 READ_TIMEOUT = 2.0
 
 _CLIENT_RE = re.compile(r"^[0-9a-f]{1,64}$")
+_PRINCIPAL_RE = re.compile(r"^[A-Za-z0-9._:@+-]{1,128}$")
+
+
+@dataclass
+class GatewayUser(UserInfo):
+    """The user a gateway token carries, with the principal muon-link named.
+    None for the level and role is a muon-link that named none."""
+    principal: str = ""
+    access_level: Optional[str] = None
+    access_role: Optional[str] = None
+    access_home: bool = False
+
 
 IPAddress = Union[ipaddress.IPv4Address, ipaddress.IPv6Address]
 
@@ -101,6 +134,15 @@ def peer_uid(sock: socket.socket) -> int:
     return uid
 
 
+def _load_request(line: bytes) -> Dict[str, Any]:
+    if len(line) > MAX_REQUEST:
+        raise ValueError("request too long")
+    request = json.loads(line.decode("utf-8"))
+    if not isinstance(request, dict):
+        raise ValueError("request is not an object")
+    return request
+
+
 def parse_token_request(line: bytes) -> Tuple[str, IPAddress]:
     """The client fingerprint and the address to bind its token to, from one
     request line, or ValueError.
@@ -111,11 +153,7 @@ def parse_token_request(line: bytes) -> Tuple[str, IPAddress]:
     transport this component does not know must not get a token for one it
     does.
     """
-    if len(line) > MAX_REQUEST:
-        raise ValueError("request too long")
-    request = json.loads(line.decode("utf-8"))
-    if not isinstance(request, dict):
-        raise ValueError("request is not an object")
+    request = _load_request(line)
     client = request.get("client")
     if not isinstance(client, str) or not _CLIENT_RE.match(client):
         raise ValueError("client must be lower-case hex")
@@ -130,6 +168,38 @@ def parse_token_request(line: bytes) -> Tuple[str, IPAddress]:
 def parse_request(line: bytes) -> str:
     """The client fingerprint from one request line, or ValueError."""
     return parse_token_request(line)[0]
+
+
+def parse_principal(line: bytes) -> Dict[str, Any]:
+    """The principal fields of one request line, checked, or ValueError.
+    Empty when muon-link named no principal."""
+    request = _load_request(line)
+    level = request.get("level")
+    role = request.get("role")
+    principal = request.get("principal")
+    home = request.get("home", False)
+    if level is None and role is None:
+        if principal is not None or "home" in request:
+            raise ValueError("principal and home need a level and a role")
+        return {}
+    if level not in muon_access_policy.PRINCIPAL_LEVELS:
+        raise ValueError(
+            f"level must be one of {sorted(muon_access_policy.PRINCIPAL_LEVELS)}"
+        )
+    if role not in muon_access_policy.ROLES:
+        raise ValueError(f"role must be one of {list(muon_access_policy.ROLES)}")
+    if principal is not None and (
+        not isinstance(principal, str) or not _PRINCIPAL_RE.match(principal)
+    ):
+        raise ValueError("principal must be 1-128 of [A-Za-z0-9._:@+-]")
+    if not isinstance(home, bool):
+        raise ValueError("home must be true or false")
+    fields: Dict[str, Any] = {
+        "access_level": level, "access_role": role, "access_home": home,
+    }
+    if principal is not None:
+        fields["principal"] = principal
+    return fields
 
 
 class MuonGateway:
@@ -183,16 +253,18 @@ class MuonGateway:
             )
             try:
                 client, address = parse_token_request(line.rstrip(b"\n"))
+                fields = parse_principal(line.rstrip(b"\n"))
             except (ValueError, UnicodeDecodeError) as err:
                 self.refused += 1
                 logging.info("muon_gateway: malformed token request: %s", err)
                 await self._reply(writer, {"error": "malformed"})
                 return
             auth = self.server.lookup_component("authorization")
-            user = UserInfo(
+            user = GatewayUser(
                 username=f"muon-link:{client[:16]}",
                 password="",
                 source="muon_gateway",
+                **fields,
             )
             token = auth.get_oneshot_token(address, user)
             self.minted += 1
