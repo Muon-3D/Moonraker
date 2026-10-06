@@ -357,9 +357,10 @@ class AuxAutoProxy:
                 body = "" if method in ("POST", "PUT", "PATCH") else None
                 headers = {}
 
-            # Debug log
+            # Arguments can include reusable credentials, Wi-Fi keys and the
+            # waiver signer's name. Log the operation, never request values.
             self.log.debug(
-                f"Proxying → {method} {url!r} headers={headers!r} body={body!r}"
+                "Proxying → %s %s", method, fast_path
             )
 
             # Forward

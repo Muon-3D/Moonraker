@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import json
+import logging
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
@@ -35,6 +36,18 @@ import pytest
 
 from moonraker.components import aux_api_proxy
 from moonraker.components.aux_api_proxy import AuxAutoProxy
+
+
+def test_developer_reentry_credentials_are_forwarded_but_never_logged(caplog):
+    proxy, server, client = make_proxy()
+    proxy._register_from_spec({"paths": {"/dev_mode": {"post": {"requestBody": {}}}}})
+    credentials = {"enabled": True, "reentry_token": "test-only-reentry-credential"}
+    with caplog.at_level(logging.DEBUG, logger="wifi_autoproxy"):
+        asyncio.run(server.handler_for("/server/aux/dev_mode")(
+            FakeWebRequest(action="POST", args=credentials)))
+    assert json.loads(client.last["body"]) == credentials
+    assert credentials["reentry_token"] not in caplog.text
+    assert "Proxying" in caplog.text
 
 
 # --------------------------------------------------------------------------
