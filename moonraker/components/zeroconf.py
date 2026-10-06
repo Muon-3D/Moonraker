@@ -40,6 +40,39 @@ OCTO_VERSION = "1.5.0"
 # Upper bound on how long shutdown will wait for an in progress rebind
 ZC_REBIND_CLOSE_TIMEOUT = 5.
 
+# MUON (KAN-475, MR-8): the TXT keys OrcaSlicer's Bonjour dialog reads from a
+# Muon printer's OctoPrint record (OrcaSlicer#4, OR-2).
+MUON_TXT_KEYS = ("name", "setup")
+MUON_SETUP_STATES = ("new", "in_progress", "complete")
+
+def _muon_txt(state: Dict[str, Any]) -> Dict[str, str]:
+    """`name` and `setup` from a muon_setup public state.
+
+    `name` is the identity's display form ("Walnut · 8987"), else its
+    name, else the name step's value: the name the owner knows the printer
+    by, which follows a rename. `setup` is the state verbatim. A key with
+    nothing trustworthy to say is left out rather than guessed, which the
+    slicer reads as "no status"."""
+    txt: Dict[str, str] = {}
+    if not isinstance(state, dict):
+        return txt
+    printer = state.get("printer") or {}
+    steps = state.get("steps") or {}
+    name_step = steps.get("name") if isinstance(steps, dict) else None
+    for candidate in (
+        printer.get("display") if isinstance(printer, dict) else None,
+        printer.get("name") if isinstance(printer, dict) else None,
+        name_step.get("value") if isinstance(name_step, dict) else None,
+    ):
+        if isinstance(candidate, str) and candidate.strip():
+            # A TXT string is at most 255 bytes, "name=" included.
+            txt["name"] = candidate.strip().encode()[:250].decode(
+                "utf-8", "ignore")
+            break
+    if state.get("state") in MUON_SETUP_STATES:
+        txt["setup"] = state["state"]
+    return txt
+
 def _fmt_addresses(addresses: Iterable[bytes]) -> str:
     parsed = sorted(str(ipaddress.ip_address(addr)) for addr in addresses)
     return ", ".join(parsed) if parsed else "none"
@@ -181,7 +214,25 @@ class ZeroconfRegistrar:
         self.octoprint_addr_pref: str = config.get(
             "octoprint_addr_pref", "ip"
         ).lower()
+        # MUON (KAN-475, MR-8): the port the records name. [server] port is
+        # where Moonraker listens, which behind a reverse proxy is not where a
+        # client on the network can reach it: the M1 binds 127.0.0.1:7125 and
+        # serves the LAN through nginx on 80.
+        self.advertised_port: Optional[int] = config.getint(
+            "advertised_port", None, minval=1, maxval=65535)
+        # MUON (KAN-475, MR-8): the `name` and `setup` TXT keys a Muon-aware
+        # slicer reads from the OctoPrint record (OrcaSlicer OR-2), taken from
+        # muon_setup and re-announced whenever either changes. Empty until
+        # muon_setup has decided what this printer is: no `setup` key reads
+        # as "no status", which is better than a guessed one.
+        self.muon_txt: Dict[str, str] = {}
+        self.server.register_event_handler(
+            "muon_setup:muon_setup_changed", self._muon_setup_changed)
         self.service_list: List[AsyncServiceInfo] = []
+        self.octo_service_info: Optional[AsyncServiceInfo] = None
+        # Set once the records are on the network. Until then a change only
+        # updates `muon_txt`, and component_init catches up when it is done.
+        self.registered: bool = False
 
     async def component_init(self) -> None:
         logging.info("Starting Zeroconf services")
@@ -252,11 +303,16 @@ class ZeroconfRegistrar:
                 addresses = [host_addr.packed]
         zc_service_name = f"{instance_name} @ {host}.{ZC_SERVICE_TYPE}"
         server_name = self.mdns_name or instance_name.lower()
+        port = self.advertised_port or hi["port"]
+        setup = self.server.lookup_component("muon_setup", None)
+        if setup is not None and getattr(setup, "doc", None) is not None:
+            # Already decided; otherwise its first change event fills these.
+            self.muon_txt = _muon_txt(setup.public_state())
         self.service_info = AsyncServiceInfo(
             ZC_SERVICE_TYPE,
             zc_service_name,
             addresses=addresses,
-            port=hi["port"],
+            port=port,
             properties=zc_service_props,
             server=f"{server_name}.local.",
         )
@@ -266,17 +322,21 @@ class ZeroconfRegistrar:
                 "version": OCTO_VERSION,
                 "model": self.octo_model_name,
                 "addr_pref": self.octoprint_addr_pref,
+                **self.muon_txt,
             }
             self.octo_service_info = AsyncServiceInfo(
                 OCTO_SERVICE_TYPE,
                 f"{instance_name} {host}.{OCTO_SERVICE_TYPE}",
                 addresses=addresses,
-                port=hi["port"],
+                port=port,
                 properties=octo_props,
                 server=f"{server_name}.local.",
             )
             self.service_list.append(self.octo_service_info)
         await self.runner.register_services(self.service_list, addresses)
+        self.registered = True
+        # A change that arrived while the records were being probed.
+        await self._announce_muon_txt()
         if self.ssdp_server is not None:
             addr = self.cfg_addr if not self.bound_all else machine.public_ip
             if not addr:
@@ -285,12 +345,51 @@ class ZeroconfRegistrar:
             if len(name) > 64:
                 name = instance_name
             await self.ssdp_server.start()
-            self.ssdp_server.register_service(name, addr, hi["port"])
+            self.ssdp_server.register_service(name, addr, port)
 
     async def close(self) -> None:
         await self.runner.unregister_services(self.service_list)
         if self.ssdp_server is not None:
             await self.ssdp_server.stop()
+
+    async def _muon_setup_changed(self, state: Dict[str, Any]) -> None:
+        # MUON (KAN-475, MR-8). Re-announce the OctoPrint record when the
+        # printer's name or setup state changes, so a slicer browsing now
+        # sees "Needs setup" turn to "Ready" without a restart.
+        self.muon_txt = _muon_txt(state)
+        if self.registered:
+            await self._announce_muon_txt()
+
+    async def _announce_muon_txt(self) -> None:
+        old = self.octo_service_info
+        if old is None:
+            return
+        props: Dict[str, Optional[str]] = {
+            k.decode(): (v.decode() if v is not None else None)
+            for k, v in old.properties.items()
+        }
+        current = {k: props.pop(k) for k in MUON_TXT_KEYS if k in props}
+        if current == self.muon_txt:
+            return
+        props.update(self.muon_txt)
+        # A fresh info rather than mutating the registered one: zeroconf
+        # caches the TXT record on the info, and the registry replaces an
+        # entry by name. `old.name` is the name it was registered under,
+        # including any rename allow_name_change made.
+        new = AsyncServiceInfo(
+            old.type,
+            old.name,
+            addresses=old.addresses_by_version(IPVersion.All),
+            port=old.port,
+            properties=props,
+            server=old.server,
+        )
+        self.service_list[self.service_list.index(old)] = new
+        self.octo_service_info = new
+        try:
+            await self.runner.update_services([new])
+        except Exception:
+            logging.exception("Zeroconf: error re-announcing the OctoPrint record")
 
     async def _update_service(self, network: Dict[str, Any]) -> None:
         if self.bound_all:
