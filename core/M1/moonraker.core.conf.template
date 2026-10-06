@@ -231,6 +231,17 @@ admin_address: 127.0.0.1:7131
 # section the level cannot be raised at all, and the printer is Open for good.
 [muon_protection]
 
+# ACC-23: the access model's level table for every request, the
+# server.muon.access.* API and drives with private uploads
+# (components/muon_access.py). It keeps the protection level in its own record
+# and writes every change of the entry to [muon_protection] too, so an A/B
+# rollback to a release without this section never reopens a Protected
+# printer. Leave dual_write_protection_level at its default (True) until every
+# printer has committed a release with this section to both slots; the
+# component's header says when it may be turned off. The owner comes from
+# [muon_link] above.
+[muon_access]
+
 # KAN-162: start the bed ramp when a job is queued instead of at the top
 # of PRINT_START.  This turns on the 170W bed heater with no human input,
 # so the component itself defaults to disabled -- enabling it is an

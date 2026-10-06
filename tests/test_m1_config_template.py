@@ -85,3 +85,21 @@ def test_m1_image_serves_the_toolpath_for_the_live_model():
 
     assert config.has_section("muon_toolpath")
     assert config.has_section("gcode_preprocessor")
+
+
+def test_m1_image_runs_the_access_model_with_the_rollback_dual_write():
+    """ACC-23: without the section the level table, the access API and private
+    uploads never load. It needs [muon_protection] for the dual write and
+    [muon_link] for the owner, and the dual write must stay on while a
+    rollback can boot a release that only reads muon_protection.level."""
+    config = configparser.ConfigParser(interpolation=None)
+    config.read(TEMPLATE, encoding="utf-8")
+
+    assert config.has_section("muon_access")
+    assert config.has_section("muon_protection")
+    assert config.has_section("muon_link")
+    assert config.getboolean(
+        "muon_access", "dual_write_protection_level", fallback=True
+    ) is True
+    sections = config.sections()
+    assert sections.index("muon_access") > sections.index("muon_protection")
