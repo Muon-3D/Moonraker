@@ -110,6 +110,17 @@ class TestTheHttpHandler:
         )
         assert NAME not in caplog.text
 
+    @pytest.mark.parametrize("hint", ["int", "float", "json"])
+    def test_query_conversion_errors_do_not_log_credentials(self, caplog, hint):
+        caplog.set_level(logging.DEBUG)
+        credential = "test-only-reentry-credential"
+        result = application.DynamicRequestHandler._convert_type(
+            self._Handler(), credential, hint
+        )
+        assert result == credential
+        assert credential not in caplog.text
+        assert hint in caplog.text
+
 
 class TestJsonRpc:
     @pytest.mark.parametrize("method", [
