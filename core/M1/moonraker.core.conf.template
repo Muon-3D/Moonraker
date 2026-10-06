@@ -126,7 +126,12 @@ force_logins: true
 # `*://my.fluidd.xyz` and `*://*.lan` go with it. We ship Fluidd in the image,
 # so trusting the hosted copy buys a customer nothing while letting any page
 # served from that domain drive the machine; and `.lan` is a suffix no Muon
-# address uses (WEB-1: `muon3d.local` and `app.muon3d.com`, nothing else).
+# address uses (WEB-1: `muon3d.local` and `control.muon3d.com`, nothing else).
+#
+# `control.muon3d.com` is the console's name (ADR 0025). `app.muon3d.com`
+# stays until its redirect covers every caller (WEB-8, KAN-414): the hosted
+# Fluidd moves to the new name only after printers admit it, which needs this
+# entry baked into an image first.
 #
 # The two localhost entries are not wildcards and are not reachable from the
 # network -- a page can only be served from them by a process already on the
@@ -134,6 +139,7 @@ force_logins: true
 # server.
 cors_domains:
     *://*.local
+    *://control.muon3d.com
     *://app.muon3d.com
     *://localhost:100 #Access for MuonUI Local Service
     *://localhost:5173 #Acces for MuonUI Dev Server
