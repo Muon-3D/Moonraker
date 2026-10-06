@@ -18,6 +18,7 @@ from ..common import (
 from ..utils import ServerError, parse_ip_address
 from ..utils.real_ip import validate_real_ip_header
 from .. import muon_access_policy
+from .. import muon_floor
 
 # Annotation imports
 from typing import (
@@ -326,6 +327,12 @@ class WebSocket(WebSocketHandler, BaseRemoteConnection):
     # Check Authorized User
     async def prepare(self) -> None:
         validate_real_ip_header(self.request.headers)
+        # MUON, KAN-436: no websocket for a phone setting the printer up over
+        # Bluetooth. Its calls would be held to the setup routes anyway, but
+        # the broadcasts (the console, Klippy's state) reach every socket.
+        muon_floor.check_bluetooth(
+            "/websocket", None, parse_ip_address(self.request.remote_ip or "")
+        )
         max_conns = self.settings["max_websocket_connections"]
         if self.__class__.connection_count >= max_conns:
             raise self.server.error(
@@ -475,6 +482,11 @@ class BridgeSocket(WebSocketHandler):
     # Check Authorized User
     async def prepare(self) -> None:
         validate_real_ip_header(self.request.headers)
+        # MUON, KAN-436: nor Klippy's own socket (see WebSocket.prepare).
+        muon_floor.check_bluetooth(
+            "/klippysocket", None,
+            parse_ip_address(self.request.remote_ip or ""),
+        )
         max_conns = self.settings["max_websocket_connections"]
         if WebSocket.connection_count >= max_conns:
             raise self.server.error(

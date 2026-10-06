@@ -222,6 +222,9 @@ ready_manifest: /usr/share/muon/setup/ready.json
 # single-use, five-second token bound to that address, for uid 0 only
 # (SO_PEERCRED). The path must match MUON_LINK_MOONRAKER_TOKEN_SOCKET in
 # MuonOS's muon-link.service; a MuonOS test compares the two.
+# KAN-436 (ADR 0032 D4): a connection that started on Bluetooth is forwarded
+# with X-Real-IP 192.0.2.2 instead, also untrusted, and muon-link asks for a
+# token bound to that address. muon_setup reads it as the caller `bluetooth`.
 [muon_gateway]
 socket_path: /home/printer_admin/comms/muon-gateway.sock
 
