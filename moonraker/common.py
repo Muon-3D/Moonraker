@@ -18,6 +18,7 @@ from .utils import Sentinel
 from .utils import redact
 from .utils import json_wrapper as jsonw
 from .utils.exceptions import ServerError, AgentError
+from . import muon_access_policy
 from . import muon_floor
 
 # Annotation imports
@@ -247,6 +248,11 @@ class APIDefinition:
         # MUON, SEC-8: the same convergence point, for the level the owner
         # chose. After the floor, so a floor surface keeps the floor's reason.
         muon_floor.check_protection(self.endpoint, transport, ip_addr, user)
+        # MUON, ACC-23: the level table, once the floor and the level have
+        # passed. A no-op without [muon_access]. See muon_access_policy.py.
+        muon_access_policy.check_access(
+            self.endpoint, request_type, args, transport, ip_addr, user
+        )
         return self.callback(
             WebRequest(
                 self.endpoint, args, request_type, transport, ip_addr, user,
