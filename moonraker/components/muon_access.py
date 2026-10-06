@@ -14,6 +14,10 @@
 #   preset     relaxed | standard | strict, or null to follow the owner and
 #              the entry (ACC-23)
 #   overrides  {action: level} for the rows that can change
+#   private_uploads  true | false, or null for the default (ACC-32)
+#   data_mode  shared | accounts | both                  (ACC-29)
+#
+# `server.muon.access.*` (AB-MR-2) is components/muon_access_api.py.
 #
 # The decision itself is ``muon_access_policy.check_access``, which
 # ``APIDefinition.request`` calls after ``muon_floor``'s checks. This component
@@ -55,8 +59,25 @@
 # the release before this one changed it after a rollback, at the panel, the
 # only place it could: that is the newer decision, and the entry follows it.
 #
-# `dual_write_protection_level: False` stops the dual write once the other
-# slot holds this release too. Until then it must stay on.
+# WHEN THE DUAL WRITE STOPS
+#
+# Once an OTA has committed a release with this component to both slots, no
+# rollback can reach the old release, so the dual write stops and the old key
+# is deleted. The printer cannot tell that today: Rugix reports each slot's
+# hashes and when it was written (`rugix-ctrl system info`, read by the Aux
+# API), never which release a slot holds, and nothing records which releases
+# carry this component. So the condition is an explicit flag that a later
+# MuonOS change sets, in a release that ships only once every printer has
+# committed a release with [muon_access] to both slots:
+#
+#     [muon_access]
+#     dual_write_protection_level: False
+#
+# With it, the old key is deleted at start (once) and never written again; the
+# level muon_floor enforces still follows the entry. Until then it must stay
+# on. Trusted devices and their tombstones are muon-link's store
+# (`clients.json`, AB-LINK-3) and the password is Moonraker#32's: this
+# component changes neither, so it has nothing of theirs to dual-write.
 #
 # WHAT THIS DOES NOT DO
 #
@@ -70,8 +91,11 @@ import json
 import logging
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
+from .muon_access_api import DATA_MODES, AccessApi
+
 from .. import muon_access_policy as policy
 from .. import muon_floor
+from .. import muon_db
 from ..common import RequestType
 
 if TYPE_CHECKING:
@@ -117,6 +141,12 @@ def parse_record(value: Any) -> Dict[str, Any]:
     policy.parse_overrides(
         {name: level for name, level in stored.items()}
     )
+    private = value.get("private_uploads")
+    if private is not None and not isinstance(private, bool):
+        raise ValueError(f"private_uploads must be a boolean: {private!r}")
+    mode = value.get("data_mode", "shared")
+    if mode not in DATA_MODES:
+        raise ValueError(f"unknown data mode {mode!r}")
     return value
 
 
@@ -132,10 +162,12 @@ class MuonAccess:
                 "[muon_access] needs [muon_protection] while it writes the "
                 "entry to muon_protection.level for rollback"
             )
-        database = self.server.lookup_component("database")
+        database = self.database = self.server.lookup_component("database")
         self.db = database.register_local_namespace(NAMESPACE, forbidden=True)
         self.record: Dict[str, Any] = new_record(policy.ENTRY_PROTECTED, None)
         self.owner = policy.OWNER_UNKNOWN
+        #: The linked account, when the link names one.
+        self.owner_email: Optional[str] = None
         # Only the hotspot until the interfaces have been read: fail closed.
         self.home = policy.HomeNetwork()
         self._owner_task: Optional[asyncio.Task] = None
@@ -144,6 +176,7 @@ class MuonAccess:
         self._publish()
         self.server.register_endpoint(ENDPOINT, ["GET", "POST"], self._handle)
         self.server.register_notification(EVENT, NOTIFY_NAME)
+        self.api = AccessApi(self)
 
     # -- state ------------------------------------------------------------
 
@@ -169,13 +202,16 @@ class MuonAccess:
 
     async def component_init(self) -> None:
         try:
-            stored = await self.db.get(RECORD_KEY, None)
+            _, stored = await muon_db.read(self.database, NAMESPACE, RECORD_KEY)
             old_level = await self._old_level()
         except Exception:
             logging.exception(
                 "muon_access: cannot read the access record, enforcing "
                 "Protected until the panel sets the entry"
             )
+            # muon_protection has since set the level from the old key:
+            # publish again, so what it enforces is Protected too.
+            self._publish()
             return
         try:
             record = self._reconcile(stored, old_level)
@@ -184,7 +220,22 @@ class MuonAccess:
                 "muon_access: %s; enforcing Protected until the panel sets "
                 "the entry", err,
             )
+            self._publish()
             return
+        if not self.dual_write and (
+            old_level is not None or record.get("written_level") is not None
+        ):
+            # The rollback window is over: the old key goes, once.
+            try:
+                await self.protection_delete_level()
+            except Exception:
+                logging.exception("muon_access: cannot delete the old level")
+            else:
+                record = dict(record, written_level=None)
+                logging.info(
+                    "muon_access: rollback window closed, muon_protection.level "
+                    "deleted"
+                )
         if record is not stored:
             try:
                 await self.db.insert(RECORD_KEY, record)
@@ -202,8 +253,16 @@ class MuonAccess:
 
     async def _old_level(self) -> Optional[int]:
         if self.protection is None:
-            return None
+            _, level = await muon_db.read(
+                self.database, "muon_protection", "level")
+            return level
         return await self.protection.stored_level()
+
+    async def protection_delete_level(self) -> None:
+        if self.protection is not None:
+            await self.protection.delete_level()
+        else:
+            await muon_db.delete(self.database, "muon_protection", "level")
 
     def _reconcile(
         self, stored: Any, old_level: Optional[int]
@@ -255,6 +314,8 @@ class MuonAccess:
                 return
             linked = isinstance(status, dict) and status.get("phase") == "linked"
             owner = policy.OWNER_ACCOUNT if linked else policy.OWNER_NONE
+            account = status.get("account") if linked else None
+            self.owner_email = account if isinstance(account, str) else None
         if owner != self.owner:
             logging.info("muon_access: owner %s -> %s", self.owner, owner)
             self.owner = owner
@@ -292,6 +353,71 @@ class MuonAccess:
     async def set_entry(self, entry: str) -> None:
         """Change the entry, writing the old key in the same change."""
         await self._update({"entry": entry})
+
+    async def update(self, changes: Dict[str, Any]) -> None:
+        """Change settings. A change of entry is dual-written."""
+        await self._update(changes)
+
+    # -- what the API answers ---------------------------------------------------
+
+    def owner_answer(self) -> Dict[str, Any]:
+        if self.owner == policy.OWNER_ACCOUNT:
+            answer: Dict[str, Any] = {"kind": "account"}
+            if self.owner_email:
+                answer["email"] = self.owner_email
+            return answer
+        # Unknown answers as none: the app shows no owner until it is known,
+        # and the table already holds the printer closed meanwhile.
+        return {"kind": "none"}
+
+    def password_set(self) -> bool:
+        """Moonraker#32's connection password, when that is in this build."""
+        auth = self.server.lookup_component("authorization", None)
+        is_set = getattr(auth, "panel_login_set", None)
+        return bool(is_set()) if callable(is_set) else False
+
+    def private_uploads(self) -> bool:
+        value = self.record.get("private_uploads")
+        if value is not None:
+            return bool(value)
+        # ACC-32: off for a printer with one owner (or none), on for an
+        # organisation.
+        return self.owner == policy.OWNER_ORGANISATION
+
+    def data_mode(self) -> str:
+        return str(self.record.get("data_mode") or "shared")
+
+    def level_changes(self, web_request: WebRequest) -> Dict[str, Any]:
+        """`preset` and `overrides` from a request, checked; 400 otherwise."""
+        changes: Dict[str, Any] = {}
+        if "preset" in web_request.get_args():
+            preset = web_request.get("preset")
+            if preset in (None, "auto"):
+                preset = None
+            elif not policy.known(policy.PRESETS, preset):
+                raise self.server.error(
+                    f"'preset' must be one of {list(policy.PRESETS)} or "
+                    "'auto'", 400,
+                )
+            changes["preset"] = preset
+        overrides = web_request.get("overrides", None)
+        if overrides is not None:
+            try:
+                current = dict(self.record.get("overrides") or {})
+                if not isinstance(overrides, dict):
+                    raise ValueError(
+                        "'overrides' must be an object of action: level"
+                    )
+                for name, level in overrides.items():
+                    if level is None:
+                        current.pop(name, None)
+                    else:
+                        current[name] = level
+                policy.parse_overrides(current)
+            except ValueError as err:
+                raise self.server.error(str(err), 400)
+            changes["overrides"] = current
+        return changes
 
     async def set_entry_from_level(self, level: int) -> None:
         """muon_protection's POST, from the panel."""
@@ -371,33 +497,7 @@ class MuonAccess:
                         f"'entry' must be one of {list(policy.ENTRIES)}", 400
                     )
                 changes["entry"] = entry
-            if "preset" in web_request.get_args():
-                preset = web_request.get("preset")
-                if preset in (None, "auto"):
-                    preset = None
-                elif not policy.known(policy.PRESETS, preset):
-                    raise self.server.error(
-                        f"'preset' must be one of {list(policy.PRESETS)} or "
-                        "'auto'", 400,
-                    )
-                changes["preset"] = preset
-            overrides = web_request.get("overrides", None)
-            if overrides is not None:
-                try:
-                    current = dict(self.record.get("overrides") or {})
-                    if not isinstance(overrides, dict):
-                        raise ValueError(
-                            "'overrides' must be an object of action: level"
-                        )
-                    for name, level in overrides.items():
-                        if level is None:
-                            current.pop(name, None)
-                        else:
-                            current[name] = level
-                    policy.parse_overrides(current)
-                except ValueError as err:
-                    raise self.server.error(str(err), 400)
-                changes["overrides"] = current
+            changes.update(self.level_changes(web_request))
             if changes:
                 await self._update(changes)
         return self.status(web_request)

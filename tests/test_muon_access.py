@@ -181,14 +181,16 @@ class TestTheTableIsTheDesign:
         assert {n for n, a in policy.ACTIONS.items() if a.home_only} == HOME_ONLY
         assert {n for n, a in policy.ACTIONS.items()
                 if a.admin_from_away} == ADMIN_FROM_AWAY
+        # access_request: asking the panel is not acting (design 2.5)
         assert {n for n, a in policy.ACTIONS.items()
-                if a.read or a.viewer_allowed} == VIEWER_ROWS | {"read"}
+                if a.read or a.viewer_allowed} == VIEWER_ROWS | {
+            "read", "access_request"}
 
     def test_the_fixed_rows(self):
         # ACC-24, plus emergency stop's "never above this"
         fixed = {n for n, a in policy.ACTIONS.items() if a.fixed}
         assert fixed == {"emergency_stop", "protection", "owner", "dev_mode",
-                         "setup"}
+                         "setup", "access_api", "access_request"}
 
     def test_each_sample_is_classified_as_its_row(self):
         for row, (endpoint, rtype, args) in SAMPLES.items():
@@ -691,6 +693,17 @@ class _Database:
     def __init__(self) -> None:
         self.namespaces: Dict[str, _Namespace] = {}
 
+    async def get_batch(self, namespace, keys):
+        ns = self.namespaces.setdefault(namespace, _Namespace())
+        if ns.fail_get:
+            raise RuntimeError("database unreadable")
+        return {key: ns.values[key] for key in keys if key in ns.values}
+
+    async def delete_batch(self, namespace, keys):
+        ns = self.namespaces.setdefault(namespace, _Namespace())
+        for key in keys:
+            ns.values.pop(key, None)
+
     def register_local_namespace(
         self, namespace: str, forbidden: bool = False, parse_keys: bool = False
     ) -> _Namespace:
@@ -870,7 +883,7 @@ class TestTheDualWrite:
         assert _db(server, "muon_access").values["record"]["written_level"] == 1
         assert _db(server, "muon_protection").values["level"] == 1
 
-    def test_without_dual_write_the_old_key_is_left_alone(self):
+    def test_without_dual_write_the_old_key_is_deleted(self):
         server = _Server()
         _db(server, "muon_protection").values["level"] = 0
         protection = MuonProtection(_Config(server))
@@ -881,7 +894,7 @@ class TestTheDualWrite:
         asyncio.run(access.component_init())
         asyncio.run(access.close())
         _post(access, LOOPBACK, {"entry": "protected"})
-        assert _db(server, "muon_protection").values["level"] == 0
+        assert "level" not in _db(server, "muon_protection").values
         # ...but what check_protection enforces follows the entry
         assert muon_floor.protection_level() == muon_floor.LEVEL_PROTECTED
 
@@ -909,8 +922,8 @@ class TestTheDualWrite:
         assert muon_floor.protection_level() == muon_floor.LEVEL_OPEN
         assert asyncio.run(api.request({}, RequestType.POST, HTTP, LAN,
                                        TRUSTED_USER))["reached"]
-        # and after a restart, with the old key still saying 1
-        assert _db(server, "muon_protection").values["level"] == 1
+        # The rollback window is closed: the old key is gone.
+        assert "level" not in _db(server, "muon_protection").values
         protection2 = MuonProtection(_Config(server))
         server.components["muon_protection"] = protection2
         access2 = MuonAccess(_Config(server, dual_write=False))

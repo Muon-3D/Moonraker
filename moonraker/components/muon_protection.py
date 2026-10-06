@@ -61,6 +61,7 @@ import logging
 from typing import TYPE_CHECKING, Any, Dict
 
 from .. import muon_floor
+from .. import muon_db
 from ..common import RequestType
 
 if TYPE_CHECKING:
@@ -68,6 +69,9 @@ if TYPE_CHECKING:
     from ..confighelper import ConfigHelper
 
 NAMESPACE = "muon_protection"
+#: components/muon_access.py's record, read by release N's guard below.
+ACCESS_NAMESPACE = "muon_access"
+ACCESS_RECORD_KEY = "record"
 LEVEL_KEY = "level"
 ENDPOINT = "/server/muon/protection"
 EVENT = "muon_protection:level_changed"
@@ -94,7 +98,7 @@ def parse_stored_level(value: Any) -> int:
 class MuonProtection:
     def __init__(self, config: ConfigHelper) -> None:
         self.server = config.get_server()
-        database = self.server.lookup_component("database")
+        database = self.database = self.server.lookup_component("database")
         self.db = database.register_local_namespace(NAMESPACE, forbidden=True)
         # Fail closed until component_init has read the stored level.
         muon_floor.set_protection_level(muon_floor.LEVEL_PROTECTED)
@@ -107,7 +111,8 @@ class MuonProtection:
         """The raw stored level, or None if there is none. Raises if the
         database cannot be read. For muon_access's migration and rollback
         check, which must see what the release before it would see."""
-        return await self.db.get(LEVEL_KEY, None)
+        _, level = await muon_db.read(self.database, NAMESPACE, LEVEL_KEY)
+        return level
 
     async def store_level(self, level: int) -> None:
         """Store the level and enforce it. Raises if the database does not
@@ -132,16 +137,63 @@ class MuonProtection:
                 {"level": level, "name": muon_floor.LEVEL_NAMES[level]},
             )
 
+    async def delete_level(self) -> None:
+        """Delete the stored level, once muon_access's rollback window is
+        over. A key that is already gone is not an error."""
+        await muon_db.delete(self.database, NAMESPACE, LEVEL_KEY)
+
+    # -- release N's guard (access-model section 6, step 3) ----------------
+    #
+    # A printer that has run muon_access holds its record in the database.
+    # This process may be the release before muon_access (after an A/B
+    # rollback), or one with [muon_access] left out of its config, which is
+    # how MuonOS ships release N. Either way muon_access is not loaded, and
+    # the record is the newer word on the entry: enforce the stricter of it
+    # and this key, so a change that wrote the record and not this key (a
+    # crash between the two) never reopens the printer.
+
+    async def _access_record(self) -> Any:
+        if self.server.lookup_component("muon_access", None) is not None:
+            return None
+        database = self.server.lookup_component("database")
+        _, record = await muon_db.read(
+            database, ACCESS_NAMESPACE, ACCESS_RECORD_KEY)
+        return record if isinstance(record, dict) else None
+
+    async def _follow_access_record(self, level: int) -> None:
+        """The panel set the level with muon_access not loaded: the record
+        follows it, so the guard does not hold the old entry."""
+        record = await self._access_record()
+        if record is None:
+            return
+        entry = "protected" if level == muon_floor.LEVEL_PROTECTED else "open"
+        database = self.server.lookup_component("database")
+        await database.insert_item(
+            ACCESS_NAMESPACE, ACCESS_RECORD_KEY,
+            dict(record, entry=entry, written_level=level),
+        )
+
     async def component_init(self) -> None:
         try:
-            stored = await self.db.get(LEVEL_KEY, muon_floor.LEVEL_OPEN)
+            found, stored = await muon_db.read(self.database, NAMESPACE, LEVEL_KEY)
+            record = await self._access_record()
         except Exception:
             logging.exception(
                 "muon_protection: cannot read the stored level, "
                 "enforcing Protected until the panel sets one"
             )
             return
-        level = parse_stored_level(stored)
+        level = parse_stored_level(stored) if found else muon_floor.LEVEL_OPEN
+        if (
+            record is not None
+            and record.get("entry") != "open"
+            and level != muon_floor.LEVEL_PROTECTED
+        ):
+            logging.warning(
+                "muon_protection: the access record says %r and the level %d; "
+                "enforcing Protected", record.get("entry"), level,
+            )
+            level = muon_floor.LEVEL_PROTECTED
         muon_floor.set_protection_level(level)
         logging.info(
             "muon_protection: level %d (%s)",
@@ -185,6 +237,7 @@ class MuonProtection:
                 await access.set_entry_from_level(level)
             else:
                 await self.store_level(level)
+                await self._follow_access_record(level)
         return self.status(transport, ip_addr, user)
 
 

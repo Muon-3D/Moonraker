@@ -135,6 +135,9 @@ class Action:
     #: Governed by another check, which this module does not repeat. The
     #: principal must still be admitted, and a Viewer still may not write.
     delegated: bool = False
+    #: Reachable by a caller on the home network that is not admitted: a
+    #: new device asking the panel to let it in (ACC-6) is not, yet.
+    home_unadmitted: bool = False
 
     def level_for(self, preset: str) -> int:
         return {RELAXED: self.relaxed, STANDARD: self.standard,
@@ -180,6 +183,18 @@ _ROWS = (
     # First-run setup: muon_setup decides its own callers (02 section 3).
     _A("setup", SIGNED_OUT_GUEST, SIGNED_OUT_GUEST, SIGNED_OUT_GUEST,
        fixed=True, delegated=True),
+    # server.muon.access.* (AB-MR-2): the settings methods answer
+    # {"applied": false} rather than a 403, and requests are asked of the
+    # panel, so their handlers apply the protection row themselves
+    # (components/muon_access_api.py).
+    _A("access_api", SIGNED_OUT_GUEST, SIGNED_OUT_GUEST, SIGNED_OUT_GUEST,
+       fixed=True, delegated=True),
+    # Asking the panel to allow one change or one new device, and reading
+    # the answer (design 2.5, ACC-6). Asking is not acting: the panel
+    # decides, so a Viewer may ask too.
+    _A("access_request", SIGNED_OUT_GUEST, SIGNED_OUT_GUEST,
+       SIGNED_OUT_GUEST, fixed=True, delegated=True, viewer_allowed=True,
+       home_unadmitted=True),
     # Not rows of the design's table. Moonraker has surfaces it does not name.
     # A client's own preferences in the database, dismissing a notice, the
     # display's brightness: what a person needs to use the interface at all,
@@ -465,6 +480,14 @@ WRITE_ACTIONS: Tuple[Tuple[str, str], ...] = (
     ("/server/muon/setup", "setup"),
     ("/server/muon/link", "owner"),
     ("/server/muon/protection", "protection"),
+    ("/server/muon/access/set_entry", "access_api"),
+    ("/server/muon/access/set_private_uploads", "access_api"),
+    ("/server/muon/access/set_data", "access_api"),
+    ("/server/muon/access/set_levels", "access_api"),
+    ("/server/muon/access/request", "access_request"),
+    ("/server/muon/access/request_status", "access_request"),
+    ("/server/muon/access/cancel_request", "access_request"),
+    # answer, and anything new under the prefix: the protection row
     ("/server/muon/access", "protection"),
     ("/server/muon/identity/name", "rename"),
     ("/server/aux/dev_mode", "dev_mode"),
@@ -633,6 +656,9 @@ def classify(
         inner = posixpath.normpath("/" + path.lstrip("/"))
         verb_type = type("_RT", (), {"name": verb})()
         return classify("/server/aux" + inner, verb_type, {})
+    if endpoint == "/server/muon/access/request_status":
+        # A GET, but reachable before the caller is admitted
+        return (ACTIONS["access_request"],)
     if method == "GET":
         return (READ,)
     if endpoint == "/api/printer/command":
@@ -753,10 +779,28 @@ def check_access(
     principal = resolve_principal(
         transport, ip_addr, user, current.entry, current.home
     )
-    for action in classify(endpoint, request_type, args):
+    actions = classify(endpoint, request_type, args)
+    if principal is None and at_home_unadmitted(actions, ip_addr, current):
+        return
+    for action in actions:
         decision = decide_action(action, principal, current)
         if not decision.allowed:
             raise refusal(decision)
+
+
+def at_home_unadmitted(
+    actions: Iterable[Action], ip_addr: Optional[Any], state: AccessState
+) -> bool:
+    """A caller that is not admitted, on the home network, asking only for
+    what such a caller may ask."""
+    actions = list(actions)
+    return (
+        bool(actions)
+        and all(action.home_unadmitted for action in actions)
+        and ip_addr is not None
+        and not muon_floor._is_gateway_address(ip_addr)
+        and state.home.contains(ip_addr)
+    )
 
 
 def allowed_actions(
