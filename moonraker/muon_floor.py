@@ -367,15 +367,40 @@ def check_floor(
 #     the token is any request muon-link forwards, and the token is bound to
 #     the sentinel by ``_check_oneshot_token``, so it cannot arrive from
 #     anywhere else.
-#   * NOT a LAN or hotspot browser. ``trusted_clients`` authenticates it as
-#     ``_TRUSTED_USER_`` purely because of where it is, which is exactly what
-#     Level 1 exists to stop counting.
+#   * a browser signed in with the panel's login (PANEL_LOGIN_USER below). It
+#     holds a JWT for the password the owner set at the panel.
+#   * NOT a LAN or hotspot browser that only arrived. ``trusted_clients``
+#     authenticates it as ``_TRUSTED_USER_`` purely because of where it is,
+#     which is exactly what Level 1 exists to stop counting.
 #
-# No Moonraker user is created, at either level. ``authenticate_request`` puts
-# the ``force_logins`` gate before ``_check_trusted_connection``, so a second
-# row in ``self.users`` would 401 the panel on everything with no way back
-# (MuonOS #87). The level lives in ``components/muon_protection.py``.
+# The level creates no Moonraker user. The connection password does: one user,
+# PANEL_LOGIN_USER, which the panel creates, re-keys and removes through
+# ``components/muon_protection.py``. While it exists every network caller must
+# sign in, as ``force_logins`` (on in the M1 config) would make them anyway.
+# ``force_logins`` used to make the panel sign in too,
+# because ``authenticate_request`` puts that gate before
+# ``_check_trusted_connection`` and the panel has no way to (MuonOS #87).
+# ``login_required`` below exempts a caller on the device, so it no longer can.
 # ---------------------------------------------------------------------------
+
+#: The one login the panel manages. Fluidd's sign-in page takes this name and
+#: the password set at the panel.
+PANEL_LOGIN_USER = "admin"
+
+
+def login_required(
+    force_logins: bool, user_count: int, ip_addr: Optional[Any]
+) -> bool:
+    """Must this caller sign in? ``force_logins`` upstream, minus the panel.
+
+    ``user_count`` includes ``_API_KEY_USER_``, which always exists, so a
+    second user is what switches it on. A caller on the device never has to:
+    it is the panel, and the panel is where the password is set and cleared.
+    """
+    if not force_logins or user_count <= 1:
+        return False
+    return not local_address(ip_addr)
+
 
 #: Level 0. The shipped default (SEC-1): the LAN and the hotspot drive the
 #: printer with no sign-in.
@@ -475,12 +500,20 @@ def has_identity(
 ) -> bool:
     """Does this caller carry an identity SEC-8 Level 1 accepts?
 
-    See the block comment above for the three that do. Fail-closed: an absent
+    See the block comment above for the four that do. Fail-closed: an absent
     address, an absent user, or a user from any other source is no identity.
     """
     if _is_internal(transport):
         return True
     if local_address(ip_addr):
+        return True
+    # Only a JWT for the panel's password carries this name; trusted_clients
+    # stamps _TRUSTED_USER_, never it.
+    if (
+        user is not None
+        and getattr(user, "username", None) == PANEL_LOGIN_USER
+        and getattr(user, "source", None) == "moonraker"
+    ):
         return True
     return (
         _is_gateway_address(ip_addr)

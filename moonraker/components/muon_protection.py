@@ -51,9 +51,20 @@
 # factory reset, which is the lifetime this needs: a reset printer is back at
 # the shipped default, Open.
 #
-# WHAT THIS DOES NOT DO
+# THE CONNECTION PASSWORD
 #
-# It creates no Moonraker user and never touches `force_logins` (MuonOS #87).
+# The panel can also set a password. It is Moonraker's own login, so Fluidd
+# asks for it: this creates, re-keys or removes one Moonraker user,
+# `muon_floor.PANEL_LOGIN_USER`. While it exists, every network caller must
+# sign in, as `force_logins` would make them, whether or not that is set. The
+# panel is exempt (`muon_floor.login_required`), which is what MuonOS #87
+# needed before any user could exist. A paired client is unaffected: it
+# authenticates with muon_gateway's token before that gate. Only the panel may
+# set or clear it, for the same reason as the level, and authorization.py
+# refuses the network routes that would reset or delete that user.
+#
+# The password and the level are separate. A browser signed in with it has an
+# identity, so it keeps the surfaces Level 1 takes back.
 
 from __future__ import annotations
 
@@ -201,8 +212,12 @@ class MuonProtection:
             muon_floor.LEVEL_NAMES[level],
         )
 
+    def _authorization(self) -> Any:
+        return self.server.lookup_component("authorization", None)
+
     def status(self, transport: Any, ip_addr: Any, user: Any) -> Dict[str, Any]:
         level = muon_floor.protection_level()
+        auth = self._authorization()
         return {
             "level": level,
             "name": muon_floor.LEVEL_NAMES[level],
@@ -212,6 +227,9 @@ class MuonProtection:
             # showing a bare 403.
             "caller_has_identity": muon_floor.has_identity(transport, ip_addr, user),
             "changeable_by_caller": is_panel(transport, ip_addr),
+            # None when this Moonraker has no [authorization], so no login.
+            "password_set": None if auth is None else auth.panel_login_set(),
+            "login_user": muon_floor.PANEL_LOGIN_USER,
         }
 
     async def _handle(self, web_request: WebRequest) -> Dict[str, Any]:
@@ -225,6 +243,10 @@ class MuonProtection:
                     "panel.",
                     403,
                 )
+            password = web_request.get("password", None)
+            if password is not None:
+                await self._set_password(password)
+                return self.status(transport, ip_addr, user)
             level = web_request.get_int("level")
             if not muon_floor.is_known_level(level):
                 raise self.server.error(
@@ -239,6 +261,20 @@ class MuonProtection:
                 await self.store_level(level)
                 await self._follow_access_record(level)
         return self.status(transport, ip_addr, user)
+
+
+    async def _set_password(self, password: Any) -> None:
+        if not isinstance(password, str):
+            raise self.server.error("'password' must be a string", 400)
+        auth = self._authorization()
+        if auth is None:
+            raise self.server.error(
+                "This printer has no login to set a password on.", 400)
+        await auth.set_panel_login(password or None)
+        logging.info(
+            "muon_protection: connection password %s at the panel",
+            "set" if password else "cleared",
+        )
 
 
 def load_component(config: ConfigHelper) -> MuonProtection:
