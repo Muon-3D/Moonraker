@@ -68,6 +68,9 @@ if TYPE_CHECKING:
     from ..confighelper import ConfigHelper
 
 NAMESPACE = "muon_protection"
+#: components/muon_access.py's record, read by release N's guard below.
+ACCESS_NAMESPACE = "muon_access"
+ACCESS_RECORD_KEY = "record"
 LEVEL_KEY = "level"
 ENDPOINT = "/server/muon/protection"
 EVENT = "muon_protection:level_changed"
@@ -132,6 +135,50 @@ class MuonProtection:
                 {"level": level, "name": muon_floor.LEVEL_NAMES[level]},
             )
 
+    async def delete_level(self) -> None:
+        """Delete the stored level, once muon_access's rollback window is
+        over. A key that is already gone is not an error."""
+        try:
+            await self.db.delete(LEVEL_KEY)
+        except self.server.error as err:
+            if getattr(err, "status_code", None) != 404:
+                raise
+
+    # -- release N's guard (access-model section 6, step 3) ----------------
+    #
+    # A printer that has run muon_access holds its record in the database.
+    # This process may be the release before muon_access (after an A/B
+    # rollback), or one with [muon_access] left out of its config, which is
+    # how MuonOS ships release N. Either way muon_access is not loaded, and
+    # the record is the newer word on the entry: enforce the stricter of it
+    # and this key, so a change that wrote the record and not this key (a
+    # crash between the two) never reopens the printer.
+
+    async def _access_record(self) -> Any:
+        if self.server.lookup_component("muon_access", None) is not None:
+            return None
+        database = self.server.lookup_component("database")
+        try:
+            record = await database.get_item(
+                ACCESS_NAMESPACE, ACCESS_RECORD_KEY, None)
+        except Exception:
+            # No such namespace: muon_access never ran here.
+            return None
+        return record if isinstance(record, dict) else None
+
+    async def _follow_access_record(self, level: int) -> None:
+        """The panel set the level with muon_access not loaded: the record
+        follows it, so the guard does not hold the old entry."""
+        record = await self._access_record()
+        if record is None:
+            return
+        entry = "protected" if level == muon_floor.LEVEL_PROTECTED else "open"
+        database = self.server.lookup_component("database")
+        await database.insert_item(
+            ACCESS_NAMESPACE, ACCESS_RECORD_KEY,
+            dict(record, entry=entry, written_level=level),
+        )
+
     async def component_init(self) -> None:
         try:
             stored = await self.db.get(LEVEL_KEY, muon_floor.LEVEL_OPEN)
@@ -142,6 +189,17 @@ class MuonProtection:
             )
             return
         level = parse_stored_level(stored)
+        record = await self._access_record()
+        if (
+            record is not None
+            and record.get("entry") != "open"
+            and level != muon_floor.LEVEL_PROTECTED
+        ):
+            logging.warning(
+                "muon_protection: the access record says %r and the level %d; "
+                "enforcing Protected", record.get("entry"), level,
+            )
+            level = muon_floor.LEVEL_PROTECTED
         muon_floor.set_protection_level(level)
         logging.info(
             "muon_protection: level %d (%s)",
@@ -185,6 +243,7 @@ class MuonProtection:
                 await access.set_entry_from_level(level)
             else:
                 await self.store_level(level)
+                await self._follow_access_record(level)
         return self.status(transport, ip_addr, user)
 
 

@@ -181,14 +181,16 @@ class TestTheTableIsTheDesign:
         assert {n for n, a in policy.ACTIONS.items() if a.home_only} == HOME_ONLY
         assert {n for n, a in policy.ACTIONS.items()
                 if a.admin_from_away} == ADMIN_FROM_AWAY
+        # access_request: asking the panel is not acting (design 2.5)
         assert {n for n, a in policy.ACTIONS.items()
-                if a.read or a.viewer_allowed} == VIEWER_ROWS | {"read"}
+                if a.read or a.viewer_allowed} == VIEWER_ROWS | {
+            "read", "access_request"}
 
     def test_the_fixed_rows(self):
         # ACC-24, plus emergency stop's "never above this"
         fixed = {n for n, a in policy.ACTIONS.items() if a.fixed}
         assert fixed == {"emergency_stop", "protection", "owner", "dev_mode",
-                         "setup"}
+                         "setup", "access_api", "access_request"}
 
     def test_each_sample_is_classified_as_its_row(self):
         for row, (endpoint, rtype, args) in SAMPLES.items():
