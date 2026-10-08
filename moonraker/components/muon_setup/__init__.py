@@ -38,7 +38,7 @@ from urllib.parse import urlencode
 
 from . import (
     caller, clock, language, manifest, model, name, network, ready, region,
-    update)
+    remote, update)
 from .model import DONE, FINISH, HIDDEN, PENDING, SKIPPED
 from ...utils.exceptions import ServerError
 
@@ -236,6 +236,9 @@ class MuonSetup:
         self._tasks: Set[asyncio.Task] = set()
         self._lapse_timer: Optional[asyncio.TimerHandle] = None
         self._poll_task: Optional[asyncio.Task] = None
+        #: remote.py's link-phase poller (MR-5), while the remote step
+        #: waits on muon-link.
+        self._remote_poll_task: Optional[asyncio.Task] = None
         self._stations_route = True
         self._clock_from_phone = False
         self._closed = False
@@ -262,8 +265,11 @@ class MuonSetup:
         reg("/server/muon/setup/reset", ["POST"], self._handle_reset)
         reg("/server/muon/setup/network/cancel", ["POST"],
             self._handle_network_cancel)
+        reg("/server/muon/setup/remote/cancel", ["POST"],
+            lambda webreq: remote.handle_cancel(self, webreq))
         # The steps' own endpoints, one module each.
-        for step_module in (language, clock, name, update, ready, network):
+        for step_module in (language, clock, name, update, ready, network,
+                            remote):
             step_module.register(self)
 
     # ------------------------------------------------------------------
@@ -1314,7 +1320,8 @@ class MuonSetup:
     def _refresh_capabilities(self) -> None:
         caps = self._live["capabilities"]
         caps["ethernet"] = os.path.exists("/sys/class/net/eth0")
-        caps["cloud_link"] = self.server.lookup_component("muon_link", None) is not None
+        # cloud_link follows GET /server/muon/link (02 §5.9); remote.py's
+        # live refresher keeps it current.
 
 
 def load_component(config: ConfigHelper) -> MuonSetup:
