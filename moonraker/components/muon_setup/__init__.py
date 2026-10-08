@@ -236,6 +236,10 @@ class MuonSetup:
         self._tasks: Set[asyncio.Task] = set()
         self._lapse_timer: Optional[asyncio.TimerHandle] = None
         self._poll_task: Optional[asyncio.Task] = None
+        #: network.py's in-flight Aux /wifi/connect, and the cleanup that
+        #: waits it out before forgetting a partial profile.
+        self._join_connect: Optional[asyncio.Task] = None
+        self._join_cleanup: Optional[asyncio.Task] = None
         self._stations_route = True
         self._clock_from_phone = False
         self._closed = False
