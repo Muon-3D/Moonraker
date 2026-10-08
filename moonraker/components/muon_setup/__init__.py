@@ -36,7 +36,9 @@ from typing import (
 )
 from urllib.parse import urlencode
 
-from . import caller, clock, language, manifest, model, name, ready, region, update
+from . import (
+    caller, clock, language, manifest, model, name, network, ready, region,
+    update)
 from .model import DONE, FINISH, HIDDEN, PENDING, SKIPPED
 from ...utils.exceptions import ServerError
 
@@ -234,6 +236,10 @@ class MuonSetup:
         self._tasks: Set[asyncio.Task] = set()
         self._lapse_timer: Optional[asyncio.TimerHandle] = None
         self._poll_task: Optional[asyncio.Task] = None
+        #: network.py's in-flight Aux /wifi/connect, and the cleanup that
+        #: waits it out before forgetting a partial profile.
+        self._join_connect: Optional[asyncio.Task] = None
+        self._join_cleanup: Optional[asyncio.Task] = None
         self._stations_route = True
         self._clock_from_phone = False
         self._closed = False
@@ -261,7 +267,7 @@ class MuonSetup:
         reg("/server/muon/setup/network/cancel", ["POST"],
             self._handle_network_cancel)
         # The steps' own endpoints, one module each.
-        for step_module in (language, clock, name, update, ready):
+        for step_module in (language, clock, name, update, ready, network):
             step_module.register(self)
 
     # ------------------------------------------------------------------
@@ -1131,7 +1137,11 @@ class MuonSetup:
         # Not through write(), so the Level 1 check is made here: at Level 1
         # the LAN may not stop a join the panel started.
         caller.refuse_if_protected(kind, self.doc["state"])
+        ssid, forget = network.cancel_cleanup_info(self)
         await self.cancel_op(("region_apply", "join"))
+        # 02 §5.6a: the partial profile goes too (only when the join made
+        # it -- an owner's saved profile is never deleted).
+        await network.cancel_cleanup(self, ssid, forget)
         return self.envelope()
 
     async def _handle_reset(self, webreq: WebRequest) -> Dict[str, Any]:
