@@ -240,44 +240,51 @@ class JoinScript:
 
 
 class FakeMuonLink:
-    """muon_link's Python API (status/start/cancel/call) for remote tests."""
+    """muon_link's Python API (status/start/cancel/call) for remote tests.
+
+    `phases` is a queue: each status() returns and consumes the head, or the
+    last phase once the queue runs dry. start() answers `connecting`, except
+    while a standing phase (offer/linked) is next — like muon_link turning a
+    409 into the current phase.
+    """
 
     def __init__(self, phases: Optional[List[Any]] = None) -> None:
-        self.phases: List[Any] = list(phases or [])
-        self.current: Any = self.phases.pop(0) if self.phases else {
-            "phase": "unlinked"}
+        self.queue: List[Any] = list(phases or [])
+        self.last: Dict[str, Any] = {"phase": "unlinked"}
         self.starts = 0
         self.cancels = 0
+        self.status_calls = 0
         self.down = False
 
     async def status(self) -> Dict[str, Any]:
         await asyncio.sleep(0)
+        self.status_calls += 1
         if self.down:
             raise ServerError("muon-link is not answering", 503)
-        if self.phases:
-            self.current = self.phases.pop(0)
-        return copy.deepcopy(self.current)
+        if self.queue:
+            self.last = self.queue.pop(0)
+        return copy.deepcopy(self.last)
 
     async def start(self) -> Dict[str, Any]:
         await asyncio.sleep(0)
         if self.down:
             raise ServerError("muon-link is not answering", 503)
         self.starts += 1
-        if isinstance(self.current, dict) and self.current.get("phase") == "offer":
-            # muon-link refuses start during an offer; muon_link turns the
-            # 409 into the standing phase (02 §9).
-            return copy.deepcopy(self.current)
-        if self.phases:
-            self.current = self.phases.pop(0)
-        else:
-            self.current = {"phase": "connecting"}
-        return copy.deepcopy(self.current)
+        # muon_link's 409 translation: a refused start during a standing
+        # phase (offer, or once linked) answers with that phase.
+        peek = self.queue[0] if self.queue else self.last
+        if isinstance(peek, dict) and peek.get("phase") in ("offer", "linked"):
+            if self.queue:
+                self.last = self.queue.pop(0)
+            return copy.deepcopy(self.last)
+        return {"phase": "connecting"}
 
     async def cancel(self) -> Dict[str, Any]:
         await asyncio.sleep(0)
         self.cancels += 1
-        self.current = {"phase": "unlinked"}
-        return dict(self.current)
+        self.queue.clear()
+        self.last = {"phase": "unlinked"}
+        return dict(self.last)
 
     async def call(self, method: str, path: str) -> Dict[str, Any]:
         if (method, path) == ("GET", "/link"):

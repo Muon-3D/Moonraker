@@ -622,6 +622,9 @@ ACCESS = [
       "psk": "test-psk-12345"}, {"panel", "hotspot", "lan"}),
     ("/region", "POST", {"rev": 5, "country": "DE"},
      {"panel", "hotspot", "lan"}),
+    ("/remote", "POST", {"rev": 5, "mode": "local"},
+     {"panel", "hotspot", "lan"}),
+    ("/remote/cancel", "POST", {}, {"panel", "hotspot", "lan"}),
     ("/driver", "POST", {"rev": 5, "kind": "web", "client_id": "c"},
      {"hotspot", "lan"}),
     ("/goto", "POST", {"rev": 5, "step": "language"},
@@ -707,8 +710,10 @@ PROTECTED_WRITES = [
     ("/network", {"rev": 5, "kind": "wifi", "ssid": "HomeWiFi",
                   "security": "wpa2", "psk": "test-psk-12345"}, WRITERS),
     ("/region", {"rev": 5, "country": "DE"}, WRITERS),
+    ("/remote", {"rev": 5, "mode": "local"}, WRITERS),
     ("/ready", {"rev": 5, "item": "load_filament", "action": "skip"}, WRITERS),
     ("/network/cancel", {}, WRITERS),
+    ("/remote/cancel", {}, WRITERS),
     ("/clock", {"epoch_ms": CLOCK_NOW_MS}, {"hotspot", "internal"}),
 ]
 
