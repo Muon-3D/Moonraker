@@ -101,13 +101,19 @@ class FakeAux:
             base, _, query = path.partition("?")
             route = self.routes.get((method, base))
             if callable(route):
-                return route(query if body is None else body)
+                result = route(query if body is None else body)
+                if asyncio.iscoroutine(result):
+                    result = await result
+                return result
         if route is None:
             raise ServerError("Not Found", 404)
         if isinstance(route, BaseException):
             raise route
         if callable(route):
-            return route(body)
+            result = route(body)
+            if asyncio.iscoroutine(result):
+                result = await result
+            return result
         return copy.deepcopy(route)
 
     async def get(self, path: str) -> Any:
@@ -177,6 +183,8 @@ class JoinScript:
         self.uplink = uplink
         self.forgets: List[str] = []
         self.shows: List[str] = []
+        self.disconnects: List[Any] = []
+        self.current_ssid: Optional[str] = None
         self.device_reads = 0
         self.connects: List[Any] = []
 
@@ -219,6 +227,12 @@ class JoinScript:
                 {"name": name} for name in self.saved],
             ("GET", "/wifi/show"): show,
             ("DELETE", "/wifi/forget"): forget,
+            ("GET", "/wifi/current"): (
+                lambda body: {"ssid": self.current_ssid}
+                if self.current_ssid else None),
+            ("POST", "/wifi/disconnect"): (
+                lambda body: self.disconnects.append(body)
+                or {"status": "disconnected"}),
         }
         if self.uplink is not None:
             routes[("GET", "/wifi/uplink")] = self.uplink

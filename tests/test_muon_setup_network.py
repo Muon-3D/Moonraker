@@ -601,3 +601,126 @@ class TestEthernet:
             assert out["error"]["code"] == "invalid_network"
             assert out["error"]["detail"]["field"] == "kind"
         run(go())
+
+
+class TestDeferredCleanup:
+    """The connect outlives the op: a cancelled or timed-out join forgets
+    the profile only after /wifi/connect resolves, and disconnects first
+    when the late connect put the printer on the cancelled SSID."""
+
+    def _blocked_aux(self, script: JoinScript, gate: asyncio.Event,
+                     result: Any = None) -> FakeAux:
+        async def slow_connect(body: Any) -> Any:
+            await gate.wait()
+            return result or {"status": "connecting",
+                              "ssid": body["ssid"]}
+        aux = wifi_aux(script)
+        aux.routes[("POST", "/wifi/connect")] = slow_connect
+        return aux
+
+    def test_cancel_waits_out_the_connect_then_disconnects(self):
+        async def go():
+            gate = asyncio.Event()
+            script = JoinScript()
+            script.current_ssid = SSID  # the late connect landed on it
+            h = await Harness(stored=join_state(),
+                              aux=self._blocked_aux(script, gate)).start()
+            await h.post("/network", join_body())
+            await asyncio.sleep(0)  # let the runner reach the connect
+            out = await h.post("/network/cancel", {})
+            assert out["ok"] is True            # cancel doesn't block
+            assert script.forgets == []         # forget waits on connect
+            gate.set()
+            await h.setup.drain()
+            assert script.disconnects == [{}] or len(script.disconnects) == 1
+            assert script.forgets == [SSID]
+            assert h.setup._join_connect is None
+        run(go())
+
+    def test_cancel_without_a_late_connection_forgets_normally(self):
+        """Connect resolves but the printer isn't on that SSID: forget
+        only, no disconnect."""
+        async def go():
+            gate = asyncio.Event()
+            script = JoinScript()
+            h = await Harness(stored=join_state(),
+                              aux=self._blocked_aux(script, gate)).start()
+            await h.post("/network", join_body())
+            await asyncio.sleep(0)
+            await h.post("/network/cancel", {})
+            gate.set()
+            await h.setup.drain()
+            assert script.disconnects == []
+            assert script.forgets == [SSID]
+        run(go())
+
+    def test_join_timeout_defers_the_cleanup(self):
+        async def go():
+            gate = asyncio.Event()
+            script = JoinScript(device_states=["associating"],
+                                uplink=None)
+            script.current_ssid = SSID
+            h = await Harness(stored=join_state(),
+                              aux=self._blocked_aux(script, gate)).start()
+            h.setup.join_timeout = 0.2
+            await h.post("/network", join_body())
+            # The op ends on its timeout while the connect still runs; the
+            # cleanup is what drain() would otherwise wait 65 s for.
+            for _ in range(100):
+                if h.doc["op"] is None:
+                    break
+                await asyncio.sleep(0.05)
+            assert h.doc["steps"]["network"]["error"]["code"] == "timeout"
+            assert script.forgets == []  # the connect is still running
+            gate.set()
+            await h.setup.drain()
+            assert len(script.disconnects) == 1
+            assert script.forgets == [SSID]
+        run(go())
+
+    def test_a_saved_profile_is_never_disconnected_or_forgotten(self):
+        async def go():
+            gate = asyncio.Event()
+            script = JoinScript(saved=[SSID])
+            script.current_ssid = SSID
+            h = await Harness(stored=join_state(),
+                              aux=self._blocked_aux(script, gate)).start()
+            await h.post("/network", join_body())
+            await asyncio.sleep(0)
+            await h.post("/network/cancel", {})
+            gate.set()
+            await h.setup.drain()
+            assert script.forgets == []
+            assert script.disconnects == []
+        run(go())
+
+    def test_psk_is_absent_from_the_cleanup_path(self, caplog: Any):
+        async def go():
+            gate = asyncio.Event()
+            script = JoinScript()
+            h = await Harness(stored=join_state(),
+                              aux=self._blocked_aux(script, gate)).start()
+            with caplog.at_level(logging.DEBUG):
+                await h.post("/network", join_body())
+                await asyncio.sleep(0)
+                await h.post("/network/cancel", {})
+                gate.set()
+                await h.setup.drain()
+            assert PSK not in caplog.text
+        run(go())
+
+    def test_a_new_join_while_cleanup_runs_is_busy(self):
+        async def go():
+            gate = asyncio.Event()
+            script = JoinScript()
+            h = await Harness(stored=join_state(),
+                              aux=self._blocked_aux(script, gate)).start()
+            await h.post("/network", join_body())
+            await asyncio.sleep(0)
+            await h.post("/network/cancel", {})
+            out = await h.post("/network", join_body(rev=h.doc["rev"]))
+            assert out["ok"] is False
+            assert out["error"]["code"] == "busy"
+            gate.set()
+            await h.setup.drain()
+        run(go())

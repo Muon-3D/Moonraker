@@ -371,6 +371,67 @@ async def _ssid_saved_before(setup: MuonSetup, ssid: str) -> bool:
     return True
 
 
+async def _forget_after_join(setup: MuonSetup, ssid: str) -> None:
+    """Forget the profile a join may have made, once the connect has ended.
+
+    When /wifi/connect is still running at Aux (the join was cancelled or
+    timed out), forgetting now would race it: nmcli can still finish and
+    leave -- or activate -- the very profile we promised to remove. In that
+    case the cleanup runs as a background task that waits for the connect,
+    disconnects if it landed on the SSID, and forgets after that. The psk
+    never enters the cleanup: it needs only the SSID."""
+    connect = setup._join_connect
+    if connect is not None and not connect.done():
+        setup._join_cleanup = setup._spawn(_join_cleanup(setup, ssid))
+        return
+    setup._join_connect = None
+    await _forget_profile(setup, ssid)
+
+
+async def _join_cleanup(setup: MuonSetup, ssid: str) -> None:
+    """The deferred forget: wait out the in-flight connect, disconnect if
+    it finished on the cancelled SSID, then forget the profile."""
+    from . import AuxMissing, AuxRefused, AuxUnavailable
+    connect = setup._join_connect
+    succeeded = False
+    try:
+        if connect is not None:
+            try:
+                result, _ = await asyncio.wait_for(
+                    asyncio.shield(connect), CONNECT_TIMEOUT + 5.0)
+            except Exception as exc:
+                result = None
+                if not isinstance(exc, asyncio.CancelledError):
+                    logging.info(
+                        "muon_setup: join cleanup: the connect never "
+                        "finished: %s", exc)
+            succeeded = (
+                isinstance(result, dict)
+                and result.get("status") == "connecting")
+        if succeeded:
+            # The connect Aux kept running may have put the printer on the
+            # SSID the owner cancelled; disconnect before forgetting, but
+            # only if the active network is actually that one.
+            current: Any = None
+            try:
+                current = await setup.aux("GET", "/wifi/current")
+            except (AuxMissing, AuxRefused, AuxUnavailable) as exc:
+                logging.info(
+                    "muon_setup: join cleanup: current SSID unknown: %s",
+                    exc)
+            if isinstance(current, dict) and current.get("ssid") == ssid:
+                try:
+                    await setup.aux("POST", "/wifi/disconnect")
+                except (AuxMissing, AuxRefused, AuxUnavailable) as exc:
+                    logging.info(
+                        "muon_setup: join cleanup: disconnect failed: %s",
+                        exc)
+        await _forget_profile(setup, ssid)
+    finally:
+        if setup._join_connect is connect:
+            setup._join_connect = None
+
+
 async def _forget_profile(setup: MuonSetup, ssid: str) -> None:
     """Delete the profile the failed/cancelled join created -- only when it
     wasn't saved before. The hotspot profile and an owner's pre-existing one
@@ -416,7 +477,7 @@ async def cancel_cleanup(setup: MuonSetup, ssid: Optional[str],
     """02 §5.6a: a cancelled join removes the partial profile -- unless the
     SSID was already saved before the join."""
     if ssid is not None and forget:
-        await _forget_profile(setup, ssid)
+        await _forget_after_join(setup, ssid)
 
 
 # --------------------------------------------------------------------------
@@ -641,6 +702,13 @@ async def handle_network(
         # profile cleanup may run. The answer goes in the op so a later
         # cancel can see it too.
         saved_before = await _ssid_saved_before(setup, ssid)
+        # A cleanup still waiting on the last join's connect means another
+        # join now would race it; `busy` is the same answer a running op
+        # gives.
+        cleanup = setup._join_cleanup
+        if cleanup is not None and not cleanup.done():
+            return model.error(
+                "busy", "a join cleanup is still running")
         step["ssid"] = ssid
         step["error"] = None
         step["region_error"] = None
@@ -687,6 +755,7 @@ def _join_runner(
         # status poll moves `op.phase`.
         connect = asyncio.ensure_future(
             _connect(setup, ssid, psk))
+        setup._join_connect = connect
         deadline = time.monotonic() + setup.join_timeout
         address: Optional[str] = None
         connect_done: Optional[Tuple[Any, Any]] = None
@@ -735,6 +804,7 @@ def _join_runner(
                 await _finish_fail(setup, handle, "no_address", "dhcp",
                                    ssid, saved_before, "no IPv4 on wlan0")
                 return
+            setup._join_connect = None
             await _finish_join(setup, handle, ssid, address, internet,
                                saved_before)
             return
@@ -877,4 +947,4 @@ async def _finish_fail(
     await handle.finish(
         lambda doc: _join_fail(doc, code, phase, ssid, detail))
     if not saved_before:
-        await _forget_profile(setup, ssid)
+        await _forget_after_join(setup, ssid)
