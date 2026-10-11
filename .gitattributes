@@ -1,2 +1,6 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# B9-MR-1: toolpath offsets are byte offsets, so these must be checked out
+# exactly as committed, never with CRLF.
+tests/assets/muon_toolpath/*.gcode -text

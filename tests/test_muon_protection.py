@@ -67,6 +67,14 @@ class _Database:
         self.namespace = _Namespace()
         self.registered: List[Tuple[str, bool]] = []
 
+    async def get_batch(self, namespace, keys):
+        if namespace != "muon_protection":
+            return {}
+        if self.namespace.fail_get:
+            raise RuntimeError("database unreadable")
+        return {key: self.namespace.values[key] for key in keys
+                if key in self.namespace.values}
+
     def register_local_namespace(
         self, namespace: str, forbidden: bool = False, parse_keys: bool = False
     ) -> _Namespace:

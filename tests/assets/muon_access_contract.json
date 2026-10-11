@@ -1,0 +1,112 @@
+{
+  "about": "server.muon.access.* (muon3d-app docs/plans/access-build.md section 2, AB-MR-2). The printer's answers, case by case. Moonraker's tests/test_muon_access_api.py checks the printer against it; muon3d-app's tools/mock-moonraker/access_mock.py is to answer from the same file. Changing a field here changes the contract for both.",
+  "levels": ["signed-out-guest", "signed-in-guest", "member", "admin"],
+  "roles": ["operator", "viewer"],
+  "entries": ["open", "protected"],
+  "dataModes": ["shared", "accounts", "both"],
+  "requestStatuses": ["pending", "allowed", "refused", "expired"],
+  "requestAnswerKeys": ["requestId", "code", "expiresAt"],
+  "capabilityValues": ["allowed", "ask", "refused"],
+  "notYetOnThePrinter": {
+    "fields": ["people", "members", "ways.email.count", "ways.link.count"],
+    "methods": ["people", "update_person", "remove_person", "trusted_devices", "revoke_device"],
+    "why": "People, trusted devices and invites are muon-link's and the console's (AB-LINK-3, AB-CON-1). An organisation owner is not in the link yet, so no case has one."
+  },
+  "cases": [
+    {
+      "name": "no owner, Open, anyone at home",
+      "printer": {"owner": "none", "entry": "open"},
+      "caller": {"kind": "home"},
+      "get": {
+        "owner": {"kind": "none"},
+        "entry": "open",
+        "you": {"level": "signed-out-guest", "role": "operator", "trusted": false, "principal": "anyone at home"},
+        "ways": {"email": {"on": false}, "link": {"on": false}, "password": {"on": false}, "approve": {"on": false}},
+        "privateUploads": false,
+        "dataMode": "shared",
+        "levelsPreset": "standard"
+      },
+      "set_entry": {"params": {"entry": "protected"}, "result": {"applied": false}},
+      "capabilities": {"print": "allowed", "hotspot": "allowed", "protection": "ask"}
+    },
+    {
+      "name": "no owner, Protected, the panel",
+      "printer": {"owner": "none", "entry": "protected"},
+      "caller": {"kind": "panel"},
+      "get": {
+        "owner": {"kind": "none"},
+        "entry": "protected",
+        "you": {"level": "admin", "role": "operator", "trusted": true, "principal": "panel"},
+        "ways": {"email": {"on": false}, "link": {"on": false}, "password": {"on": false}, "approve": {"on": false}},
+        "privateUploads": false,
+        "dataMode": "shared",
+        "levelsPreset": "standard"
+      },
+      "set_entry": {"params": {"entry": "open"}, "result": {"applied": true}},
+      "capabilities": {"print": "allowed", "hotspot": "allowed", "protection": "allowed"}
+    },
+    {
+      "name": "no owner, Protected, signed in with the password",
+      "printer": {"owner": "none", "entry": "protected"},
+      "caller": {"kind": "password"},
+      "get": {
+        "owner": {"kind": "none"},
+        "entry": "protected",
+        "you": {"level": "signed-out-guest", "role": "operator", "trusted": false, "principal": "password"},
+        "ways": {"email": {"on": false}, "link": {"on": false}, "password": {"on": false}, "approve": {"on": false}},
+        "privateUploads": false,
+        "dataMode": "shared",
+        "levelsPreset": "standard"
+      },
+      "set_entry": {"params": {"entry": "open"}, "result": {"applied": false}},
+      "capabilities": {"print": "refused", "read": "allowed", "protection": "ask"}
+    },
+    {
+      "name": "one owner, Protected, the owner's trusted device",
+      "printer": {"owner": "account", "email": "sam@example.com", "entry": "protected"},
+      "caller": {"kind": "gateway", "level": "admin", "role": "operator", "home": false, "principal": "device:sam-phone"},
+      "get": {
+        "owner": {"kind": "account", "email": "sam@example.com"},
+        "entry": "protected",
+        "you": {"level": "admin", "role": "operator", "trusted": true, "principal": "device:sam-phone"},
+        "ways": {"email": {"on": false}, "link": {"on": false}, "password": {"on": false}, "approve": {"on": false}},
+        "privateUploads": false,
+        "dataMode": "shared",
+        "levelsPreset": "standard"
+      },
+      "set_entry": {"params": {"entry": "open"}, "result": {"applied": true}},
+      "capabilities": {"print": "allowed", "hotspot": "allowed", "protection": "allowed", "config": "refused"}
+    },
+    {
+      "name": "one owner, Open, a guest at home",
+      "printer": {"owner": "account", "email": "sam@example.com", "entry": "open"},
+      "caller": {"kind": "home"},
+      "get": {
+        "owner": {"kind": "account", "email": "sam@example.com"},
+        "entry": "open",
+        "you": {"level": "signed-out-guest", "role": "operator", "trusted": false, "principal": "anyone at home"},
+        "ways": {"email": {"on": false}, "link": {"on": false}, "password": {"on": false}, "approve": {"on": false}},
+        "privateUploads": false,
+        "dataMode": "shared",
+        "levelsPreset": "relaxed"
+      },
+      "set_entry": {"params": {"entry": "protected"}, "result": {"applied": false}},
+      "capabilities": {"print": "allowed", "wifi": "allowed", "hotspot": "refused", "protection": "ask"}
+    },
+    {
+      "name": "one owner, Open, a Viewer through the gateway",
+      "printer": {"owner": "account", "email": "sam@example.com", "entry": "open"},
+      "caller": {"kind": "gateway", "level": "signed-in-guest", "role": "viewer", "home": false, "principal": "acct:jo@example.com"},
+      "get": {
+        "owner": {"kind": "account", "email": "sam@example.com"},
+        "entry": "open",
+        "you": {"level": "signed-in-guest", "role": "viewer", "trusted": false, "principal": "acct:jo@example.com"},
+        "ways": {"email": {"on": false}, "link": {"on": false}, "password": {"on": false}, "approve": {"on": false}},
+        "privateUploads": false,
+        "dataMode": "shared",
+        "levelsPreset": "relaxed"
+      },
+      "capabilities": {"read": "allowed", "emergency_stop": "allowed", "print": "refused", "protection": "refused"}
+    }
+  ]
+}

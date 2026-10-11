@@ -17,6 +17,7 @@ from ..common import (
 )
 from ..utils import ServerError, parse_ip_address
 from ..utils.real_ip import validate_real_ip_header
+from .. import muon_access_policy
 
 # Annotation imports
 from typing import (
@@ -207,12 +208,15 @@ class WebsocketManager:
         data: Union[List, Tuple] = [],
         mask: List[int] = []
     ) -> None:
-        msg: Dict[str, Any] = {'jsonrpc': "2.0", 'method': "notify_" + name}
-        if data:
-            msg['params'] = data
         for sc in list(self.clients.values()):
             if sc.uid in mask or sc.need_auth:
                 continue
+            filtered = muon_access_policy.filter_notification(name, data, sc)
+            if filtered is None:
+                continue
+            msg: Dict[str, Any] = {'jsonrpc': "2.0", 'method': "notify_" + name}
+            if filtered:
+                msg['params'] = filtered
             sc.queue_message(msg)
 
     def get_count(self) -> int:

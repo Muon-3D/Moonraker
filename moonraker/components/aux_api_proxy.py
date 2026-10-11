@@ -17,6 +17,7 @@ from urllib.parse import unquote, urlencode
 from tornado.httpclient import HTTPClientError
 
 from ..utils import ServerError
+from ..utils import redact
 
 FASTAPI_ROOT = "http://127.0.0.1:6789"  # loopback-only Aux API bind
 OPENAPI_PATH = "/openapi.json"  # FastAPI default
@@ -357,9 +358,11 @@ class AuxAutoProxy:
                 body = "" if method in ("POST", "PUT", "PATCH") else None
                 headers = {}
 
-            # Debug log
+            # Debug log. Redacted: a body or query can carry a password, a
+            # hotspot key or the waiver signer's name (utils/redact.py).
             self.log.debug(
-                f"Proxying → {method} {url!r} headers={headers!r} body={body!r}"
+                f"Proxying → {method} {redact.redact_url(url)!r} "
+                f"headers={headers!r} body={redact.redact_json_text(body)!r}"
             )
 
             # Forward

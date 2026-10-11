@@ -75,3 +75,13 @@ def test_m1_image_trusts_the_lan_it_is_on_over_ipv6():
         if ":" in entry:
             net = ipaddress.ip_network(entry, strict=False)
             assert net.is_private or net.is_link_local or net.is_loopback, entry
+
+
+def test_m1_image_serves_the_toolpath_for_the_live_model():
+    """B9-MR-1: without the section the component never loads, gcode_preprocessor
+    makes no toolpath at upload, and /server/muon/toolpath is a 404."""
+    config = configparser.ConfigParser(interpolation=None)
+    config.read(TEMPLATE, encoding="utf-8")
+
+    assert config.has_section("muon_toolpath")
+    assert config.has_section("gcode_preprocessor")

@@ -24,6 +24,7 @@ from ...utils import source_info
 from ...utils import json_wrapper as jsonw
 from ...common import RequestType, TransportType
 from ... import muon_config_guard
+from ... import muon_access_policy
 
 # Annotation imports
 from typing import (
@@ -847,6 +848,19 @@ class FileManager:
                     op_func = shutil.copy2
             else:
                 raise self.server.error(f"Invalid endpoint {ep}")
+            # shutil places a file inside an existing destination directory.
+            # Authorize and tag that complete destination before it is visible.
+            effective_dest = dest_path
+            if os.path.isdir(dest_path) and (
+                ep == "/server/files/move" or not os.path.isdir(source_path)
+            ):
+                effective_dest = os.path.join(dest_path, os.path.basename(source_path))
+            source_rel = self.get_relative_path(source_root, source_path)
+            dest_rel = self.get_relative_path(dest_root, effective_dest)
+            await muon_access_policy.prepare_file_operation(web_request, {
+                "source": f"{source_root}/{source_rel}",
+                "dest": f"{dest_root}/{dest_rel}",
+            })
             self.sync_lock.setup(action, dest_path, move_copy=True)
             try:
                 full_dest = await self.event_loop.run_in_thread(
@@ -898,6 +912,11 @@ class FileManager:
                 raise self.server.error(
                     "At least one file or directory must be specified"
                 )
+            dest_rel = self.get_relative_path(dest_root, str(dest_path))
+            await muon_access_policy.prepare_file_operation(web_request, {
+                "items": items,
+                "dest": f"{dest_root}/{dest_rel}",
+            })
             self.sync_lock.setup("create_file", dest_path)
             await self.event_loop.run_in_thread(
                 self._zip_files, items, dest_path, store_only
