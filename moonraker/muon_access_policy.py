@@ -419,11 +419,7 @@ def _gateway_principal(user: Any) -> Principal:
 
 
 def _is_password_user(user: Any) -> bool:
-    return (
-        user is not None
-        and getattr(user, "username", None) == PASSWORD_LOGIN_USER
-        and getattr(user, "source", None) == "moonraker"
-    )
+    return muon_floor.is_panel_login(user)
 
 
 def resolve_principal(

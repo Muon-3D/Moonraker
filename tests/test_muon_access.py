@@ -45,7 +45,8 @@ IP_JSON = [
 ]
 
 TRUSTED_USER = UserInfo("_TRUSTED_USER_", "")
-PASSWORD_USER = UserInfo("admin", "", source="moonraker")
+PASSWORD_USER = UserInfo("admin", "", source="moonraker",
+                         groups=[muon_floor.PANEL_LOGIN_GROUP])
 LEGACY_GATEWAY_USER = GatewayUser(
     "muon-link:0123456789abcdef", "", source="muon_gateway"
 )

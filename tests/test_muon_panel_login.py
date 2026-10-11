@@ -29,6 +29,9 @@ from moonraker.components import muon_protection
 from moonraker.components.database import SqliteProvider, SqlTableWrapper
 from moonraker.components.authorization import Authorization
 from moonraker.components.muon_protection import MuonProtection
+from moonraker.components.websockets import WebsocketManager, WebSocket, BridgeSocket
+from moonraker.components.klippy_connection import KlippyConnection
+from moonraker import muon_access_policy
 from moonraker.utils.exceptions import ServerError
 
 LOOPBACK = "127.0.0.1"
@@ -73,6 +76,17 @@ class _AuthServer:
 
     def __init__(self) -> None:
         self.loop = _Loop()
+        self.auth = None
+        self.wsm = WebsocketManager.__new__(WebsocketManager)
+        self.wsm.server = self
+        self.wsm.clients = {}
+        self.wsm.bridge_connections = {}
+        self.kconn = KlippyConnection.__new__(KlippyConnection)
+        self.kconn.subscriptions = {}
+
+    def lookup_component(self, name, default=None):
+        return {"authorization": self.auth, "websockets": self.wsm,
+                "klippy_connection": self.kconn}.get(name, default)
 
     def get_event_loop(self) -> _Loop:
         return self.loop
@@ -86,7 +100,11 @@ def _authorization(force_logins: bool = True) -> Authorization:
     auth = Authorization.__new__(Authorization)
     auth._credential_lock = asyncio.Lock()
     auth.server = _AuthServer()  # type: ignore[assignment]
+    auth.server.auth = auth
     auth.force_logins = force_logins
+    auth.default_source = "moonraker"
+    auth.issuer = "http://moonraker.test"
+    auth.login_timeout = 90
     auth.enable_api_key = False
     auth.api_key = "k"
     auth.users = {auth_mod.API_USER: UserInfo(auth_mod.API_USER, "k")}
@@ -444,7 +462,9 @@ class TestIdentityAtLevelOne:
         muon_floor.set_protection_level(muon_floor.LEVEL_OPEN)
 
     def test_a_browser_signed_in_with_the_password_has_an_identity(self):
-        signed_in = UserInfo(LOGIN, "", source="moonraker")
+        auth = _authorization()
+        _run(auth.set_panel_login("correct horse"))
+        signed_in = auth.users[LOGIN]
         muon_floor.check_protection(
             self.WIFI, self.HTTP, ipaddress.ip_address(LAN), signed_in)
 
@@ -503,6 +523,10 @@ class _Server:
 
     def register_local_namespace(self, *_a: Any, **_k: Any) -> _Namespace:
         return self.namespace
+
+    async def get_batch(self, _namespace, keys):
+        return {key: self.namespace.values[key] for key in keys
+                if key in self.namespace.values}
 
     def register_endpoint(self, *_a: Any) -> None:
         pass
@@ -603,3 +627,146 @@ def test_panel_password_requires_login_without_force_logins():
     with pytest.raises(HTTPError):
         _authenticate(auth, LAN)
     assert _authenticate(auth, LOOPBACK).username == auth_mod.TRUSTED_USER
+
+class TestPanelCredentialBoundary:
+    @staticmethod
+    def _login_request(username=LOGIN, source="moonraker"):
+        return WebRequest(
+            "/access/user",
+            {"username": username, "password": "correct horse", "source": source},
+            RequestType.POST, SimpleNamespace(transport_type=None),
+            ipaddress.ip_address(LAN), None)
+
+    @pytest.mark.parametrize(
+        "source,create", [("moonraker", True), ("ldap", True), ("ldap", False)])
+    def test_normal_user_creation_cannot_claim_the_panel_name(self, source, create):
+        auth = _authorization()
+
+        class Ldap:
+            async def authenticate_ldap_user(self, *_args):
+                pass
+        auth.ldap = Ldap()
+        with pytest.raises(ServerError):
+            _run(auth._login_jwt_user(
+                self._login_request(source=source), create=create))
+        assert LOGIN not in auth.users
+        assert auth.sql_log == []
+
+    def test_an_unmarked_admin_is_not_a_panel_identity(self):
+        user = UserInfo(LOGIN, "", source="moonraker")
+        assert not muon_floor.has_identity(None, ipaddress.ip_address(LAN), user)
+        assert not muon_access_policy._is_password_user(user)
+        auth = _authorization()
+        auth.users[LOGIN] = user
+        assert auth.panel_login_set()  # fail closed until a panel reset
+
+    def test_preexisting_admin_jwt_cannot_supply_panel_provenance(self):
+        auth = _authorization()
+        auth.issuer = "http://moonraker.test"
+        _run(auth.set_panel_login("correct horse"))
+        token = _run(auth._login_jwt_user(self._login_request()))["token"]
+        assert auth.decode_jwt(token) is auth.users[LOGIN]
+        auth.users[LOGIN].groups = []
+        with pytest.raises(ServerError):
+            auth.decode_jwt(token)
+
+    def test_an_unmarked_legacy_password_keeps_the_network_closed(self):
+        auth = _authorization(force_logins=False)
+        auth.users[LOGIN] = UserInfo(LOGIN, "old-password", source="moonraker")
+        with pytest.raises(HTTPError):
+            _authenticate(auth, LAN)
+        assert _authenticate(auth, LOOPBACK).username == auth_mod.TRUSTED_USER
+
+    @staticmethod
+    def _socket(ip, user):
+        sc = WebSocket.__new__(WebSocket)
+        sc._ip_addr = ipaddress.ip_address(ip)
+        sc._user_info = user
+        sc._need_auth = False
+        sc._uid = id(sc)
+        sc.closed = []
+        sc.close_socket = lambda code, reason: sc.closed.append((code, reason))
+        return sc
+
+    @staticmethod
+    def _bridge(ip, user):
+        sc = BridgeSocket.__new__(BridgeSocket)
+        sc._ip_addr = ipaddress.ip_address(ip)
+        sc.current_user = user
+        sc.uid = id(sc)
+        sc.klippy_write_buf = []
+        sc.klippy_writer = None
+        sc.closed = []
+        sc.close_socket = lambda code, reason: sc.closed.append((code, reason))
+        return sc
+
+    def test_first_password_revokes_network_sockets_bridges_and_oneshots(self):
+        auth = _authorization()
+        trusted = UserInfo(auth_mod.TRUSTED_USER, "")
+        gateway = UserInfo("muon-link:ab", "", source="muon_gateway")
+        sockets = [self._socket(ip, user) for ip, user in
+                   [(LAN, trusted), (HOTSPOT, trusted), (LOOPBACK, trusted),
+                    (MAPPED_LOOPBACK, trusted), (SENTINEL, gateway)]]
+        bridges = [self._bridge(ip, user) for ip, user in
+                   [(LAN, trusted), (LOOPBACK, trusted), (SENTINEL, gateway)]]
+        auth.server.wsm.clients = {id(sc): sc for sc in sockets}
+        auth.server.kconn.subscriptions = {sc: {} for sc in sockets}
+        auth.server.wsm.bridge_connections = {id(sc): sc for sc in bridges}
+        cancelled = []
+        for ip, user, token in [(LAN, trusted, "lan"), (LOOPBACK, trusted, "panel"),
+                                (SENTINEL, gateway, "gateway")]:
+            handle = SimpleNamespace(cancel=lambda token=token: cancelled.append(token))
+            auth.oneshot_tokens[token] = (ipaddress.ip_address(ip), user, handle)
+        _run(auth.set_panel_login("correct horse"))
+        assert [sc.need_auth for sc in sockets] == [True, True, False, False, False]
+        assert [bool(sc.closed) for sc in sockets] == [True, True, False, False, False]
+        assert set(auth.server.kconn.subscriptions) == set(sockets[2:])
+        assert [bool(sc.closed) for sc in bridges] == [True, False, False]
+        assert set(auth.oneshot_tokens) == {"panel", "gateway"}
+        assert cancelled == ["lan"]
+
+    @pytest.mark.parametrize("password", ["new password", None])
+    def test_rekey_or_clear_revokes_old_admin_oneshots_and_bridges(self, password):
+        auth = _authorization()
+        _run(auth.set_panel_login("correct horse"))
+        user = auth.users[LOGIN]
+        bridge = self._bridge(LAN, user)
+        auth.server.wsm.bridge_connections = {id(bridge): bridge}
+        cancelled = []
+        auth.oneshot_tokens["old"] = (
+            ipaddress.ip_address(LAN), user,
+            SimpleNamespace(cancel=lambda: cancelled.append(True)))
+        _run(auth.set_panel_login(password))
+        assert bridge.closed
+        assert auth.oneshot_tokens == {}
+        assert cancelled == [True]
+
+    def test_a_socket_prepared_before_the_password_cannot_register_after_it(self):
+        auth = _authorization()
+        trusted = UserInfo(auth_mod.TRUSTED_USER, "")
+        socket = self._socket(LAN, trusted)
+        bridge = self._bridge(LAN, trusted)
+        _run(auth.set_panel_login("correct horse"))
+        auth.server.wsm.add_client(socket)
+        auth.server.wsm.add_bridge_connection(bridge)
+        assert socket.need_auth
+        assert bridge.closed
+
+    def test_a_trusted_lookup_finishing_after_password_creation_is_refused(self):
+        async def exercise():
+            auth = _authorization()
+            started, release = asyncio.Event(), asyncio.Event()
+
+            async def lookup(_ip):
+                started.set()
+                await release.wait()
+                return UserInfo(auth_mod.TRUSTED_USER, "")
+            auth._check_trusted_connection = lookup
+            authenticating = asyncio.create_task(
+                auth.authenticate_request(_Request(LAN)))
+            await started.wait()
+            await auth.set_panel_login("correct horse")
+            release.set()
+            with pytest.raises(HTTPError):
+                await authenticating
+        _run(exercise())

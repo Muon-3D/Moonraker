@@ -541,6 +541,12 @@ class Authorization:
         if username in RESERVED_USERS:
             raise self.server.error(
                 f"Invalid Request for user {username}")
+        if username == muon_floor.PANEL_LOGIN_USER and (
+            create or source != "moonraker"
+            or not muon_floor.is_panel_login(self.users.get(username))
+        ):
+            raise self.server.error(
+                "This login can only be created at the printer's panel.", 403)
         if source == "ldap":
             if create:
                 raise self.server.error("Cannot Create LDAP User")
@@ -656,7 +662,40 @@ class Authorization:
         }
 
     def panel_login_set(self) -> bool:
+        # Legacy admin rows have no provenance. Keep their login gate closed
+        # until the owner resets the password at the panel; never promote them.
         return muon_floor.PANEL_LOGIN_USER in self.users
+
+    def panel_password_allows(
+        self, user: Optional[UserInfo], ip: Optional[IPAddr]
+    ) -> bool:
+        """Revalidate cached credentials across a panel password change."""
+        if user is None or muon_floor.local_address(ip):
+            return True
+        if user.source == muon_floor.GATEWAY_USER_SOURCE:
+            return True
+        if user.username == muon_floor.PANEL_LOGIN_USER:
+            return (
+                muon_floor.is_panel_login(user)
+                and self.users.get(user.username) is user
+            )
+        if user.username == TRUSTED_USER:
+            return not self.panel_login_set()
+        return True
+
+    def _invalidate_panel_password_sessions(self) -> None:
+        for token, (ip, user, handle) in list(self.oneshot_tokens.items()):
+            if not self.panel_password_allows(user, ip):
+                handle.cancel()
+                self.oneshot_tokens.pop(token, None)
+        if self.panel_login_set():
+            for ip in list(self.trusted_users):
+                if not muon_floor.local_address(ip):
+                    self.trusted_users.pop(ip, None)
+        wsm: Optional[WebsocketManager] = self.server.lookup_component(
+            "websockets", None)
+        if wsm is not None:
+            wsm.invalidate_panel_password_sessions()
 
     async def set_panel_login(self, password: Optional[str]) -> None:
         """MUON, SEC-8: create, re-key or remove the panel-managed login.
@@ -684,13 +723,17 @@ class Authorization:
             hashed_pass = hashlib.pbkdf2_hmac(
                 'sha256', password.encode(), salt, HASH_ITER).hex()
             user = UserInfo(
-                username=username, password=hashed_pass, salt=salt.hex()
+                username=username, password=hashed_pass, salt=salt.hex(),
+                groups=[muon_floor.PANEL_LOGIN_GROUP]
             )
             await self._persist_panel_login(user)
             self.users[username] = user
+            self._invalidate_panel_password_sessions()
             if existing is None:
                 return
             event = "authorization:user_logged_out"
+        if not password:
+            self._invalidate_panel_password_sessions()
         if existing.jwk_id is not None:
             self.public_jwks.pop(existing.jwk_id, None)
         event_loop = self.server.get_event_loop()
@@ -779,6 +822,11 @@ class Authorization:
             payload.get('username', ""), None)
         if user_info is None:
             raise self.server.error("Unknown user", 401)
+        if (
+            user_info.username == muon_floor.PANEL_LOGIN_USER
+            and not muon_floor.is_panel_login(user_info)
+        ):
+            raise self.server.error("This login is not panel-managed", 401)
         return user_info
 
     def validate_jwt(self, token: str) -> UserInfo:
@@ -997,6 +1045,10 @@ class Authorization:
         # then it is acceptable to return None
         trusted_user = await self._check_trusted_connection(ip)
         if trusted_user is not None:
+            if not self.panel_password_allows(trusted_user, ip):
+                if not auth_required:
+                    return None
+                raise HTTPError(401, "Unauthorized, Panel Password Enabled")
             return trusted_user
         if not auth_required:
             return None

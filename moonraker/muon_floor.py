@@ -386,6 +386,17 @@ def check_floor(
 #: The one login the panel manages. Fluidd's sign-in page takes this name and
 #: the password set at the panel.
 PANEL_LOGIN_USER = "admin"
+PANEL_LOGIN_GROUP = "muon_panel_login"
+
+
+def is_panel_login(user: Any) -> bool:
+    """Only the panel credential writer stamps this persisted provenance."""
+    return (
+        user is not None
+        and getattr(user, "username", None) == PANEL_LOGIN_USER
+        and getattr(user, "source", None) == "moonraker"
+        and PANEL_LOGIN_GROUP in getattr(user, "groups", [])
+    )
 
 
 def login_required(
@@ -507,13 +518,7 @@ def has_identity(
         return True
     if local_address(ip_addr):
         return True
-    # Only a JWT for the panel's password carries this name; trusted_clients
-    # stamps _TRUSTED_USER_, never it.
-    if (
-        user is not None
-        and getattr(user, "username", None) == PANEL_LOGIN_USER
-        and getattr(user, "source", None) == "moonraker"
-    ):
+    if is_panel_login(user):
         return True
     return (
         _is_gateway_address(ip_addr)
