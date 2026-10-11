@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import ipaddress
 import logging
 import os
 import socket
@@ -136,8 +137,9 @@ def _ipv4_ioctl(ifname: str) -> Optional[str]:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             req = struct.pack("256s", ifname.encode()[:15])
-            return socket.inet_ntoa(
+            address = socket.inet_ntoa(
                 fcntl.ioctl(sock.fileno(), 0x8915, req)[20:24])
+            return None if ipaddress.ip_address(address).is_link_local else address
         finally:
             sock.close()
     except OSError:
@@ -362,7 +364,15 @@ async def _ssid_saved_before(setup: MuonSetup, ssid: str) -> bool:
     # until OS-2: GET /wifi/show?ssid= stands in on this image.
     try:
         await setup.aux("GET", "/wifi/show?" + urlencode({"ssid": ssid}))
-    except AuxMissing:
+    except AuxMissing as exc:
+        # Older Aux images use a resource-specific 404 for a missing profile.
+        # A generic route 404 is ambiguous, so preserve the owner's profile.
+        cause = exc.__cause__
+        if isinstance(cause, ServerError) and cause.status_code == 404:
+            message = str(cause)
+            missing = f"Connection profile '{ssid}' not found"
+            if message == missing or message.startswith(missing + ": "):
+                return False
         return True
     except AuxRefused as exc:
         return exc.status != 404

@@ -569,7 +569,10 @@ class TestRegionEndpoint:
 
 
 class TestEthernet:
-    def test_ethernet_with_an_address_is_done(self):
+    def test_ethernet_with_an_address_is_done(self, monkeypatch):
+        # Exercise the machine fallback without reading the test host's eth0.
+        monkeypatch.setattr(network, "_ipv4_ioctl", lambda _ifname: None)
+
         async def go():
             h = await Harness(stored=join_state()).start()
             h.server.components["machine"].eth0 = "10.10.0.5"
@@ -723,4 +726,39 @@ class TestDeferredCleanup:
             assert out["error"]["code"] == "busy"
             gate.set()
             await h.setup.drain()
+        run(go())
+
+class TestLegacySavedProfileAndUplink:
+    @pytest.mark.parametrize("message", [
+        f"Connection profile '{SSID}' not found",
+        f"Connection profile '{SSID}' not found: nmcli connection show failed",
+    ])
+    def test_no_saved_route_can_still_recognize_an_absent_profile(self, message):
+        async def go():
+            script = JoinScript()
+            aux = wifi_aux(script)
+            del aux.routes[("GET", "/wifi/saved")]
+            aux.routes[("GET", "/wifi/show?ssid=" + SSID)] = ServerError(message, 404)
+            h = await Harness(stored=join_state(), aux=aux).start()
+            assert await network._ssid_saved_before(h.setup, SSID) is False
+        run(go())
+
+    def test_a_missing_show_route_keeps_the_profile(self):
+        async def go():
+            aux = wifi_aux(JoinScript())
+            del aux.routes[("GET", "/wifi/saved")]
+            del aux.routes[("GET", "/wifi/show")]
+            h = await Harness(stored=join_state(), aux=aux).start()
+            assert await network._ssid_saved_before(h.setup, SSID) is True
+        run(go())
+
+    def test_ioctl_link_local_is_not_an_uplink(self):
+        import unittest.mock as mock
+
+        async def go():
+            h = await Harness(stored=join_state()).start()
+            with mock.patch.object(network.fcntl, "ioctl", return_value=(
+                    bytes(20) + network.socket.inet_aton("169.254.2.3") + bytes(232))):
+                assert network.interface_ipv4(h.setup, "eth0") is None
+                assert network.ethernet_status(h.setup)["address"] is None
         run(go())
