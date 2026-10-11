@@ -230,6 +230,7 @@ class ZeroconfRegistrar:
             "muon_setup:muon_setup_changed", self._muon_setup_changed)
         self.service_list: List[AsyncServiceInfo] = []
         self.octo_service_info: Optional[AsyncServiceInfo] = None
+        self._muon_txt_lock = asyncio.Lock()
         # Set once the records are on the network. Until then a change only
         # updates `muon_txt`, and component_init catches up when it is done.
         self.registered: bool = False
@@ -361,6 +362,10 @@ class ZeroconfRegistrar:
             await self._announce_muon_txt()
 
     async def _announce_muon_txt(self) -> None:
+        async with self._muon_txt_lock:
+            await self._announce_muon_txt_locked()
+
+    async def _announce_muon_txt_locked(self) -> None:
         old = self.octo_service_info
         if old is None:
             return
@@ -384,12 +389,13 @@ class ZeroconfRegistrar:
             properties=props,
             server=old.server,
         )
-        self.service_list[self.service_list.index(old)] = new
-        self.octo_service_info = new
         try:
             await self.runner.update_services([new])
         except Exception:
             logging.exception("Zeroconf: error re-announcing the OctoPrint record")
+            return
+        self.service_list[self.service_list.index(old)] = new
+        self.octo_service_info = new
 
     async def _update_service(self, network: Dict[str, Any]) -> None:
         if self.bound_all:

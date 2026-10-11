@@ -206,3 +206,53 @@ def test_name_falls_back_and_unknown_states_are_left_out() -> None:
     assert zc._muon_txt({}) == {}
     long = zc._muon_txt({"printer": {"display": "x" * 400}})["name"]
     assert len(("name=" + long).encode()) <= 255
+
+
+def test_an_identical_state_retries_a_failed_announcement() -> None:
+    reg, runner, server = build(M1, FakeSetup(state("in_progress")))
+    old = reg.octo_service_info
+    attempts = []
+    original_update = runner.update_services
+
+    async def failing_once(infos):
+        attempts.append(infos)
+        if len(attempts) == 1:
+            raise OSError("network unavailable")
+        await original_update(infos)
+
+    runner.update_services = failing_once
+    handler = server.handlers["muon_setup:muon_setup_changed"]
+    asyncio.run(handler(state("complete")))
+    assert reg.octo_service_info is old
+    assert txt(reg.octo_service_info)["setup"] == "in_progress"
+    asyncio.run(handler(state("complete")))
+    assert len(attempts) == 2
+    assert txt(reg.octo_service_info)["setup"] == "complete"
+
+
+def test_overlapping_name_changes_finish_with_the_latest_name() -> None:
+    reg, runner, server = build(M1, FakeSetup(state("in_progress")))
+
+    async def exercise():
+        entered, release = asyncio.Event(), asyncio.Event()
+        original_update = runner.update_services
+        attempts = []
+
+        async def blocking_first(infos):
+            attempts.append(infos)
+            if len(attempts) == 1:
+                entered.set()
+                await release.wait()
+            await original_update(infos)
+
+        runner.update_services = blocking_first
+        handler = server.handlers["muon_setup:muon_setup_changed"]
+        first = asyncio.create_task(handler(state("complete", "Oak", "Oak")))
+        await entered.wait()
+        second = asyncio.create_task(handler(state("complete", "Elm", "Elm")))
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.gather(first, second)
+        assert txt(reg.octo_service_info)["name"] == "Elm"
+
+    asyncio.run(exercise())
