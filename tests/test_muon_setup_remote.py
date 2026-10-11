@@ -306,3 +306,48 @@ class TestCloudCapability:
             await h.setup.refresh_live(full=True)
             assert h.setup._live["capabilities"]["cloud_link"] is False
         run(go())
+
+class TestCloudAttemptLifetime:
+    def test_cloud_can_finish_from_the_completion_card(self):
+        async def go():
+            doc = cloud_state()
+            doc.update(state="complete", cursor="finish")
+            doc["steps"]["remote"].update(mode="later", status="skipped")
+            link = FakeMuonLink([
+                {"phase": "connecting"},
+                {"phase": "linked", "account": "owner@example.test"},
+            ])
+            h = await remote_harness(link, stored=doc)
+            out = await h.post("/remote", body(mode="cloud", rev=h.doc["rev"]))
+            assert out["ok"]
+            await settle(h)
+            assert h.doc["steps"]["remote"]["status"] == "done"
+            assert h.doc["steps"]["remote"]["account"] == "owner@example.test"
+            assert h.doc["state"] == "complete" and h.doc["cursor"] == "finish"
+        run(go())
+
+    @pytest.mark.parametrize("mode", ["local", "later"])
+    @pytest.mark.parametrize("result", [
+        {"phase": "linked", "account": "stale@example.test"},
+        {"phase": "offer", "account": "stale@example.test"},
+        {"phase": "unavailable"},
+    ])
+    def test_a_result_in_flight_cannot_overwrite_a_new_mode(self, mode, result):
+        async def go():
+            entered, release = asyncio.Event(), asyncio.Event()
+            link = FakeMuonLink([{"phase": "connecting"}])
+
+            async def blocked_status():
+                entered.set()
+                await release.wait()
+                return result
+            link.status = blocked_status
+            h = await remote_harness(link)
+            await h.post("/remote", body(mode="cloud", rev=h.doc["rev"]))
+            await entered.wait()
+            await h.post("/remote", body(mode=mode, rev=h.doc["rev"]))
+            expected = h.doc["steps"]["remote"].copy()
+            release.set()
+            await settle(h)
+            assert h.doc["steps"]["remote"] == expected
+        run(go())

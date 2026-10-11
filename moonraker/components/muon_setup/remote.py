@@ -80,13 +80,16 @@ async def refresh(setup: MuonSetup) -> None:
         _ensure_poller(setup)
 
 
-def _waiting(setup: MuonSetup) -> bool:
+def _waiting(setup: MuonSetup, generation: Optional[int] = None) -> bool:
     """Whether the step is waiting on the link: the poller's whole life."""
     doc = setup.doc
-    if doc is None or setup._closed:
+    if doc is None or setup._closed or (
+        generation is not None and generation != setup._remote_generation
+    ):
         return False
     step = doc["steps"]["remote"]
-    return (doc["cursor"] == "remote" and step.get("mode") == "cloud"
+    return ((doc["cursor"] == "remote" or doc["state"] == "complete")
+            and step.get("mode") == "cloud"
             and step["status"] == "pending" and step.get("error") is None)
 
 
@@ -94,7 +97,16 @@ def _ensure_poller(setup: MuonSetup) -> None:
     task = getattr(setup, "_remote_poll_task", None)
     if task is not None and not task.done():
         return
-    setup._remote_poll_task = setup._spawn(_poll(setup))
+    setup._remote_poll_task = setup._spawn(_poll(setup, setup._remote_generation))
+
+
+def _next_attempt(setup: MuonSetup) -> Optional[asyncio.Task]:
+    setup._remote_generation += 1
+    task = setup._remote_poll_task
+    setup._remote_poll_task = None
+    if task is not None and not task.done():
+        task.cancel()
+    return task
 
 
 # --------------------------------------------------------------------------
@@ -109,12 +121,16 @@ async def handle_remote(
         step = doc["steps"]["remote"]
         mode = ctx.args.get("mode")
         if mode == "local":
+            _next_attempt(setup)
             step.update(mode="local", status="done", error=None)
-            setup.advance()
+            if doc["state"] != "complete":
+                setup.advance()
             return None
         if mode == "later":
+            _next_attempt(setup)
             step.update(mode="later", status="skipped", error=None)
-            setup.advance()
+            if doc["state"] != "complete":
+                setup.advance()
             return None
         if mode != "cloud":
             return model.error(
@@ -133,6 +149,7 @@ async def handle_remote(
             step["error"] = model.error(
                 "link_unavailable", "muon-link is not configured")
             return None
+        _next_attempt(setup)
         step.update(mode="cloud", status="pending", error=None)
         try:
             status = await link.start()
@@ -143,7 +160,8 @@ async def handle_remote(
         if isinstance(status, dict) and status.get("phase") == "linked":
             step.update(link=copy.deepcopy(status), status="done",
                         account=status.get("account"), error=None)
-            setup.advance()
+            if doc["state"] != "complete":
+                setup.advance()
             return None
         if isinstance(status, dict) and status.get("phase") == "unavailable":
             step.update(link=copy.deepcopy(status))
@@ -176,7 +194,8 @@ async def handle_cancel(
     step = doc["steps"]["remote"]
     if step["status"] == "done":
         return setup.envelope()  # no-op once linked (02 §5.9)
-    task = getattr(setup, "_remote_poll_task", None)
+    task = _next_attempt(setup)
+    generation = setup._remote_generation
     if task is not None and not task.done():
         task.cancel()
         try:
@@ -190,7 +209,7 @@ async def handle_cancel(
         except Exception as exc:
             logging.info("muon_setup: muon-link cancel failed: %s", exc)
     async with setup._lock:
-        if setup.doc is not None:
+        if setup.doc is not None and generation == setup._remote_generation:
             setup.doc["steps"]["remote"].update(
                 mode=None, link=None, error=None)
             await setup._commit()
@@ -201,54 +220,60 @@ async def handle_cancel(
 # The two-second poll
 # --------------------------------------------------------------------------
 
-async def _poll(setup: MuonSetup) -> None:
+async def _poll(setup: MuonSetup, generation: int) -> None:
     retried = False
-    while _waiting(setup):
+    while _waiting(setup, generation):
         await asyncio.sleep(POLL_SECONDS)
-        if not _waiting(setup):
+        if not _waiting(setup, generation):
             return
         link = _link(setup)
         if link is None:
             await _fail(setup, "link_unavailable",
-                        "muon-link is not configured")
+                        "muon-link is not configured", generation=generation)
             return
         try:
             status = await link.status()
         except Exception:
             await _fail(setup, "link_unavailable",
-                        "muon-link is not answering")
+                        "muon-link is not answering", generation=generation)
+            return
+        if not _waiting(setup, generation):
             return
         if not isinstance(status, dict):
             continue
         phase = status.get("phase")
         if phase == "unavailable":
-            await _mirror(setup, status)
+            await _mirror(setup, status, generation)
             await _fail(setup, "link_unavailable",
-                        "no link orchestrator is configured")
+                        "no link orchestrator is configured", generation=generation)
             return
         if phase == "linked":
-            await _linked(setup, status)
+            await _linked(setup, status, generation)
             return
         if phase == "failed" and not retried:
             # One retry on a failed ceremony (02 §5.9 step 3).
             retried = True
-            await _mirror(setup, status)
+            await _mirror(setup, status, generation)
+            if not _waiting(setup, generation):
+                return
             try:
                 status = await link.start()
             except Exception:
                 await _fail(setup, "link_failed",
                             "muon-link is not answering",
-                            detail={"message": "the retry could not start"})
+                            detail={"message": "the retry could not start"},
+                            generation=generation)
                 return
             if isinstance(status, dict) and status.get("phase") == "linked":
-                await _linked(setup, status)
+                await _linked(setup, status, generation)
                 return
-            await _mirror(setup, status)
+            await _mirror(setup, status, generation)
             continue
         if phase == "failed":
-            await _mirror(setup, status)
+            await _mirror(setup, status, generation)
             await _fail(setup, "link_failed", "the account link failed",
-                        detail={"message": status.get("message")})
+                        detail={"message": status.get("message")},
+                        generation=generation)
             return
         if phase == "code" and _code_expired(setup, status):
             # The code is past its life; ask for another (02 §5.9 step 3).
@@ -258,12 +283,12 @@ async def _poll(setup: MuonSetup) -> None:
             except Exception:
                 renewed = None
             if isinstance(renewed, dict) and renewed.get("phase") == "linked":
-                await _linked(setup, renewed)
+                await _linked(setup, renewed, generation)
                 return
             if isinstance(renewed, dict):
-                await _mirror(setup, renewed)
+                await _mirror(setup, renewed, generation)
             continue
-        await _mirror(setup, status)
+        await _mirror(setup, status, generation)
 
 
 def _code_expired(setup: MuonSetup, status: Dict[str, Any]) -> bool:
@@ -275,34 +300,38 @@ def _code_expired(setup: MuonSetup, status: Dict[str, Any]) -> bool:
     return time.time() > expires
 
 
-async def _mirror(setup: MuonSetup, status: Dict[str, Any]) -> None:
+async def _mirror(setup: MuonSetup, status: Dict[str, Any], generation: int) -> None:
     """Copy the phase object into remote.link unchanged; rev bumps only when
     it changed (it's stored state, 02 §5.9 step 2)."""
     async with setup._lock:
         doc = setup.doc
-        if doc is None or doc["steps"]["remote"].get("link") == status:
+        if not _waiting(setup, generation) or doc is None or (
+            doc["steps"]["remote"].get("link") == status
+        ):
             return
         doc["steps"]["remote"]["link"] = copy.deepcopy(status)
         await setup._commit()
 
 
-async def _linked(setup: MuonSetup, status: Dict[str, Any]) -> None:
+async def _linked(setup: MuonSetup, status: Dict[str, Any], generation: int) -> None:
     async with setup._lock:
         doc = setup.doc
-        if doc is None:
+        if doc is None or not _waiting(setup, generation):
             return
         doc["steps"]["remote"].update(
             link=copy.deepcopy(status), status="done",
             account=status.get("account"), error=None)
-        setup.advance()
+        if doc["state"] != "complete":
+            setup.advance()
         await setup._commit()
 
 
 async def _fail(setup: MuonSetup, code: str, message: str,
-                detail: Optional[Dict[str, Any]] = None) -> None:
+                detail: Optional[Dict[str, Any]] = None,
+                generation: Optional[int] = None) -> None:
     async with setup._lock:
         doc = setup.doc
-        if doc is None:
+        if doc is None or not _waiting(setup, generation):
             return
         step = doc["steps"]["remote"]
         step["status"] = "pending"

@@ -239,6 +239,7 @@ class MuonSetup:
         #: remote.py's link-phase poller (MR-5), while the remote step
         #: waits on muon-link.
         self._remote_poll_task: Optional[asyncio.Task] = None
+        self._remote_generation = 0
         #: network.py's in-flight Aux /wifi/connect, and the cleanup that
         #: waits it out before forgetting a partial profile.
         self._join_connect: Optional[asyncio.Task] = None
