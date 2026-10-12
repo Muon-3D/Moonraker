@@ -772,6 +772,43 @@ class TestPanelCredentialBoundary:
         _run(exercise())
 
 class TestPanelApiKeyAndSetupRole:
+    def test_panel_login_uses_moonraker_when_ldap_is_the_configured_default(self):
+        auth = _authorization()
+        auth.default_source = "ldap"
+        calls = []
+
+        class Ldap:
+            async def authenticate_ldap_user(self, *_args):
+                calls.append(True)
+        auth.ldap = Ldap()
+        _run(auth.set_panel_login("correct horse"))
+        request = TestPanelCredentialBoundary._login_request()
+        request.args.pop("source")
+        login = _run(auth._login_jwt_user(request))
+        assert login["source"] == "moonraker"
+        assert calls == [] and auth.default_source == "ldap"
+        request.args["source"] = "ldap"
+        with pytest.raises(ServerError):
+            _run(auth._login_jwt_user(request))
+        ordinary = TestPanelCredentialBoundary._login_request(username="friend")
+        ordinary.args.pop("source")
+        ordinary.ip_addr = ipaddress.ip_address(LOOPBACK)
+        assert _run(auth._login_jwt_user(ordinary))["source"] == "ldap"
+        assert calls == [True]
+
+    def test_info_reports_the_effective_panel_source_then_restores_ldap(self):
+        auth = _authorization()
+        auth.default_source = "ldap"
+        auth.ldap = object()
+        request = WebRequest(
+            "/access/info", {}, RequestType.GET, ip_addr=ipaddress.ip_address(LAN))
+        assert _run(auth._handle_info_request(request))["default_source"] == "ldap"
+        _run(auth.set_panel_login("correct horse"))
+        info = _run(auth._handle_info_request(request))
+        assert info["default_source"] == "moonraker"
+        _run(auth.set_panel_login(None))
+        assert _run(auth._handle_info_request(request))["default_source"] == "ldap"
+
     def test_protected_access_reaches_password_validation_and_refresh(self):
         from moonraker.common import APIDefinition, TransportType
 

@@ -405,6 +405,11 @@ class Authorization:
             "action": "user_logged_out"
         }
 
+    def _login_default_source(self, username: str) -> str:
+        if muon_floor.is_panel_login(self.users.get(username)):
+            return "moonraker"
+        return self.default_source
+
     async def _handle_info_request(self, web_request: WebRequest) -> Dict[str, Any]:
         sources = ["moonraker"]
         if self.ldap is not None:
@@ -419,7 +424,7 @@ class Authorization:
         elif req_ip is not None:
             request_trusted = await self._check_authorized_ip(req_ip)
         return {
-            "default_source": self.default_source,
+            "default_source": self._login_default_source(muon_floor.PANEL_LOGIN_USER),
             "available_sources": sources,
             "login_required": login_req,
             "trusted": request_trusted
@@ -532,7 +537,8 @@ class Authorization:
     ) -> Dict[str, Any]:
         username = web_request.get_str('username')
         password = web_request.get_str('password')
-        source = web_request.get_str('source', self.default_source).lower()
+        source = web_request.get_str(
+            'source', self._login_default_source(username)).lower()
         conn = web_request.get_client_connection()
         ip = web_request.get_ip_address()
         if ip is None and conn is not None and not web_request.is_plain_http():
