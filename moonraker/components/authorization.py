@@ -125,6 +125,7 @@ class UserSqlDefinition(SqlTableDefinition):
 
 class Authorization:
     def __init__(self, config: ConfigHelper) -> None:
+        self._credential_lock = asyncio.Lock()
         self.server = config.get_server()
         self.login_timeout = config.getint('login_timeout', 90)
         self.force_logins = config.getboolean('force_logins', False)
@@ -377,6 +378,10 @@ class Authorization:
         return ret
 
     async def _handle_logout(self, web_request: WebRequest) -> Dict[str, str]:
+        async with self._credential_lock:
+            return await self._logout_user(web_request)
+
+    async def _logout_user(self, web_request: WebRequest) -> Dict[str, str]:
         user_info = web_request.get_current_user()
         if user_info is None:
             raise self.server.error("No user logged in")
@@ -400,20 +405,26 @@ class Authorization:
             "action": "user_logged_out"
         }
 
+    def _login_default_source(self, username: str) -> str:
+        if muon_floor.is_panel_login(self.users.get(username)):
+            return "moonraker"
+        return self.default_source
+
     async def _handle_info_request(self, web_request: WebRequest) -> Dict[str, Any]:
         sources = ["moonraker"]
         if self.ldap is not None:
             sources.append("ldap")
-        login_req = self.force_logins and len(self.users) > 1
+        req_ip = web_request.ip_addr
+        login_req = muon_floor.login_required(
+            self.force_logins or self.panel_login_set(), len(self.users), req_ip)
         request_trusted: Optional[bool] = None
         user = web_request.get_current_user()
-        req_ip = web_request.ip_addr
         if user is not None and user.username == TRUSTED_USER:
             request_trusted = True
         elif req_ip is not None:
             request_trusted = await self._check_authorized_ip(req_ip)
         return {
-            "default_source": self.default_source,
+            "default_source": self._login_default_source(muon_floor.PANEL_LOGIN_USER),
             "available_sources": sources,
             "login_required": login_req,
             "trusted": request_trusted
@@ -427,6 +438,12 @@ class Authorization:
             user_info = self.decode_jwt(refresh_token, token_type="refresh")
         except Exception:
             raise self.server.error("Invalid Refresh Token", 401)
+        conn = web_request.get_client_connection()
+        ip = web_request.get_ip_address()
+        if ip is None and conn is not None and not web_request.is_plain_http():
+            ip = conn.authentication_ip
+        if not self.panel_password_allows(user_info, ip):
+            raise self.server.error("Panel password authentication required", 401)
         username: str = user_info.username
         if user_info.jwt_secret is None or user_info.jwk_id is None:
             raise self.server.error("User not logged in", 401)
@@ -497,6 +514,10 @@ class Authorization:
         if username in RESERVED_USERS:
             raise self.server.error(
                 f"Invalid Reset Request for user {username}")
+        # MUON, SEC-6: the panel's login changes only at the panel.
+        if username == muon_floor.PANEL_LOGIN_USER:
+            raise self.server.error(
+                "This password can only be changed at the printer's panel.", 403)
         salt = bytes.fromhex(user_info.salt)
         hashed_pass = hashlib.pbkdf2_hmac(
             'sha256', password.encode(), salt, HASH_ITER).hex()
@@ -514,17 +535,40 @@ class Authorization:
     async def _login_jwt_user(
         self, web_request: WebRequest, create: bool = False
     ) -> Dict[str, Any]:
-        username: str = web_request.get_str('username')
-        password: str = web_request.get_str('password')
-        source: str = web_request.get_str(
-            'source', self.default_source
-        ).lower()
+        username = web_request.get_str('username')
+        password = web_request.get_str('password')
+        source = web_request.get_str(
+            'source', self._login_default_source(username)).lower()
+        conn = web_request.get_client_connection()
+        ip = web_request.get_ip_address()
+        if ip is None and conn is not None and not web_request.is_plain_http():
+            ip = conn.authentication_ip
+        self._check_login_request(username, source, ip, create)
+        if source == "ldap":
+            assert self.ldap is not None
+            # An external server must not hold up the panel's password writer.
+            await self.ldap.authenticate_ldap_user(username, password)
+        async with self._credential_lock:
+            return await self._login_jwt_user_locked(
+                web_request, (username, password, source, ip), create)
+
+    def _check_login_request(
+        self, username: str, source: str, ip: Optional[IPAddr], create: bool
+    ) -> None:
         if source not in AUTH_SOURCES:
             raise self.server.error(f"Invalid 'source': {source}")
-        user_info: UserInfo
         if username in RESERVED_USERS:
             raise self.server.error(
                 f"Invalid Request for user {username}")
+        if username == muon_floor.PANEL_LOGIN_USER and (
+            create or source != "moonraker"
+            or not muon_floor.is_panel_login(self.users.get(username))
+        ):
+            raise self.server.error(
+                "This login can only be created at the printer's panel.", 403)
+        candidate = self.users.get(username) or UserInfo(username, "", source=source)
+        if not self.panel_password_allows(candidate, ip):
+            raise self.server.error("Panel password authentication required", 401)
         if source == "ldap":
             if create:
                 raise self.server.error("Cannot Create LDAP User")
@@ -532,9 +576,18 @@ class Authorization:
                 raise self.server.error(
                     "LDAP authentication not available", 401
                 )
-            await self.ldap.authenticate_ldap_user(username, password)
-            if username not in self.users:
-                create = True
+
+    async def _login_jwt_user_locked(
+        self, web_request: WebRequest,
+        credentials: Tuple[str, str, str, Optional[IPAddr]], create: bool = False
+    ) -> Dict[str, Any]:
+        # Keep the authenticated tuple fixed across LDAP's await, and recheck
+        # the current gate before any account creation or credential mutation.
+        username, password, source, ip = credentials
+        self._check_login_request(username, source, ip, create)
+        user_info: UserInfo
+        if source == "ldap" and username not in self.users:
+            create = True
         if create:
             if username in self.users:
                 raise self.server.error(f"User {username} already exists")
@@ -570,6 +623,8 @@ class Authorization:
             action = "user_logged_in"
             if hashed_pass != user_info.password:
                 raise self.server.error("Invalid Password")
+        if not self.panel_password_allows(user_info, ip):
+            raise self.server.error("Panel password authentication required", 401)
         jwt_secret_hex: Optional[str] = user_info.jwt_secret
         if jwt_secret_hex is None:
             private_key = Signer()
@@ -615,6 +670,10 @@ class Authorization:
         if username in RESERVED_USERS:
             raise self.server.error(
                 f"Invalid Request for reserved user {username}")
+        # MUON, SEC-6: removing the panel's login would remove the password.
+        if username == muon_floor.PANEL_LOGIN_USER:
+            raise self.server.error(
+                "This login can only be removed at the printer's panel.", 403)
         user_info: Optional[UserInfo] = self.users.get(username)
         if user_info is None:
             raise self.server.error(f"No registered user: {username}")
@@ -634,6 +693,103 @@ class Authorization:
             "username": username,
             "action": "user_deleted"
         }
+
+    def panel_login_set(self) -> bool:
+        # Legacy admin rows have no provenance. Keep their login gate closed
+        # until the owner resets the password at the panel; never promote them.
+        return muon_floor.PANEL_LOGIN_USER in self.users
+
+    def panel_password_allows(
+        self, user: Optional[UserInfo], ip: Optional[IPAddr]
+    ) -> bool:
+        """Revalidate cached credentials across a panel password change."""
+        if user is None or muon_floor.local_address(ip):
+            return True
+        if user.source == muon_floor.GATEWAY_USER_SOURCE:
+            return True
+        if user.username == muon_floor.PANEL_LOGIN_USER:
+            return (
+                muon_floor.is_panel_login(user)
+                and self.users.get(user.username) is user
+            )
+        return not self.panel_login_set()
+
+    def _invalidate_panel_password_sessions(self) -> None:
+        for token, (ip, user, handle) in list(self.oneshot_tokens.items()):
+            if not self.panel_password_allows(user, ip):
+                handle.cancel()
+                self.oneshot_tokens.pop(token, None)
+        if self.panel_login_set():
+            for ip in list(self.trusted_users):
+                if not muon_floor.local_address(ip):
+                    self.trusted_users.pop(ip, None)
+        wsm: Optional[WebsocketManager] = self.server.lookup_component(
+            "websockets", None)
+        if wsm is not None:
+            wsm.invalidate_panel_password_sessions()
+
+    async def set_panel_login(self, password: Optional[str]) -> None:
+        """MUON, SEC-8: create, re-key or remove the panel-managed login.
+
+        Called only by muon_protection, for the panel. Any change logs out every
+        session the old password opened: its JWT key is dropped, so the token
+        no longer decodes, and the logout event closes live websockets.
+        """
+        # Login/logout also persist credentials. Keep those writes outside
+        # this transaction so they cannot restore a superseded password.
+        async with self._credential_lock:
+            await self._set_panel_login_locked(password)
+
+    async def _set_panel_login_locked(self, password: Optional[str]) -> None:
+        username = muon_floor.PANEL_LOGIN_USER
+        existing = self.users.get(username)
+        if not password:
+            if existing is None:
+                return
+            await self._persist_panel_login(None)
+            del self.users[username]
+            event = "authorization:user_deleted"
+        else:
+            salt = secrets.token_bytes(32)
+            hashed_pass = hashlib.pbkdf2_hmac(
+                'sha256', password.encode(), salt, HASH_ITER).hex()
+            user = UserInfo(
+                username=username, password=hashed_pass, salt=salt.hex(),
+                groups=[muon_floor.NETWORK_ROLE, muon_floor.PANEL_LOGIN_GROUP]
+            )
+            await self._persist_panel_login(user)
+            self.users[username] = user
+            self._invalidate_panel_password_sessions()
+            if existing is None:
+                return
+            event = "authorization:user_logged_out"
+        if not password:
+            self._invalidate_panel_password_sessions()
+        if existing.jwk_id is not None:
+            self.public_jwks.pop(existing.jwk_id, None)
+        event_loop = self.server.get_event_loop()
+        event_loop.delay_callback(
+            .005, self.server.send_event, event, {'username': username})
+
+    async def _persist_panel_login(self, user: Optional[UserInfo]) -> None:
+        # The table context does not roll back a failed commit. Explicitly
+        # discard that transaction before another write can commit it later.
+        try:
+            async with self.user_table as tx:
+                if user is None:
+                    await tx.execute(
+                        f"DELETE FROM {USER_TABLE} WHERE username = ?",
+                        (muon_floor.PANEL_LOGIN_USER,)
+                    )
+                else:
+                    vals = user.as_tuple()
+                    placeholders = ",".join("?" * len(vals))
+                    await tx.execute(
+                        f"REPLACE INTO {USER_TABLE} VALUES({placeholders})", vals
+                    )
+        except BaseException:
+            await self.user_table.rollback()
+            raise
 
     def _generate_jwt(self,
                       username: str,
@@ -697,9 +853,14 @@ class Authorization:
             payload.get('username', ""), None)
         if user_info is None:
             raise self.server.error("Unknown user", 401)
+        if (
+            user_info.username == muon_floor.PANEL_LOGIN_USER
+            and not muon_floor.is_panel_login(user_info)
+        ):
+            raise self.server.error("This login is not panel-managed", 401)
         return user_info
 
-    def validate_jwt(self, token: str) -> UserInfo:
+    def validate_jwt(self, token: str, ip: Optional[IPAddr] = None) -> UserInfo:
         try:
             user_info = self.decode_jwt(token)
         except Exception as e:
@@ -708,13 +869,20 @@ class Authorization:
             raise self.server.error(
                 f"Failed to decode JWT: {e}", 401
             ) from e
+        if not self.panel_password_allows(user_info, ip):
+            raise self.server.error("Panel password authentication required", 401)
         return user_info
 
-    def validate_api_key(self, api_key: str) -> UserInfo:
+    def validate_api_key(
+        self, api_key: str, ip: Optional[IPAddr] = None
+    ) -> UserInfo:
         if not self.enable_api_key:
             raise self.server.error("API Key authentication is disabled", 401)
         if api_key and api_key == self.api_key:
-            return self.users[API_USER]
+            user = self.users[API_USER]
+            if not self.panel_password_allows(user, ip):
+                raise self.server.error("Panel password authentication required", 401)
+            return user
         raise self.server.error("Invalid API Key", 401)
 
     def _load_private_key(self, secret: str) -> Signer:
@@ -764,6 +932,8 @@ class Authorization:
         self.oneshot_tokens.pop(token, None)
 
     def get_oneshot_token(self, ip_addr: IPAddr, user: Optional[UserInfo]) -> str:
+        if not self.panel_password_allows(user, ip_addr):
+            raise self.server.error("Panel password authentication required", 401)
         token = base64.b32encode(os.urandom(20)).decode()
         event_loop = self.server.get_event_loop()
         hdl = event_loop.delay_callback(
@@ -861,6 +1031,8 @@ class Authorization:
                 logging.info(f"Oneshot Token IP Mismatch: expected{ip_addr}"
                              f", Recd: {cur_ip}")
                 return None
+            if not self.panel_password_allows(user, cur_ip):
+                return None
             return user
         else:
             return None
@@ -876,17 +1048,21 @@ class Authorization:
         if request.method == "OPTIONS":
             return None
 
-        # Check JSON Web Token
-        jwt_user = self._check_json_web_token(request, auth_required)
-        if jwt_user is not None:
-            return jwt_user
-
         try:
             ip = ipaddress.ip_address(request.remote_ip)  # type: ignore
         except ValueError:
             logging.exception(
                 f"Unable to Create IP Address {request.remote_ip}")
             ip = None
+
+        # Check JSON Web Token against the current panel-password gate.
+        jwt_user = self._check_json_web_token(request, auth_required)
+        if jwt_user is not None:
+            if self.panel_password_allows(jwt_user, ip):
+                return jwt_user
+            if auth_required:
+                raise HTTPError(401, "Panel password authentication required")
+            return None
 
         # Check oneshot access token
         ost: Optional[List[bytes]] = request.arguments.get('token', None)
@@ -899,11 +1075,18 @@ class Authorization:
         if self.enable_api_key:
             key: Optional[str] = request.headers.get("X-Api-Key")
             if key and key == self.api_key:
-                return self.users[API_USER]
+                try:
+                    return self.validate_api_key(key, ip)
+                except self.server.error as err:
+                    if auth_required:
+                        raise HTTPError(err.status_code, str(err)) from err
 
         # If the force_logins option is enabled and at least one user is created
-        # then trusted user authentication is disabled
-        if self.force_logins and len(self.users) > 1:
+        # then trusted user authentication is disabled.  MUON: the panel's
+        # password switches it on as well, whatever the config says, and the
+        # panel itself is exempt because it has no way to sign in (MuonOS #87).
+        force_logins = self.force_logins or self.panel_login_set()
+        if muon_floor.login_required(force_logins, len(self.users), ip):
             if not auth_required:
                 return None
             raise HTTPError(401, "Unauthorized, Force Logins Enabled")
@@ -912,6 +1095,10 @@ class Authorization:
         # then it is acceptable to return None
         trusted_user = await self._check_trusted_connection(ip)
         if trusted_user is not None:
+            if not self.panel_password_allows(trusted_user, ip):
+                if not auth_required:
+                    return None
+                raise HTTPError(401, "Unauthorized, Panel Password Enabled")
             return trusted_user
         if not auth_required:
             return None
