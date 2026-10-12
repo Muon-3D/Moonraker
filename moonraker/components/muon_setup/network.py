@@ -551,20 +551,24 @@ async def apply_region(
     return None
 
 
-async def _single_zone_tz(setup: MuonSetup, doc: Dict[str, Any]) -> None:
+async def _single_zone_tz(
+    setup: MuonSetup, doc: Dict[str, Any], country: Optional[str] = None
+) -> None:
     # Owner timezone writes use this lock through write(); phone writes share
     # it too, so an automatic response cannot land after a later choice.
     async with setup._lock:
         if setup.doc is not doc:
             return
-        await _single_zone_tz_locked(setup, doc)
+        await _single_zone_tz_locked(setup, doc, country)
 
 
-async def _single_zone_tz_locked(setup: MuonSetup, doc: Dict[str, Any]) -> None:
+async def _single_zone_tz_locked(
+    setup: MuonSetup, doc: Dict[str, Any], country: Optional[str]
+) -> None:
     """02 §5.6a step 4: a one-zone country sets the zone itself, unless the
     phone or the owner already chose."""
     region = setup._live.get("region") or {}
-    country = region.get("declared_country")
+    country = country or region.get("declared_country")
     if not isinstance(country, str):
         return
     if setup._internal.get("tz_source") in ("phone", "owner"):
@@ -641,7 +645,7 @@ def _region_outcome(
             setup.advance()
     # else: called while network is still pending before a join -- apply
     # only; the join sets region_confirmed (02 §5.6a).
-    setup._spawn(_single_zone_tz(setup, doc))
+    setup._spawn(_single_zone_tz(setup, doc, country))
 
 
 # --------------------------------------------------------------------------
@@ -768,7 +772,7 @@ def _join_runner(
                                 hostname_local=None, internet=None)
                 await handle.finish(failed)
                 return
-            await _single_zone_tz(setup, setup.doc or {})
+            await _single_zone_tz(setup, setup.doc or {}, region_arg)
             if not handle.current():
                 return
         # Step 4: the join. The connect call runs as a task while the device
@@ -828,10 +832,9 @@ def _join_runner(
                 # update check reached Aux is the internet verdict.
                 internet = True if checked else None
             if address is None:
-                address = interface_ipv4(setup, "wlan0")
-            if address is None:
                 await _finish_fail(setup, handle, "no_address", "dhcp",
-                                   ssid, saved_before, "no IPv4 on wlan0")
+                                   ssid, saved_before,
+                                   "no verified IPv4 on the requested network")
                 return
             setup._join_connect = None
             await _finish_join(setup, handle, ssid, address, internet,
