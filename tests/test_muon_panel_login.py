@@ -772,6 +772,46 @@ class TestPanelCredentialBoundary:
         _run(exercise())
 
 class TestPanelApiKeyAndSetupRole:
+    def test_protected_access_reaches_password_validation_and_refresh(self):
+        from moonraker.common import APIDefinition, TransportType
+
+        async def exercise():
+            auth = _authorization()
+            auth.max_logins = None
+            auth.failed_logins = {}
+            await auth.set_panel_login("correct horse")
+            policy = muon_access_policy
+            home = policy.HomeNetwork.from_interface_addresses([(LAN, 24)])
+            policy.set_state(policy.AccessState(
+                entry=policy.ENTRY_PROTECTED, owner=policy.OWNER_ACCOUNT,
+                preset="strict", home=home))
+            login_api = APIDefinition(
+                "/access/login", "/access/login", ["access.login"],
+                RequestType.POST, TransportType.HTTP, auth._handle_login, False)
+            refresh_api = APIDefinition(
+                "/access/refresh_jwt", "/access/refresh_jwt", ["access.refresh_jwt"],
+                RequestType.POST, TransportType.HTTP,
+                auth._handle_refresh_jwt, False)
+            args = {"username": LOGIN, "password": "correct horse"}
+            address = ipaddress.ip_address(LAN)
+            transport = SimpleNamespace(transport_type=TransportType.HTTP)
+            try:
+                with pytest.raises(ServerError):
+                    await login_api.request(
+                        dict(args, password="wrong"), RequestType.POST,
+                        transport, address, None)
+                login = await login_api.request(
+                    args, RequestType.POST, transport, address, None)
+                assert auth.validate_jwt(login["token"], address) is auth.users[LOGIN]
+                refreshed = await refresh_api.request(
+                    {"refresh_token": login["refresh_token"]}, RequestType.POST,
+                    transport, address, None)
+                assert auth.validate_jwt(
+                    refreshed["token"], address) is auth.users[LOGIN]
+            finally:
+                policy.set_state(None)
+        _run(exercise())
+
     def test_stalled_ldap_cannot_delay_password_activation_or_create_a_late_user(
         self
     ):
