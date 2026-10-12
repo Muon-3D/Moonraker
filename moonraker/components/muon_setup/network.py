@@ -87,6 +87,17 @@ def register(setup: MuonSetup) -> None:
     reg("/server/muon/setup/region", ["POST"],
         lambda webreq: handle_region(setup, webreq))
 
+    setup.boot_op_handlers["join"] = lambda doc: _on_join_boot(setup, doc)
+
+
+def _on_join_boot(setup: MuonSetup, doc: Dict[str, Any]) -> None:
+    op = doc["op"]
+    setup._mark_interrupted(doc, op)
+    ssid = op.get("ssid")
+    if op.get("forget") is True and isinstance(ssid, str) and ssid:
+        # Register before startup resolves, so writes cannot race this cleanup.
+        setup._join_cleanup = setup._spawn(_join_cleanup(setup, ssid))
+
 
 # --------------------------------------------------------------------------
 # Shared helpers
@@ -626,6 +637,9 @@ def _region_runner(setup: MuonSetup, country: str, from_join: bool):
             return
         await handle.finish(
             lambda doc: _region_outcome(setup, doc, country, None, from_join))
+        # A post-setup join may wait here for its region confirmation.
+        if setup.doc is not None and setup.doc["state"] == "complete":
+            setup._spawn(setup.schedule_hotspot_off())
     return run
 
 
