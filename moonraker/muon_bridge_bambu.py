@@ -244,7 +244,7 @@ class BambuPrinter:
             code = str(exc)[:3]
             raise BridgeError(
                 f"the printer refused the upload (FTP {code})",
-                401 if code == "530" else 502) from None
+                403 if code == "530" else 502) from None
         except (OSError, ftplib.Error, EOFError) as exc:
             raise BridgeError(
                 f"the upload failed: {type(exc).__name__}", 502) from None

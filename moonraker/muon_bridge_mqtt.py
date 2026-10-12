@@ -139,7 +139,7 @@ class MqttClient:
             code = body[1] if kind == CONNACK and len(body) == 2 else -1
             raise BridgeError(
                 CONNACK_REASONS.get(code, "the printer refused MQTT"),
-                401 if code in (4, 5) else 502)
+                403 if code in (4, 5) else 502)
 
     async def subscribe(self, topic: str, timeout: float = 10.0) -> None:
         assert self.writer is not None and self.reader is not None

@@ -417,7 +417,7 @@ def test_wrong_access_code_is_refused_and_dropped(
             with pytest.raises(ServerError) as info:
                 await call(printer.bridge, "open_session",
                            bambu_args(code="wrong123"))
-            assert info.value.status_code == 401
+            assert info.value.status_code == 403
             assert printer.bridge.sessions == {}
     asyncio.run(run())
 
@@ -508,6 +508,26 @@ def test_prusalink_digest_round_trip(qop: bool, algorithm: Optional[str]
     asyncio.run(run())
 
 
+def test_prusalink_second_session_after_the_first() -> None:
+    async def run() -> None:
+        state = PrusaState(qop=True)
+        server, port = start_prusa(state)
+        component = bridge()
+        component.dialer = lambda host, p: ("127.0.0.1", port)
+        try:
+            for _ in range(2):
+                conn = Connection(*OWNER)
+                opened = await call(component, "open_session", prusa_args(),
+                                    conn)
+                await call(component, "close_session",
+                           {"session_id": opened["session_id"]}, conn)
+            assert len(state.nonces) == 2
+        finally:
+            await component.close()
+            server.stop()
+    asyncio.run(run())
+
+
 def test_prusalink_wrong_password() -> None:
     async def run() -> None:
         state = PrusaState(qop=False)
@@ -517,7 +537,7 @@ def test_prusalink_wrong_password() -> None:
         try:
             with pytest.raises(ServerError) as info:
                 await call(component, "open_session", prusa_args("nope"))
-            assert info.value.status_code == 401
+            assert info.value.status_code == 403
             assert component.sessions == {}
         finally:
             server.stop()
@@ -584,6 +604,25 @@ def test_without_muon_access_only_the_panel() -> None:
     panel = (ipaddress.ip_address("127.0.0.1"), None)
     assert asyncio.run(call(component, "status", {}, None, panel)) == {
         "bridged": True, "sessions": []}
+
+
+@pytest.mark.parametrize("owner", [policy.OWNER_NONE, policy.OWNER_UNKNOWN])
+@pytest.mark.parametrize("entry", [policy.ENTRY_OPEN, policy.ENTRY_PROTECTED])
+def test_with_no_owner_only_the_panel(owner: str, entry: str) -> None:
+    """Bench finding: Open with no owner must not mean anyone at home."""
+    import ipaddress
+    state = policy.AccessState(entry=entry, owner=owner)
+    policy.set_state(state)
+    assert policy.required_level(policy.ACTIONS["bridge"], state) == \
+        policy.PANEL
+    component = bridge()
+    for who in (OWNER, gateway("signed_out_guest"), gateway("member")):
+        with pytest.raises(ServerError) as info:
+            asyncio.run(call(component, "status", {}, None, who))
+        assert info.value.status_code == 403
+    panel = (ipaddress.ip_address("127.0.0.1"), None)
+    assert asyncio.run(call(component, "status", {}, None, panel))[
+        "bridged"] is True
 
 
 def test_every_bridge_endpoint_is_the_bridge_row() -> None:

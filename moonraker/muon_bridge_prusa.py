@@ -197,15 +197,17 @@ class PrusaPrinter:
                 challenge = response.headers.get("WWW-Authenticate")
                 if challenge and self.auth.learn(challenge):
                     continue
+                # 403, not 401: Moonraker's JSON-RPC reports 401 as
+                # "invalid params" (common.py).
                 raise BridgeError("PrusaLink refused the user name or "
-                                  "password", 401)
+                                  "password", 403)
             answer = response.body or b""
             if len(answer) > MAX_ANSWER:
                 raise BridgeError("PrusaLink's answer is too large", 502)
             kept = {name: response.headers[name] for name in PASS_HEADERS
                     if name in response.headers}
             return response.code, kept, answer
-        raise BridgeError("PrusaLink kept refusing the Digest answer", 401)
+        raise BridgeError("PrusaLink kept refusing the Digest answer", 403)
 
     async def proxy(self, method: str, path: Any, body: Any = None
                     ) -> Dict[str, Any]:

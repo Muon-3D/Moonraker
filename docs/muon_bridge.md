@@ -44,7 +44,8 @@ Only the owner may use the bridge. Access is the `bridge` row of
 - It requires the admin level (the owner's level) from the home network,
   under every preset.
 - The row is fixed, so presets and overrides cannot change it.
-- If the printer has no owner, only the panel may use the bridge.
+- If the printer has no owner, or its owner isn't known yet, only the panel
+  may use the bridge, whether entry is Open or Protected.
 - Viewers are refused, and so are callers from away.
 
 `check_access` applies this row to every `/server/muon_bridge/*` endpoint,
@@ -100,6 +101,10 @@ again from the `Secret` for each request.
 - Only one session per target address.
 
 When a limit is hit, the call is refused with a 429.
+
+When the printer refuses the access code or the PrusaLink password, the
+call fails with a 403 whose message says so. It is not a 401, because
+Moonraker's JSON-RPC reports 401 as "invalid params".
 
 ## API
 

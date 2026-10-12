@@ -301,11 +301,13 @@ class PrusaState:
         self.qop = qop
         self.algorithm = algorithm
         self.realm = "Printer API"
-        self.nonce = os.urandom(8).hex()
+        #: A fresh nonce per challenge, as a server would, with the nonce
+        #: counts seen under each.
+        self.nonces: Dict[str, List[str]] = {}
         self.authorizations: List[str] = []
         self.files: Dict[str, bytes] = {}
         self.actions: List[str] = []
-        self.seen_nc: List[str] = []
+        self.seen_nc: List[Tuple[str, str]] = []
         self.unauthenticated = 0
 
 
@@ -321,7 +323,9 @@ class _Prusa(RequestHandler):
 
     def _challenge(self) -> None:
         s = self.state
-        header = f'Digest realm="{s.realm}", nonce="{s.nonce}"'
+        nonce = os.urandom(8).hex()
+        s.nonces[nonce] = []
+        header = f'Digest realm="{s.realm}", nonce="{nonce}"'
         if s.qop:
             header += ', qop="auth"'
         if s.algorithm:
@@ -343,19 +347,21 @@ class _Prusa(RequestHandler):
             key, _, value = part.partition("=")
             params[key] = value.strip('"')
         if params.get("username") != PRUSA_USER or \
-                params.get("nonce") != s.nonce or \
+                params.get("nonce") not in s.nonces or \
                 params.get("uri") != self.request.uri:
             return False
         ha1 = _hash(s.algorithm, f"{PRUSA_USER}:{s.realm}:{PRUSA_PASSWORD}")
         ha2 = _hash(s.algorithm, f"{self.request.method}:{self.request.uri}")
         if s.qop:
-            if params.get("qop") != "auth" or params["nc"] in s.seen_nc:
+            nonce = params["nonce"]
+            if params.get("qop") != "auth" or params["nc"] in s.nonces[nonce]:
                 return False
-            s.seen_nc.append(params["nc"])
-            want = _hash(s.algorithm, f"{ha1}:{s.nonce}:{params['nc']}:"
+            s.nonces[nonce].append(params["nc"])
+            s.seen_nc.append((nonce, params["nc"]))
+            want = _hash(s.algorithm, f"{ha1}:{nonce}:{params['nc']}:"
                          f"{params['cnonce']}:auth:{ha2}")
         else:
-            want = _hash(s.algorithm, f"{ha1}:{s.nonce}:{ha2}")
+            want = _hash(s.algorithm, f"{ha1}:{params['nonce']}:{ha2}")
         return params.get("response") == want
 
     def prepare(self) -> None:

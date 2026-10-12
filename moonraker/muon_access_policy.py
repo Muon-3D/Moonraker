@@ -356,7 +356,9 @@ def required_level(action: Action, state: AccessState) -> int:
         )
     if state.owner in (OWNER_NONE, OWNER_UNKNOWN):
         # (OWNER_UNKNOWN only for a delegated row, handled above otherwise)
-        if action.name == "protection":
+        if action.name in ("protection", "bridge"):
+            # bridge: another printer's controls are the owner's; with no
+            # owner, the panel's alone, Open or not.
             return PANEL
         if action.delegated:
             return base
