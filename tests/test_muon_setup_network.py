@@ -1286,3 +1286,181 @@ class TestEthernetToWifiConfirmation:
             assert step["region_confirmed"] is (detected == "DE")
             assert step["status"] == ("done" if detected == "DE" else "pending")
         run(go())
+
+
+class TestPersistedJoinBoundaries:
+    @pytest.mark.parametrize("owner_confirmation", [False, True])
+    @pytest.mark.parametrize("restart", [False, True])
+    def test_owner_region_choice_survives_ethernet_and_restart(
+        self, monkeypatch, owner_confirmation, restart
+    ):
+        async def go():
+            aux = wifi_aux(JoinScript())
+            aux.routes[("GET", "/region")] = dict(
+                REGION_174, declared_country="DE", detected_country="FR")
+            aux.routes[("POST", "/region/country")] = {"declared_country": "DE"}
+            monkeypatch.setattr(network, "interface_ipv4", lambda setup, iface:
+                                "10.10.0.5" if iface == "eth0" else "192.168.1.37")
+            h = await Harness(stored=join_state(), aux=aux).start()
+            await h.post("/network", {"rev": h.doc["rev"], "kind": "ethernet"})
+            if owner_confirmation:
+                out = await h.post("/region", {"rev": h.doc["rev"], "country": "DE"})
+                assert out["ok"]
+                await joined(h)
+            if restart:
+                await joined(h)
+                h = await Harness(namespaces=h.db.namespaces, aux=aux).start()
+            await h.post("/network", join_body(rev=h.doc["rev"]))
+            await joined(h)
+            step = h.doc["steps"]["network"]
+            assert step["region_confirmed"] is owner_confirmation
+            assert step["status"] == ("done" if owner_confirmation else "pending")
+        run(go())
+
+    @pytest.mark.parametrize("stage", ["connect", "cancel", "disconnect", "forget"])
+    def test_restart_resumes_cleanup_after_the_join_operation_was_cleared(self, stage):
+        async def go():
+            entered, release = asyncio.Event(), asyncio.Event()
+            script = JoinScript(connect_result=ServerError("bad-psk", 400))
+            script.current_ssid = SSID
+            aux = wifi_aux(script)
+
+            async def blocked(_body):
+                entered.set()
+                await release.wait()
+                return {"status": "connecting", "ssid": SSID}
+
+            if stage in ("connect", "cancel"):
+                aux.routes[("POST", "/wifi/connect")] = blocked
+            elif stage == "disconnect":
+                aux.routes[("POST", "/wifi/disconnect")] = blocked
+            else:
+                aux.routes[("DELETE", "/wifi/forget")] = blocked
+            h = await Harness(stored=join_state(), aux=aux).start()
+            if stage == "connect":
+                h.setup.join_timeout = 0.0
+            await h.post("/network", join_body(rev=h.doc["rev"]))
+            await entered.wait()
+            if stage == "cancel":
+                await h.post("/network/cancel", {})
+
+            async def cleared():
+                while h.doc["op"] is not None or h.stored()["op"] is not None:
+                    await asyncio.sleep(0)
+            await asyncio.wait_for(cleared(), 30.)
+            snapshot = h.db.namespaces
+            await h.setup.close()
+            recovered = JoinScript(saved=[SSID])
+            recovered.current_ssid = SSID
+            reboot = await Harness(namespaces=snapshot,
+                                   aux=wifi_aux(recovered)).start()
+            await joined(reboot)
+            assert reboot.doc["op"] is None
+            assert recovered.forgets == [SSID]
+            assert len(recovered.disconnects) == 1
+        run(go())
+
+
+class TestDurableCleanupLifetime:
+    def test_live_refresh_does_not_clean_a_join_that_can_still_succeed(self):
+        async def go():
+            release = asyncio.Event()
+            script = JoinScript()
+            aux = TestDeferredCleanup()._blocked_aux(script, release)
+            h = await Harness(stored=join_state(), aux=aux).start()
+            await h.post("/network", join_body(rev=h.doc["rev"]))
+            for _ in range(10):
+                await asyncio.sleep(0)
+            await h.setup.refresh_live()
+            assert script.forgets == [] and script.disconnects == []
+            release.set()
+            await joined(h)
+            accepted = JoinScript(saved=[SSID])
+            accepted.current_ssid = SSID
+            reboot = await Harness(namespaces=h.db.namespaces,
+                                   aux=wifi_aux(accepted)).start()
+            await joined(reboot)
+            assert accepted.forgets == [] and accepted.disconnects == []
+        run(go())
+
+    @pytest.mark.parametrize("stage", ["disconnect", "forget"])
+    def test_failed_cleanup_stays_recoverable_and_blocks_a_new_join(self, stage):
+        async def go():
+            script = JoinScript(connect_result=ServerError("bad-psk", 400))
+            script.current_ssid = SSID
+            aux = wifi_aux(script)
+            key = (("POST", "/wifi/disconnect") if stage == "disconnect"
+                   else ("DELETE", "/wifi/forget"))
+            aux.routes[key] = ServerError("Aux is temporarily unavailable", 503)
+            h = await Harness(stored=join_state(), aux=aux).start()
+            await h.post("/network", join_body(rev=h.doc["rev"]))
+            await joined(h)
+            before = len(script.connects)
+            out = await h.post("/network", join_body(rev=h.doc["rev"]))
+            assert out["error"]["code"] == "busy"
+            await joined(h)
+            assert len(script.connects) == before
+            recovered = JoinScript(saved=[SSID])
+            recovered.current_ssid = SSID
+            reboot = await Harness(namespaces=h.db.namespaces,
+                                   aux=wifi_aux(recovered)).start()
+            await joined(reboot)
+            assert recovered.forgets == [SSID]
+            assert len(recovered.disconnects) == 1
+        run(go())
+
+    def test_an_older_internal_write_cannot_erase_the_cleanup_marker(self):
+        async def go():
+            h = await Harness(stored=join_state()).start()
+            entered, release = asyncio.Event(), asyncio.Event()
+            insert = h.db.insert_item
+            first = True
+
+            async def blocked_insert(namespace, key, value):
+                nonlocal first
+                if key == "internal" and first:
+                    first = False
+                    entered.set()
+                    await release.wait()
+                return await insert(namespace, key, value)
+
+            h.db.insert_item = blocked_insert
+            old = asyncio.create_task(h.setup._persist_internal())
+            await entered.wait()
+            reserve = asyncio.create_task(network.remember_cleanup(h.setup, SSID))
+            for _ in range(10):
+                await asyncio.sleep(0)
+            release.set()
+            await asyncio.gather(old, reserve)
+            recovered = JoinScript(saved=[SSID])
+            recovered.current_ssid = SSID
+            reboot = await Harness(namespaces=h.db.namespaces,
+                                   aux=wifi_aux(recovered)).start()
+            await joined(reboot)
+            assert recovered.forgets == [SSID]
+        run(go())
+
+
+class TestResetWithPendingCleanup:
+    @pytest.mark.parametrize("recovers", [False, True])
+    def test_reset_preserves_pending_cleanup_or_waits_for_its_retry(self, recovers):
+        async def go():
+            script = JoinScript(connect_result=ServerError("bad-psk", 400))
+            script.current_ssid = SSID
+            aux = wifi_aux(script)
+            aux.routes[("DELETE", "/wifi/forget")] = ServerError("unavailable", 503)
+            h = await Harness(stored=join_state(), aux=aux).start()
+            await h.post("/network", join_body(rev=h.doc["rev"]))
+            await joined(h)
+            if recovers:
+                aux.routes[("DELETE", "/wifi/forget")] = script.routes()[
+                    ("DELETE", "/wifi/forget")]
+                out = await h.post("/reset", {})
+                assert out["ok"] and h.doc["state"] == "new"
+                assert script.forgets == [SSID]
+            else:
+                with pytest.raises(ServerError) as raised:
+                    await h.post("/reset", {})
+                assert raised.value.status_code == 409
+                assert h.stored()["steps"]["network"]["error"]["code"] == "wrong_password"
+        run(go())

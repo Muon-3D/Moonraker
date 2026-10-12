@@ -88,15 +88,83 @@ def register(setup: MuonSetup) -> None:
         lambda webreq: handle_region(setup, webreq))
 
     setup.boot_op_handlers["join"] = lambda doc: _on_join_boot(setup, doc)
+    setup.live_refreshers.append(lambda: _refresh_cleanup(setup))
 
 
 def _on_join_boot(setup: MuonSetup, doc: Dict[str, Any]) -> None:
-    op = doc["op"]
-    setup._mark_interrupted(doc, op)
-    ssid = op.get("ssid")
-    if op.get("forget") is True and isinstance(ssid, str) and ssid:
-        # Register before startup resolves, so writes cannot race this cleanup.
+    setup._mark_interrupted(doc, doc["op"])
+
+
+async def prepare_boot_cleanup(setup: MuonSetup, stored: Dict[str, Any]) -> None:
+    # Save ownership before _load() can persist an interrupted op as None.
+    if stored.get("version") != model.SCHEMA_VERSION:
+        return
+    op = stored.get("op")
+    if isinstance(op, dict) and op.get("kind") == "join" and op.get("forget") is True:
+        ssid = op.get("ssid")
+        if isinstance(ssid, str) and ssid:
+            await remember_cleanup(setup, ssid)
+
+
+async def remember_cleanup(setup: MuonSetup, ssid: str) -> None:
+    async with setup._lock:
+        pending = setup._internal.get("join_cleanup_ssid")
+        if pending == ssid:
+            return
+        if pending is not None:
+            raise ServerError("a previous join cleanup is still pending", 409)
+        setup._internal["join_cleanup_ssid"] = ssid
+        try:
+            await setup._persist_internal()
+        except BaseException:
+            setup._internal.pop("join_cleanup_ssid", None)
+            raise
+
+
+async def _clear_cleanup(
+    setup: MuonSetup, ssid: str, handle: Optional[OpHandle] = None
+) -> bool:
+    async with setup._lock:
+        if handle is not None and not handle.current():
+            return False
+        pending = setup._internal.get("join_cleanup_ssid")
+        if pending is None:
+            return True
+        if pending != ssid:
+            return False
+        setup._internal.pop("join_cleanup_ssid")
+        try:
+            await setup._persist_internal()
+        except BaseException:
+            setup._internal["join_cleanup_ssid"] = ssid
+            raise
+        return True
+
+
+def resume_cleanup(setup: MuonSetup) -> None:
+    if setup._closed or setup.read_only_version is not None or setup.doc is None:
+        return
+    if (setup.doc.get("op") or {}).get("kind") == "join":
+        return  # Ownership is reserved while a live join may still succeed.
+    ssid = setup._internal.get("join_cleanup_ssid")
+    task = setup._join_cleanup
+    if isinstance(ssid, str) and ssid and (task is None or task.done()):
         setup._join_cleanup = setup._spawn(_join_cleanup(setup, ssid))
+
+
+async def _refresh_cleanup(setup: MuonSetup) -> None:
+    resume_cleanup(setup)
+
+
+async def _record_owner_region(
+    setup: MuonSetup, handle: OpHandle, country: str
+) -> bool:
+    async with setup._lock:
+        if not handle.current():
+            return False
+        setup._internal["owner_region"] = country
+        await setup._persist_internal()
+        return True
 
 
 # --------------------------------------------------------------------------
@@ -401,6 +469,7 @@ async def _forget_after_join(setup: MuonSetup, ssid: str) -> None:
     case the cleanup runs as a background task that waits for the connect,
     disconnects if it landed on the SSID, and forgets after that. The psk
     never enters the cleanup: it needs only the SSID."""
+    await remember_cleanup(setup, ssid)
     connect = setup._join_connect
     cleanup = setup._join_cleanup
     if cleanup is not None and not cleanup.done():
@@ -412,54 +481,65 @@ async def _forget_after_join(setup: MuonSetup, ssid: str) -> None:
 
 
 async def _join_cleanup(setup: MuonSetup, ssid: str) -> None:
-    """The deferred forget: wait out the in-flight connect, disconnect if
-    it finished on the cancelled SSID, then forget the profile."""
+    """Retain the durable ownership marker until disconnect/forget succeeds."""
     from . import AuxMissing, AuxRefused, AuxUnavailable
+    await remember_cleanup(setup, ssid)
     connect = setup._join_connect
     try:
         if connect is not None:
             try:
                 await asyncio.wait_for(
                     asyncio.shield(connect), CONNECT_TIMEOUT + 5.0)
+            except asyncio.TimeoutError:
+                # A late connect may still create the profile; keep both handles.
+                logging.info("muon_setup: join cleanup: connect still pending")
+                return
             except Exception as exc:
-                if not isinstance(exc, asyncio.CancelledError):
-                    logging.info(
-                        "muon_setup: join cleanup: the connect never "
-                        "finished: %s", exc)
-        # Pending or completed connects may have activated the cancelled SSID.
-        # Disconnect that new connection before forgetting its profile.
+                logging.info("muon_setup: join cleanup: connect failed: %s", exc)
         current: Any = None
+        known = False
+        disconnected = True
         try:
             current = await setup.aux("GET", "/wifi/current")
+            known = True
         except (AuxMissing, AuxRefused, AuxUnavailable) as exc:
-            logging.info(
-                "muon_setup: join cleanup: current SSID unknown: %s", exc)
+            logging.info("muon_setup: join cleanup: current SSID unknown: %s", exc)
         if isinstance(current, dict) and current.get("ssid") == ssid:
             try:
                 await setup.aux("POST", "/wifi/disconnect")
             except (AuxMissing, AuxRefused, AuxUnavailable) as exc:
-                logging.info(
-                    "muon_setup: join cleanup: disconnect failed: %s", exc)
-        await _forget_profile(setup, ssid)
+                disconnected = False
+                logging.info("muon_setup: join cleanup: disconnect failed: %s", exc)
+        removed = await _forget_profile(setup, ssid)
+        if known and disconnected and removed:
+            try:
+                await _clear_cleanup(setup, ssid)
+            except Exception:
+                logging.exception(
+                    "muon_setup: cleanup marker could not be cleared; retrying")
     finally:
-        if setup._join_connect is connect:
+        if connect is not None and connect.done() and setup._join_connect is connect:
             setup._join_connect = None
 
 
-async def _forget_profile(setup: MuonSetup, ssid: str) -> None:
-    """Delete the profile the failed/cancelled join created -- only when it
-    wasn't saved before. The hotspot profile and an owner's pre-existing one
-    are never touched."""
+async def _forget_profile(setup: MuonSetup, ssid: str) -> bool:
+    """Remove only a profile owned by this join; report confirmed removal."""
     from . import AuxMissing, AuxRefused, AuxUnavailable
     try:
         await setup.aux("DELETE", "/wifi/forget?" + urlencode({"ssid": ssid}))
-    except AuxMissing:
-        logging.info(
-            "muon_setup: this image has no Aux DELETE /wifi/forget; the "
-            "partial profile stays")
+    except AuxMissing as exc:
+        cause = exc.__cause__
+        missing = f"Connection profile '{ssid}' not found"
+        if isinstance(cause, ServerError) and cause.status_code == 404 and (
+            str(cause) == missing or str(cause).startswith(missing + ": ")
+        ):
+            return True  # The owned profile is already gone.
+        logging.info("muon_setup: no Aux DELETE /wifi/forget; keeping cleanup pending")
+        return False
     except (AuxRefused, AuxUnavailable) as exc:
-        logging.info("muon_setup: profile cleanup for %r failed: %s",
-                     ssid, exc)
+        logging.info("muon_setup: profile cleanup for %r failed: %s", ssid, exc)
+        return False
+    return True
 
 
 def _join_fail(
@@ -635,6 +715,8 @@ def _region_runner(setup: MuonSetup, country: str, from_join: bool):
                 lambda doc: _region_outcome(setup, doc, country, err,
                                             from_join))
             return
+        if not await _record_owner_region(setup, handle, country):
+            return
         await handle.finish(
             lambda doc: _region_outcome(setup, doc, country, None, from_join))
         # A post-setup join may wait here for its region confirmation.
@@ -736,6 +818,9 @@ async def handle_network(
         # join now would race it; `busy` is the same answer a running op
         # gives.
         cleanup = setup._join_cleanup
+        if setup._internal.get("join_cleanup_ssid") is not None:
+            resume_cleanup(setup)
+            return model.error("busy", "a join cleanup is still pending")
         if cleanup is not None and not cleanup.done():
             return model.error(
                 "busy", "a join cleanup is still running")
@@ -745,9 +830,10 @@ async def handle_network(
             # still change the active network. Do not race it with a new join.
             return model.error("busy", "the previous join is still connecting")
         if step.get("kind") == "ethernet":
-            # Ethernet requires no country choice; its flag is synthetic.
-            # A subsequent Wi-Fi join must establish its own confirmation.
-            step["region_confirmed"] = False
+            # Ethernet's default flag is synthetic. Keep a separately stored
+            # owner choice when a later Wi-Fi join needs confirmation.
+            step["region_confirmed"] = isinstance(
+                setup._internal.get("owner_region"), str)
         step.update(ssid=ssid, status=model.PENDING, kind=None, addresses=[],
                     hostname_local=None, internet=None)
         step["error"] = None
@@ -793,11 +879,15 @@ def _join_runner(
                                 hostname_local=None, internet=None)
                 await handle.finish(failed)
                 return
+            if not await _record_owner_region(setup, handle, region_arg):
+                return
             await _single_zone_tz(setup, setup.doc or {}, region_arg)
             if not handle.current():
                 return
         # Step 4: the join. The connect call runs as a task while the device
         # status poll moves `op.phase`.
+        if not saved_before:
+            await remember_cleanup(setup, ssid)
         connect = setup._spawn(
             _connect(setup, ssid, psk))
         setup._join_connect = connect
@@ -1000,6 +1090,8 @@ async def _finish_join(
         else:
             # Picker: the region line is the question now (02 §5.6a).
             step["status"] = model.PENDING
+    if not saved_before and not await _clear_cleanup(setup, ssid, handle):
+        return
     await handle.finish(mutate)
     # E5: a join after `complete` reschedules the hotspot auto-off.
     if setup.doc is not None and setup.doc["state"] == "complete":
@@ -1012,6 +1104,7 @@ async def _finish_fail(
 ) -> None:
     cleanup = None
     if not saved_before:
+        await remember_cleanup(setup, ssid)
         # Register required cleanup before finish() clears the operation.
         # Reset can then cancel the runner without losing this owned work.
         cleanup = setup._join_cleanup = setup._spawn(_join_cleanup(setup, ssid))
