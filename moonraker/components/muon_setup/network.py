@@ -764,7 +764,12 @@ def _join_runner(
                 def failed(doc: Dict[str, Any]) -> None:
                     step = doc["steps"]["network"]
                     step["region_error"] = err
+                    step.update(status=model.PENDING, kind=None, addresses=[],
+                                hostname_local=None, internet=None)
                 await handle.finish(failed)
+                return
+            await _single_zone_tz(setup, setup.doc or {})
+            if not handle.current():
                 return
         # Step 4: the join. The connect call runs as a task while the device
         # status poll moves `op.phase`.
@@ -933,16 +938,18 @@ async def _finish_join(
 
     def mutate(doc: Dict[str, Any]) -> None:
         step = doc["steps"]["network"]
+        current_confirmation = confirmed or (
+            doc["state"] == "complete" and step.get("region_confirmed") is True)
         step.update(kind="wifi", ssid=ssid, addresses=[address],
                     hostname_local=_hostname_local(),
                     internet=internet,
-                    region_confirmed=confirmed)
+                    region_confirmed=current_confirmation)
         if internet == "portal":
             step["error"] = {"code": "portal_required",
                              "detail": {"ssid": ssid}}
         else:
             step["error"] = None
-        if confirmed:
+        if current_confirmation:
             step["status"] = model.DONE
             if doc["state"] != "complete" and doc["cursor"] == "network":
                 setup.advance()

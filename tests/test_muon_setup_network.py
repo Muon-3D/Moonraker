@@ -749,6 +749,7 @@ class TestLegacySavedProfileAndUplink:
             assert await network._ssid_saved_before(h.setup, SSID) is False
         run(go())
 
+
     def test_a_missing_show_route_keeps_the_profile(self):
         async def go():
             aux = wifi_aux(JoinScript())
@@ -767,4 +768,85 @@ class TestLegacySavedProfileAndUplink:
                     bytes(20) + network.socket.inet_aton("169.254.2.3") + bytes(232))):
                 assert network.interface_ipv4(h.setup, "eth0") is None
                 assert network.ethernet_status(h.setup)["address"] is None
+        run(go())
+
+
+
+class TestJoinRegionAndResetBoundaries:
+    @staticmethod
+    def completed():
+        doc = join_state()
+        doc.update(state="complete", cursor="finish")
+        doc["steps"]["network"].update(
+            status="done", kind="wifi", ssid="PreviousWiFi",
+            addresses=["192.168.1.7"], region_confirmed=True)
+        return doc
+
+    @pytest.mark.parametrize("detected", ["FR", None])
+    def test_post_setup_join_preserves_explicit_region_confirmation(self, detected):
+        async def go():
+            script = JoinScript(uplink={"addresses": ["10.0.0.9"], "internet": True})
+            aux = wifi_aux(script)
+            aux.routes[("GET", "/region")] = dict(
+                REGION_174, declared_country="DE", detected_country=detected)
+            h = await Harness(stored=self.completed(), aux=aux).start()
+            await h.post("/network", join_body(rev=h.doc["rev"]))
+            await joined(h)
+            assert h.doc["steps"]["network"]["region_confirmed"] is True
+            assert h.doc["steps"]["network"]["status"] == "done"
+        run(go())
+
+    def test_failed_post_setup_region_does_not_report_the_new_ssid_as_connected(self):
+        async def go():
+            aux = wifi_aux(JoinScript())
+            aux.routes[("POST", "/region/country")] = ServerError("busy", 400)
+            h = await Harness(stored=self.completed(), aux=aux).start()
+            await h.post("/network", join_body(region="DE", rev=h.doc["rev"]))
+            await joined(h)
+            step = h.doc["steps"]["network"]
+            assert step["status"] == "pending"
+            assert step["kind"] is None and step["addresses"] == []
+            assert step["region_error"]["code"] == "region_busy"
+            assert not aux.posted("/wifi/connect")
+        run(go())
+
+    @pytest.mark.parametrize("chosen", [None, "phone", "owner"])
+    def test_region_bearing_join_applies_the_zone_unless_already_chosen(self, chosen):
+        async def go():
+            aux = wifi_aux(JoinScript())
+            aux.routes[("GET", "/region")] = dict(REGION_174, declared_country="IE")
+            aux.routes[("POST", "/region/country")] = \
+                lambda body: {"declared_country": body["country"]}
+            aux.routes[("POST", "/time/zone")] = {}
+            h = await Harness(stored=join_state(), aux=aux).start()
+            h.setup._internal["tz_source"] = chosen
+            await h.post("/network", join_body(region="IE", rev=h.doc["rev"]))
+            await joined(h)
+            zones = [body for method, path, body in aux.calls
+                     if method == "POST" and path == "/time/zone"]
+            assert zones == ([] if chosen else [{"tz": "Europe/Dublin"}])
+        run(go())
+
+    @pytest.mark.parametrize("saved", [False, True])
+    def test_reset_waits_for_join_cleanup_before_replacing_the_document(self, saved):
+        async def go():
+            gate = asyncio.Event()
+            script = JoinScript(saved=[SSID] if saved else [])
+            script.current_ssid = SSID
+            aux = TestDeferredCleanup()._blocked_aux(script, gate)
+            h = await Harness(stored=join_state(), aux=aux).start()
+            await h.post("/network", join_body())
+            await asyncio.sleep(0)
+            resetting = asyncio.create_task(h.post("/reset", {}))
+            try:
+                for _ in range(12):
+                    await asyncio.sleep(0)
+                assert not resetting.done()
+            finally:
+                gate.set()
+                await resetting
+                await h.setup.drain()
+            assert h.doc["state"] == "new" and h.doc["op"] is None
+            assert script.forgets == ([] if saved else [SSID])
+            assert len(script.disconnects) == (0 if saved else 1)
         run(go())
