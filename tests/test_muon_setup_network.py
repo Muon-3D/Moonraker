@@ -691,8 +691,13 @@ class TestDeferredCleanup:
             await h.post("/network", join_body())
             await asyncio.sleep(0)
             await h.post("/network/cancel", {})
-            gate.set()
-            await h.setup.drain()
+            draining = asyncio.create_task(h.setup.drain())
+            try:
+                await asyncio.sleep(0)
+                assert not draining.done()
+            finally:
+                gate.set()
+                await draining
             assert script.forgets == []
             assert script.disconnects == []
         run(go())
@@ -712,10 +717,11 @@ class TestDeferredCleanup:
             assert PSK not in caplog.text
         run(go())
 
-    def test_a_new_join_while_cleanup_runs_is_busy(self):
+    @pytest.mark.parametrize("saved", [False, True])
+    def test_a_new_join_while_the_prior_connect_runs_is_busy(self, saved):
         async def go():
             gate = asyncio.Event()
-            script = JoinScript()
+            script = JoinScript(saved=[SSID] if saved else [])
             h = await Harness(stored=join_state(),
                               aux=self._blocked_aux(script, gate)).start()
             await h.post("/network", join_body())
