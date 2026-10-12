@@ -1140,15 +1140,16 @@ class MuonSetup:
         if not await self.wait_resolved(STARTUP_WAIT) or self.doc is None:
             return self.envelope(model.error(
                 "aux_unavailable", "setup state is not ready yet"))
-        # Not through write(), so the Level 1 check is made here: at Level 1
-        # the LAN may not stop a join the panel started.
-        caller.refuse_if_protected(kind, self.doc["state"])
-        ssid, forget = network.cancel_cleanup_info(self)
-        await self.cancel_op(("region_apply", "join"))
-        # 02 §5.6a: the partial profile goes too (only when the join made
-        # it -- an owner's saved profile is never deleted).
-        await network.cancel_cleanup(self, ssid, forget)
-        return self.envelope()
+        async with self._reset_lock:
+            # Not through write(), so the Level 1 check is made here: at Level 1
+            # the LAN may not stop a join the panel started.
+            caller.refuse_if_protected(kind, self.doc["state"])
+            ssid, forget = network.cancel_cleanup_info(self)
+            await self.cancel_op(("region_apply", "join"))
+            # 02 §5.6a: the partial profile goes too (only when the join made
+            # it -- an owner's saved profile is never deleted).
+            await network.cancel_cleanup(self, ssid, forget)
+            return self.envelope()
 
     async def _handle_reset(self, webreq: WebRequest) -> Dict[str, Any]:
         """Development and support only (02 §5.11, 07 S11). Floored, and
