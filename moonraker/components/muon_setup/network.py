@@ -109,7 +109,7 @@ def _region_market(setup: MuonSetup) -> str:
     if not isinstance(region, dict):
         # Images without the region routes (KAN-321): `none`, so a join
         # confirms the region by itself (02 §5.6a).
-        return "none"
+        return "none" if setup._region_missing else "unknown"
     return str(region.get("market") or "none")
 
 
@@ -391,6 +391,9 @@ async def _forget_after_join(setup: MuonSetup, ssid: str) -> None:
     disconnects if it landed on the SSID, and forgets after that. The psk
     never enters the cleanup: it needs only the SSID."""
     connect = setup._join_connect
+    cleanup = setup._join_cleanup
+    if cleanup is not None and not cleanup.done():
+        return
     if connect is not None and not connect.done():
         setup._join_cleanup = setup._spawn(_join_cleanup(setup, ssid))
         return
@@ -820,6 +823,11 @@ def _join_runner(
             connect_done = connect_done or await _connect_result(connect)
             code, detail_text = _connect_outcome(connect_done)
         if code == "ok":
+            if address is None:
+                await _finish_fail(setup, handle, "no_address", "dhcp",
+                                   ssid, saved_before,
+                                   "no verified IPv4 on the requested network")
+                return
             await handle.update(phase="internet_check")
             internet = await _internet(setup)
             await handle.update(phase="update_check")
@@ -831,11 +839,6 @@ def _join_runner(
                 # until OS-2: no /wifi/uplink on this image -- whether the
                 # update check reached Aux is the internet verdict.
                 internet = True if checked else None
-            if address is None:
-                await _finish_fail(setup, handle, "no_address", "dhcp",
-                                   ssid, saved_before,
-                                   "no verified IPv4 on the requested network")
-                return
             setup._join_connect = None
             await _finish_join(setup, handle, ssid, address, internet,
                                saved_before, bool(region_arg))
@@ -983,10 +986,15 @@ async def _finish_fail(
     setup: MuonSetup, handle: OpHandle, code: str, phase: Optional[str],
     ssid: str, saved_before: bool, detail: str
 ) -> None:
+    cleanup = None
+    if not saved_before:
+        # Register required cleanup before finish() clears the operation.
+        # Reset can then cancel the runner without losing this owned work.
+        cleanup = setup._join_cleanup = setup._spawn(_join_cleanup(setup, ssid))
     await handle.finish(
         lambda doc: _join_fail(doc, code, phase, ssid, detail))
     connect = setup._join_connect
     if connect is not None and connect.done():
         setup._join_connect = None
-    if not saved_before:
-        await _forget_after_join(setup, ssid)
+    if cleanup is not None:
+        await asyncio.shield(cleanup)

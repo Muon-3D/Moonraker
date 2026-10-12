@@ -210,6 +210,7 @@ class MuonSetup:
         self._resolved = asyncio.Event()
         self._lock = asyncio.Lock()
         self._reset_lock = asyncio.Lock()
+        self._region_missing = False
         #: `marker_written` / `marker_by`: the marker's POST reached Aux, and
         #: with which `by`. `marker_clear_pending`: a reset's DELETE has not
         #: yet. `tz_source`: who set the time zone (02 §6 `clock`).
@@ -1330,10 +1331,13 @@ class MuonSetup:
             options = await self.aux("GET", "/region/options")
         except AuxMissing:
             self._live["region"] = None
+            self._region_missing = True
             return
         except (AuxUnavailable, AuxRefused):
+            self._region_missing = False
             return
         if isinstance(state, dict) and isinstance(options, dict):
+            self._region_missing = False
             # Aux GET /region verbatim, plus the derived market (02 §6).
             self._live["region"] = region.state_region(state, options)
 
