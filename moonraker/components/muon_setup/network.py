@@ -744,6 +744,10 @@ async def handle_network(
             # A saved profile needs no cleanup, but its old Aux request can
             # still change the active network. Do not race it with a new join.
             return model.error("busy", "the previous join is still connecting")
+        if step.get("kind") == "ethernet":
+            # Ethernet requires no country choice; its flag is synthetic.
+            # A subsequent Wi-Fi join must establish its own confirmation.
+            step["region_confirmed"] = False
         step.update(ssid=ssid, status=model.PENDING, kind=None, addresses=[],
                     hostname_local=None, internet=None)
         step["error"] = None
