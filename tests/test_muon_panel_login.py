@@ -770,3 +770,130 @@ class TestPanelCredentialBoundary:
             with pytest.raises(HTTPError):
                 await authenticating
         _run(exercise())
+
+class TestPanelApiKeyAndSetupRole:
+    def test_stale_api_identity_cannot_mint_or_redeem_a_network_oneshot(self):
+        auth = _authorization()
+        user = auth.users[auth_mod.API_USER]
+        addr = ipaddress.ip_address(LAN)
+        _run(auth.set_panel_login("correct horse"))
+        auth.server.loop.delay_callback = lambda *_args: SimpleNamespace(
+            cancel=lambda: None)
+        with pytest.raises(ServerError):
+            auth.get_oneshot_token(addr, user)
+        cancelled = []
+        auth.oneshot_tokens["stale"] = (
+            addr, user, SimpleNamespace(cancel=lambda: cancelled.append(True)))
+        assert auth._check_oneshot_token("stale", addr) is None
+        assert cancelled == [True]
+
+    def test_password_preserves_explicit_unix_api_identification(self):
+        from moonraker.components.extensions import UnixSocketClient
+        auth = _authorization()
+        auth.enable_api_key = True
+        _run(auth.set_panel_login("correct horse"))
+        client = UnixSocketClient.__new__(UnixSocketClient)
+        client.server = auth.server
+        client._user_info = None
+        client._need_auth = False
+        client.authenticate(api_key="k")
+        assert client.user_info is auth.users[auth_mod.API_USER]
+        assert client.ip_addr is None  # no change to floor authority
+
+    def test_http_batch_rechecks_cached_api_identity_between_requests(self):
+        from moonraker.common import APIDefinition, JsonRPC, TransportType
+        from moonraker.components.application import RPCHandler
+
+        async def exercise():
+            auth = _authorization()
+            auth.enable_api_key = True
+            handler = RPCHandler.__new__(RPCHandler)
+            handler.server = auth.server
+            handler.request = _Request(LAN)
+            handler.current_user = auth.users[auth_mod.API_USER]
+            rpc = JsonRPC(SimpleNamespace(is_verbose_enabled=lambda: False))
+            entered, release = asyncio.Event(), asyncio.Event()
+            calls = []
+
+            async def first(_request):
+                entered.set()
+                await release.wait()
+                return "first"
+
+            async def second(_request):
+                calls.append("second")
+                return "second"
+
+            for name, callback in (("first", first), ("second", second)):
+                definition = APIDefinition(
+                    "/server/" + name, "/server/" + name, [name],
+                    RequestType.GET, TransportType.HTTP, callback, True)
+                rpc.register_method(name, RequestType.GET, definition)
+            batch = json.dumps([
+                {"jsonrpc": "2.0", "method": name, "id": index}
+                for index, name in enumerate(("first", "second"))])
+            pending = asyncio.create_task(rpc.dispatch(batch, handler))
+            await entered.wait()
+            await auth.set_panel_login("correct horse")
+            release.set()
+            responses = json.loads(await pending)
+            assert responses[0]["result"] == "first"
+            assert responses[1]["error"]["code"] == -32602
+            assert calls == []
+        _run(exercise())
+
+    def test_enabling_password_rejects_network_api_headers_but_keeps_loopback(self):
+        auth = _authorization()
+        auth.enable_api_key = True
+        headers = {"X-Api-Key": "k"}
+        user = auth.users[auth_mod.API_USER]
+        assert _run(auth.authenticate_request(_Request(LAN, headers))) is user
+        _run(auth.set_panel_login("correct horse"))
+        for ip in (LAN, HOTSPOT):
+            with pytest.raises(HTTPError):
+                _run(auth.authenticate_request(_Request(ip, headers)))
+        for ip in (LOOPBACK, MAPPED_LOOPBACK):
+            assert _run(auth.authenticate_request(_Request(ip, headers))) is user
+
+    def test_api_key_connections_and_tokens_are_revoked_after_first_password(self):
+        auth = _authorization()
+        auth.enable_api_key = True
+        user = auth.users[auth_mod.API_USER]
+        socket = TestPanelCredentialBoundary._socket(LAN, user)
+        bridge = TestPanelCredentialBoundary._bridge(HOTSPOT, user)
+        local = TestPanelCredentialBoundary._socket(LOOPBACK, user)
+        auth.server.wsm.clients = {id(sc): sc for sc in (socket, local)}
+        auth.server.wsm.bridge_connections = {id(bridge): bridge}
+        cancelled = []
+        auth.oneshot_tokens["api"] = (
+            ipaddress.ip_address(LAN), user,
+            SimpleNamespace(cancel=lambda: cancelled.append(True)))
+        _run(auth.set_panel_login("correct horse"))
+        assert socket.closed and bridge.closed
+        assert not local.closed
+        assert auth.oneshot_tokens == {} and cancelled == [True]
+
+    def test_socket_cannot_reauthenticate_with_the_api_key_after_password(self):
+        auth = _authorization()
+        auth.enable_api_key = True
+        _run(auth.set_panel_login("correct horse"))
+        socket = TestPanelCredentialBoundary._socket(LAN, None)
+        socket.server = auth.server
+        socket._need_auth = True
+        with pytest.raises(ServerError):
+            socket.authenticate(api_key="k")
+        local = TestPanelCredentialBoundary._socket(LOOPBACK, None)
+        local.server = auth.server
+        local.authenticate(api_key="k")
+        assert local.user_info is auth.users[auth_mod.API_USER]
+
+    def test_password_user_remains_a_lan_setup_caller(self):
+        from moonraker.components.muon_setup import caller
+        auth = _authorization()
+        _run(auth.set_panel_login("correct horse"))
+        request = WebRequest(
+            "/server/muon/setup", {}, RequestType.GET,
+            SimpleNamespace(transport_type=None), ipaddress.ip_address(LAN),
+            auth.users[LOGIN])
+        assert caller.caller_kind(request) == caller.LAN
+        caller.require(caller.caller_kind(request), caller.READ_STATE)

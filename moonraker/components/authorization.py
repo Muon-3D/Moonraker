@@ -679,7 +679,7 @@ class Authorization:
                 muon_floor.is_panel_login(user)
                 and self.users.get(user.username) is user
             )
-        if user.username == TRUSTED_USER:
+        if user.username in (TRUSTED_USER, API_USER):
             return not self.panel_login_set()
         return True
 
@@ -724,7 +724,7 @@ class Authorization:
                 'sha256', password.encode(), salt, HASH_ITER).hex()
             user = UserInfo(
                 username=username, password=hashed_pass, salt=salt.hex(),
-                groups=[muon_floor.PANEL_LOGIN_GROUP]
+                groups=[muon_floor.NETWORK_ROLE, muon_floor.PANEL_LOGIN_GROUP]
             )
             await self._persist_panel_login(user)
             self.users[username] = user
@@ -840,11 +840,16 @@ class Authorization:
             ) from e
         return user_info
 
-    def validate_api_key(self, api_key: str) -> UserInfo:
+    def validate_api_key(
+        self, api_key: str, ip: Optional[IPAddr] = None
+    ) -> UserInfo:
         if not self.enable_api_key:
             raise self.server.error("API Key authentication is disabled", 401)
         if api_key and api_key == self.api_key:
-            return self.users[API_USER]
+            user = self.users[API_USER]
+            if not self.panel_password_allows(user, ip):
+                raise self.server.error("Panel password authentication required", 401)
+            return user
         raise self.server.error("Invalid API Key", 401)
 
     def _load_private_key(self, secret: str) -> Signer:
@@ -894,6 +899,8 @@ class Authorization:
         self.oneshot_tokens.pop(token, None)
 
     def get_oneshot_token(self, ip_addr: IPAddr, user: Optional[UserInfo]) -> str:
+        if not self.panel_password_allows(user, ip_addr):
+            raise self.server.error("Panel password authentication required", 401)
         token = base64.b32encode(os.urandom(20)).decode()
         event_loop = self.server.get_event_loop()
         hdl = event_loop.delay_callback(
@@ -991,6 +998,8 @@ class Authorization:
                 logging.info(f"Oneshot Token IP Mismatch: expected{ip_addr}"
                              f", Recd: {cur_ip}")
                 return None
+            if not self.panel_password_allows(user, cur_ip):
+                return None
             return user
         else:
             return None
@@ -1029,7 +1038,11 @@ class Authorization:
         if self.enable_api_key:
             key: Optional[str] = request.headers.get("X-Api-Key")
             if key and key == self.api_key:
-                return self.users[API_USER]
+                try:
+                    return self.validate_api_key(key, ip)
+                except self.server.error as err:
+                    if auth_required:
+                        raise HTTPError(err.status_code, str(err)) from err
 
         # If the force_logins option is enabled and at least one user is created
         # then trusted user authentication is disabled.  MUON: the panel's

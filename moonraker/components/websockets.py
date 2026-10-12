@@ -176,7 +176,7 @@ class WebsocketManager:
     def add_client(self, sc: BaseRemoteConnection) -> None:
         auth: AuthComp = self.server.lookup_component("authorization", None)
         if auth is not None and not auth.panel_password_allows(
-            sc.user_info, sc.ip_addr
+            sc.user_info, sc.authentication_ip
         ):
             self._close_password_client(sc)
         self.clients[sc.uid] = sc
@@ -224,7 +224,7 @@ class WebsocketManager:
             return
         for sc in list(self.clients.values()):
             if sc.user_info is not None and not auth.panel_password_allows(
-                sc.user_info, sc.ip_addr
+                sc.user_info, sc.authentication_ip
             ):
                 self._close_password_client(sc)
         for bc in list(self.bridge_connections.values()):
