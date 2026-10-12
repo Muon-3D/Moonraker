@@ -177,6 +177,10 @@ _ROWS = (
     # The owner: changes only by linking, which LINK-3 confirms at the panel
     _A("owner", SIGNED_OUT_GUEST, SIGNED_OUT_GUEST, SIGNED_OUT_GUEST,
        fixed=True, delegated=True),
+    # Driving another printer on this LAN through this one (muon_bridge,
+    # KAN-527): the owner's alone, from home, whatever the preset. Admin is
+    # the owner's level; with no owner, only the panel.
+    _A("bridge", ADMIN, ADMIN, ADMIN, home_only=True, fixed=True),
     # Developer mode: dev_mode_consent in the Aux API asks the hardware
     # (KAN-371), which is how this row's "panel" is met.
     _A("dev_mode", PANEL, PANEL, PANEL, fixed=True, delegated=True),
@@ -655,6 +659,9 @@ def classify(
     if endpoint == "/server/muon/access/request_status":
         # A GET, but reachable before the caller is admitted
         return (ACTIONS["access_request"],)
+    if _matches(endpoint, "/server/muon_bridge"):
+        # Its reads too: what another printer is doing is the owner's.
+        return (ACTIONS["bridge"],)
     if method == "GET":
         return (READ,)
     if endpoint == "/api/printer/command":
