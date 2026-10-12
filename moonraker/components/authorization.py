@@ -530,20 +530,27 @@ class Authorization:
     async def _login_jwt_user(
         self, web_request: WebRequest, create: bool = False
     ) -> Dict[str, Any]:
+        username = web_request.get_str('username')
+        password = web_request.get_str('password')
+        source = web_request.get_str('source', self.default_source).lower()
+        conn = web_request.get_client_connection()
+        ip = web_request.get_ip_address()
+        if ip is None and conn is not None and not web_request.is_plain_http():
+            ip = conn.authentication_ip
+        self._check_login_request(username, source, ip, create)
+        if source == "ldap":
+            assert self.ldap is not None
+            # An external server must not hold up the panel's password writer.
+            await self.ldap.authenticate_ldap_user(username, password)
         async with self._credential_lock:
-            return await self._login_jwt_user_locked(web_request, create)
+            return await self._login_jwt_user_locked(
+                web_request, (username, password, source, ip), create)
 
-    async def _login_jwt_user_locked(
-        self, web_request: WebRequest, create: bool = False
-    ) -> Dict[str, Any]:
-        username: str = web_request.get_str('username')
-        password: str = web_request.get_str('password')
-        source: str = web_request.get_str(
-            'source', self.default_source
-        ).lower()
+    def _check_login_request(
+        self, username: str, source: str, ip: Optional[IPAddr], create: bool
+    ) -> None:
         if source not in AUTH_SOURCES:
             raise self.server.error(f"Invalid 'source': {source}")
-        user_info: UserInfo
         if username in RESERVED_USERS:
             raise self.server.error(
                 f"Invalid Request for user {username}")
@@ -553,10 +560,6 @@ class Authorization:
         ):
             raise self.server.error(
                 "This login can only be created at the printer's panel.", 403)
-        conn = web_request.get_client_connection()
-        ip = web_request.get_ip_address()
-        if ip is None and conn is not None and not web_request.is_plain_http():
-            ip = conn.authentication_ip
         candidate = self.users.get(username) or UserInfo(username, "", source=source)
         if not self.panel_password_allows(candidate, ip):
             raise self.server.error("Panel password authentication required", 401)
@@ -567,9 +570,18 @@ class Authorization:
                 raise self.server.error(
                     "LDAP authentication not available", 401
                 )
-            await self.ldap.authenticate_ldap_user(username, password)
-            if username not in self.users:
-                create = True
+
+    async def _login_jwt_user_locked(
+        self, web_request: WebRequest,
+        credentials: Tuple[str, str, str, Optional[IPAddr]], create: bool = False
+    ) -> Dict[str, Any]:
+        # Keep the authenticated tuple fixed across LDAP's await, and recheck
+        # the current gate before any account creation or credential mutation.
+        username, password, source, ip = credentials
+        self._check_login_request(username, source, ip, create)
+        user_info: UserInfo
+        if source == "ldap" and username not in self.users:
+            create = True
         if create:
             if username in self.users:
                 raise self.server.error(f"User {username} already exists")

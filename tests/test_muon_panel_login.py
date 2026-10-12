@@ -772,6 +772,34 @@ class TestPanelCredentialBoundary:
         _run(exercise())
 
 class TestPanelApiKeyAndSetupRole:
+    def test_stalled_ldap_cannot_delay_password_activation_or_create_a_late_user(
+        self
+    ):
+        async def exercise():
+            auth = _authorization(force_logins=False)
+            entered, release = asyncio.Event(), asyncio.Event()
+
+            class Ldap:
+                async def authenticate_ldap_user(self, *_args):
+                    entered.set()
+                    await release.wait()
+            auth.ldap = Ldap()
+            request = TestPanelCredentialBoundary._login_request(
+                username="late-friend", source="ldap")
+            login = asyncio.create_task(auth._login_jwt_user(request))
+            try:
+                await entered.wait()
+                await asyncio.wait_for(auth.set_panel_login("correct horse"), 1)
+                release.set()
+                with pytest.raises(ServerError):
+                    await login
+                assert "late-friend" not in auth.users
+                assert auth.users[LOGIN].username == LOGIN
+            finally:
+                release.set()
+                await asyncio.gather(login, return_exceptions=True)
+        _run(exercise())
+
     @pytest.mark.parametrize("ip", [LAN, None])
     @pytest.mark.parametrize("operation", ["login", "refresh"])
     def test_http_associated_local_socket_cannot_replace_the_request_address(
