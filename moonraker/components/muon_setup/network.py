@@ -394,8 +394,7 @@ async def _forget_after_join(setup: MuonSetup, ssid: str) -> None:
     if connect is not None and not connect.done():
         setup._join_cleanup = setup._spawn(_join_cleanup(setup, ssid))
         return
-    setup._join_connect = None
-    await _forget_profile(setup, ssid)
+    await _join_cleanup(setup, ssid)
 
 
 async def _join_cleanup(setup: MuonSetup, ssid: str) -> None:
@@ -403,39 +402,30 @@ async def _join_cleanup(setup: MuonSetup, ssid: str) -> None:
     it finished on the cancelled SSID, then forget the profile."""
     from . import AuxMissing, AuxRefused, AuxUnavailable
     connect = setup._join_connect
-    succeeded = False
     try:
         if connect is not None:
             try:
-                result, _ = await asyncio.wait_for(
+                await asyncio.wait_for(
                     asyncio.shield(connect), CONNECT_TIMEOUT + 5.0)
             except Exception as exc:
-                result = None
                 if not isinstance(exc, asyncio.CancelledError):
                     logging.info(
                         "muon_setup: join cleanup: the connect never "
                         "finished: %s", exc)
-            succeeded = (
-                isinstance(result, dict)
-                and result.get("status") == "connecting")
-        if succeeded:
-            # The connect Aux kept running may have put the printer on the
-            # SSID the owner cancelled; disconnect before forgetting, but
-            # only if the active network is actually that one.
-            current: Any = None
+        # Pending or completed connects may have activated the cancelled SSID.
+        # Disconnect that new connection before forgetting its profile.
+        current: Any = None
+        try:
+            current = await setup.aux("GET", "/wifi/current")
+        except (AuxMissing, AuxRefused, AuxUnavailable) as exc:
+            logging.info(
+                "muon_setup: join cleanup: current SSID unknown: %s", exc)
+        if isinstance(current, dict) and current.get("ssid") == ssid:
             try:
-                current = await setup.aux("GET", "/wifi/current")
+                await setup.aux("POST", "/wifi/disconnect")
             except (AuxMissing, AuxRefused, AuxUnavailable) as exc:
                 logging.info(
-                    "muon_setup: join cleanup: current SSID unknown: %s",
-                    exc)
-            if isinstance(current, dict) and current.get("ssid") == ssid:
-                try:
-                    await setup.aux("POST", "/wifi/disconnect")
-                except (AuxMissing, AuxRefused, AuxUnavailable) as exc:
-                    logging.info(
-                        "muon_setup: join cleanup: disconnect failed: %s",
-                        exc)
+                    "muon_setup: join cleanup: disconnect failed: %s", exc)
         await _forget_profile(setup, ssid)
     finally:
         if setup._join_connect is connect:
@@ -562,6 +552,15 @@ async def apply_region(
 
 
 async def _single_zone_tz(setup: MuonSetup, doc: Dict[str, Any]) -> None:
+    # Owner timezone writes use this lock through write(); phone writes share
+    # it too, so an automatic response cannot land after a later choice.
+    async with setup._lock:
+        if setup.doc is not doc:
+            return
+        await _single_zone_tz_locked(setup, doc)
+
+
+async def _single_zone_tz_locked(setup: MuonSetup, doc: Dict[str, Any]) -> None:
     """02 §5.6a step 4: a one-zone country sets the zone itself, unless the
     phone or the owner already chose."""
     region = setup._live.get("region") or {}
@@ -794,7 +793,16 @@ def _join_runner(
             # An uplink IPv4 is what decides (02 §5.6 step 5).
             address = interface_ipv4(setup, "wlan0")
             if address is not None and connect_done is not None:
-                break
+                try:
+                    current = await setup.aux("GET", "/wifi/current")
+                except (AuxMissing, AuxRefused, AuxUnavailable):
+                    current = None
+                activated = (not isinstance(status, dict)
+                             or status.get("state") == "activated")
+                if (isinstance(current, dict) and current.get("ssid") == ssid
+                        and activated):
+                    break
+                address = None
             if connect_done is not None and _connect_outcome(connect_done)[0] != "ok":
                 break
             if time.monotonic() > deadline:
