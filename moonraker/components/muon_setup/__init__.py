@@ -210,6 +210,7 @@ class MuonSetup:
         self._resolved = asyncio.Event()
         self._lock = asyncio.Lock()
         self._reset_lock = asyncio.Lock()
+        self._internal_lock = asyncio.Lock()
         self._region_missing = False
         #: `marker_written` / `marker_by`: the marker's POST reached Aux, and
         #: with which `by`. `marker_clear_pending`: a reset's DELETE has not
@@ -288,7 +289,9 @@ class MuonSetup:
         if isinstance(internal, dict):
             self._internal.update(internal)
         if isinstance(stored, dict):
+            await network.prepare_boot_cleanup(self, stored)
             self._load(stored)
+            network.resume_cleanup(self)
             # Discovery may already be registered after a slow database load.
             # An unchanged document still supplies its initial name/status.
             self.server.send_event(
@@ -601,8 +604,9 @@ class MuonSetup:
         await self.database.insert_item(NAMESPACE, STATE_KEY, stored)
 
     async def _persist_internal(self) -> None:
-        await self.database.insert_item(
-            NAMESPACE, INTERNAL_KEY, dict(self._internal))
+        async with self._internal_lock:
+            await self.database.insert_item(
+                NAMESPACE, INTERNAL_KEY, dict(self._internal))
 
     async def _persist_quietly(self) -> None:
         async with self._lock:
@@ -1145,6 +1149,8 @@ class MuonSetup:
             # the LAN may not stop a join the panel started.
             caller.refuse_if_protected(kind, self.doc["state"])
             ssid, forget = network.cancel_cleanup_info(self)
+            if ssid is not None and forget:
+                await network.remember_cleanup(self, ssid)
             await self.cancel_op(("region_apply", "join"))
             # 02 §5.6a: the partial profile goes too (only when the join made
             # it -- an owner's saved profile is never deleted).
@@ -1162,6 +1168,8 @@ class MuonSetup:
         async with self._reset_lock:
             ssid, forget = network.cancel_cleanup_info(self)
             connect = self._join_connect
+            if ssid is not None and forget:
+                await network.remember_cleanup(self, ssid)
             if self._marker_task is not None and not self._marker_task.done():
                 self._marker_task.cancel()
             if self._op_task is not None and not self._op_task.done():
@@ -1173,10 +1181,13 @@ class MuonSetup:
             # Finish pending join work before replacing the document. New profiles
             # are cleaned up; owner profiles remain intact and are only awaited.
             await network.cancel_cleanup(self, ssid, forget)
+            network.resume_cleanup(self)
             if self._join_cleanup is not None:
                 await asyncio.shield(self._join_cleanup)
             if connect is not None:
                 await network._connect_result(connect)
+            if self._internal.get("join_cleanup_ssid") is not None:
+                raise ServerError("join profile cleanup has not finished", 409)
             async with self._lock:
                 old_rev = self.doc["rev"] if self.doc is not None else 0
                 if self.read_only_version is not None:
