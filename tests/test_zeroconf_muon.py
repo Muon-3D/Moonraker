@@ -69,6 +69,9 @@ class FakeSetup:
         assert self.state is not None
         return self.state
 
+    async def wait_resolved(self, timeout=None):
+        return self.doc is not None
+
 
 class FakeServer:
     def __init__(self, setup: Optional[FakeSetup]) -> None:
@@ -163,6 +166,33 @@ def test_no_keys_before_muon_setup_has_decided() -> None:
     reg, _, _ = build(M1, FakeSetup(None))
     octo = txt(reg.octo_service_info)
     assert "setup" not in octo and "name" not in octo
+
+
+def test_registration_waits_for_the_stored_setup_document() -> None:
+    async def exercise():
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        class DelayedSetup(FakeSetup):
+            async def wait_resolved(self, timeout=None):
+                entered.set()
+                await release.wait()
+                self.state = state("complete")
+                self.doc = {"state": "complete"}
+                return True
+
+        server = FakeServer(DelayedSetup(None))
+        reg = zc.ZeroconfRegistrar(FakeConfig(server, M1))
+        reg.runner = RecordingRunner()
+        pending = asyncio.create_task(reg.component_init())
+        try:
+            await asyncio.sleep(0)
+            assert entered.is_set() and not reg.registered
+        finally:
+            release.set()
+            await pending
+        assert txt(reg.octo_service_info)["setup"] == "complete"
+        assert txt(reg.octo_service_info)["name"] == "Walnut · 8987"
+    asyncio.run(exercise())
 
 
 def test_a_change_re_announces_the_record_under_the_same_name() -> None:

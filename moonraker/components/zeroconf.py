@@ -306,6 +306,10 @@ class ZeroconfRegistrar:
         server_name = self.mdns_name or instance_name.lower()
         port = self.advertised_port or hi["port"]
         setup = self.server.lookup_component("muon_setup", None)
+        if setup is not None:
+            # Wait for normal stored-state loading, but still advertise an
+            # unresolved migration. Its later state event fills these keys.
+            await setup.wait_resolved(timeout=10.0)
         if setup is not None and getattr(setup, "doc", None) is not None:
             # Already decided; otherwise its first change event fills these.
             self.muon_txt = _muon_txt(setup.public_state())
