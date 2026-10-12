@@ -1207,3 +1207,54 @@ class TestReviewConnectionSampling:
                                {"rescan": True}, method="GET")
             assert out["networks"][0]["band"] == band
         run(go())
+
+
+class TestInterruptedJoinCleanup:
+    @pytest.mark.parametrize("forget,current", [(True, SSID),
+                                               (True, "OtherWiFi"),
+                                               (False, SSID)])
+    def test_boot_cleans_only_the_profile_created_by_the_interrupted_join(
+        self, forget, current
+    ):
+        async def go():
+            doc = join_state()
+            doc["op"] = {"id": "op_crashed", "kind": "join", "phase": "dhcp",
+                         "ssid": SSID, "forget": forget}
+            script = JoinScript(saved=[SSID])
+            script.current_ssid = current
+            h = await Harness(stored=doc, aux=wifi_aux(script)).start()
+            await joined(h)
+            assert h.doc["op"] is None
+            assert h.doc["steps"]["network"]["error"]["code"] == "interrupted"
+            assert script.forgets == ([SSID] if forget else [])
+            assert len(script.disconnects) == (1 if forget and current == SSID else 0)
+        run(go())
+
+    def test_a_new_join_waits_for_the_boot_cleanup(self):
+        async def go():
+            entered, release = asyncio.Event(), asyncio.Event()
+            doc = join_state()
+            doc["op"] = {"id": "op_crashed", "kind": "join", "phase": "dhcp",
+                         "ssid": SSID, "forget": True}
+            script = JoinScript(saved=[SSID])
+            aux = wifi_aux(script)
+
+            async def blocked_current(_body):
+                entered.set()
+                await release.wait()
+                return {"ssid": SSID}
+
+            aux.routes[("GET", "/wifi/current")] = blocked_current
+            h = await Harness(stored=doc, aux=aux).start()
+            # With no recovery task registered, startup has no work left.
+            await asyncio.sleep(0)
+            recovering = h.setup._join_cleanup is not None
+            if recovering:
+                await entered.wait()
+                out = await h.post("/network", join_body(rev=h.doc["rev"]))
+                assert out["error"]["code"] == "busy"
+                assert not script.connects
+            release.set()
+            await joined(h)
+            assert recovering
+        run(go())

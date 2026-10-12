@@ -87,6 +87,17 @@ def register(setup: MuonSetup) -> None:
     reg("/server/muon/setup/region", ["POST"],
         lambda webreq: handle_region(setup, webreq))
 
+    setup.boot_op_handlers["join"] = lambda doc: _on_join_boot(setup, doc)
+
+
+def _on_join_boot(setup: MuonSetup, doc: Dict[str, Any]) -> None:
+    op = doc["op"]
+    setup._mark_interrupted(doc, op)
+    ssid = op.get("ssid")
+    if op.get("forget") is True and isinstance(ssid, str) and ssid:
+        # Register before startup resolves, so writes cannot race this cleanup.
+        setup._join_cleanup = setup._spawn(_join_cleanup(setup, ssid))
+
 
 # --------------------------------------------------------------------------
 # Shared helpers
