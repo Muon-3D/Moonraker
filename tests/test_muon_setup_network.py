@@ -782,6 +782,42 @@ class TestJoinRegionAndResetBoundaries:
             addresses=["192.168.1.7"], region_confirmed=True)
         return doc
 
+    @pytest.mark.parametrize("cancel", [False, True])
+    def test_unsuccessful_rejoin_clears_the_previous_connection_fields(self, cancel):
+        async def go():
+            gate = asyncio.Event()
+            script = JoinScript(connect_result=ServerError("connect failed", 500))
+            aux = (TestDeferredCleanup()._blocked_aux(script, gate) if cancel
+                   else wifi_aux(script))
+            h = await Harness(stored=self.completed(), aux=aux).start()
+            await h.post("/network", join_body(rev=h.doc["rev"]))
+            if cancel:
+                await asyncio.sleep(0)
+                await h.post("/network/cancel", {})
+                gate.set()
+            await joined(h)
+            step = h.doc["steps"]["network"]
+            assert step["status"] == "pending"
+            assert step["kind"] is None and step["addresses"] == []
+            assert step["hostname_local"] is None and step["internet"] is None
+        run(go())
+
+    @pytest.mark.parametrize("detected", ["FR", None])
+    def test_an_explicit_join_region_is_confirmed_after_success(self, detected):
+        async def go():
+            script = JoinScript(uplink={"addresses": ["10.0.0.9"], "internet": True})
+            aux = wifi_aux(script)
+            aux.routes[("GET", "/region")] = dict(
+                REGION_174, declared_country="DE", detected_country=detected)
+            aux.routes[("POST", "/region/country")] = \
+                lambda body: {"declared_country": body["country"]}
+            h = await Harness(stored=join_state(), aux=aux).start()
+            await h.post("/network", join_body(region="DE", rev=h.doc["rev"]))
+            await joined(h)
+            assert h.doc["steps"]["network"]["region_confirmed"] is True
+            assert h.doc["steps"]["network"]["status"] == "done"
+        run(go())
+
     @pytest.mark.parametrize("detected", ["FR", None])
     def test_post_setup_join_preserves_explicit_region_confirmation(self, detected):
         async def go():

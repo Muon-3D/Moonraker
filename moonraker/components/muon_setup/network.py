@@ -724,7 +724,8 @@ async def handle_network(
             # A saved profile needs no cleanup, but its old Aux request can
             # still change the active network. Do not race it with a new join.
             return model.error("busy", "the previous join is still connecting")
-        step["ssid"] = ssid
+        step.update(ssid=ssid, status=model.PENDING, kind=None, addresses=[],
+                    hostname_local=None, internet=None)
         step["error"] = None
         step["region_error"] = None
         setup.start_op(
@@ -826,7 +827,7 @@ def _join_runner(
                 return
             setup._join_connect = None
             await _finish_join(setup, handle, ssid, address, internet,
-                               saved_before)
+                               saved_before, bool(region_arg))
             return
         await _finish_fail(setup, handle, code,
                            _last_phase(setup, handle), ssid, saved_before,
@@ -925,14 +926,14 @@ async def _update_check(setup: MuonSetup) -> bool:
 
 async def _finish_join(
     setup: MuonSetup, handle: OpHandle, ssid: str, address: str,
-    internet: Any, saved_before: bool
+    internet: Any, saved_before: bool, explicit_region: bool = False
 ) -> None:
     market = _region_market(setup)
     region = setup._live.get("region") or {}
     declared = region.get("declared_country")
     detected = region.get("detected_country")
     confirmed = (
-        market in ("none", "locked")
+        explicit_region or market in ("none", "locked")
         or (isinstance(declared, str) and declared == detected)
     )
 
