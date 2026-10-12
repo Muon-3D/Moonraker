@@ -719,6 +719,11 @@ async def handle_network(
         if cleanup is not None and not cleanup.done():
             return model.error(
                 "busy", "a join cleanup is still running")
+        connect = setup._join_connect
+        if connect is not None and not connect.done():
+            # A saved profile needs no cleanup, but its old Aux request can
+            # still change the active network. Do not race it with a new join.
+            return model.error("busy", "the previous join is still connecting")
         step["ssid"] = ssid
         step["error"] = None
         step["region_error"] = None
@@ -763,7 +768,7 @@ def _join_runner(
                 return
         # Step 4: the join. The connect call runs as a task while the device
         # status poll moves `op.phase`.
-        connect = asyncio.ensure_future(
+        connect = setup._spawn(
             _connect(setup, ssid, psk))
         setup._join_connect = connect
         deadline = time.monotonic() + setup.join_timeout

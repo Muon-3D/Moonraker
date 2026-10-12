@@ -45,7 +45,8 @@ IP_JSON = [
 ]
 
 TRUSTED_USER = UserInfo("_TRUSTED_USER_", "")
-PASSWORD_USER = UserInfo("admin", "", source="moonraker")
+PASSWORD_USER = UserInfo("admin", "", source="moonraker",
+                         groups=[muon_floor.PANEL_LOGIN_GROUP])
 LEGACY_GATEWAY_USER = GatewayUser(
     "muon-link:0123456789abcdef", "", source="muon_gateway"
 )
@@ -246,6 +247,48 @@ class TestStandardForEveryLevelAndRole:
 
 
 class TestTheFloorAndThePanel:
+    @pytest.mark.parametrize("endpoint,verb", [
+        ("/access/login", RequestType.POST),
+        ("/access/info", RequestType.GET),
+        ("/access/refresh_jwt", RequestType.POST),
+        ("/server/connection/identify", RequestType.POST),
+    ])
+    def test_home_callers_can_bootstrap_authentication_under_protected(
+        self, endpoint, verb
+    ):
+        policy.set_state(state(entry="protected", preset="strict",
+                               overrides={"read": policy.ADMIN}))
+        for addr in (LAN, HOTSPOT):
+            assert asyncio.run(_api(endpoint).request(
+                {}, verb, HTTP, addr, None))["reached"] == endpoint
+
+    @pytest.mark.parametrize("endpoint,verb", [
+        ("/access/login", RequestType.POST),
+        ("/access/info", RequestType.GET),
+        ("/access/refresh_jwt", RequestType.POST),
+        ("/server/connection/identify", RequestType.POST),
+    ])
+    def test_bootstrap_does_not_admit_remote_or_unknown_addresses(
+        self, endpoint, verb
+    ):
+        policy.set_state(state(entry="protected", preset="strict"))
+        for addr in (SENTINEL, None, ipaddress.ip_address("203.0.113.10")):
+            with pytest.raises(ServerError):
+                asyncio.run(_api(endpoint).request({}, verb, HTTP, addr, None))
+
+    @pytest.mark.parametrize("endpoint,verb", [
+        ("/access/login/other", RequestType.POST),
+        ("/access/info", RequestType.POST),
+        ("/access/login", RequestType.GET),
+        ("/server/info", RequestType.GET),
+    ])
+    def test_bootstrap_exception_keeps_other_reads_and_methods_gated(
+        self, endpoint, verb
+    ):
+        policy.set_state(state(entry="protected", preset="strict"))
+        with pytest.raises(ServerError):
+            asyncio.run(_api(endpoint).request({}, verb, HTTP, LAN, None))
+
     def test_the_floor_still_refuses_an_admin(self):
         policy.set_state(state(preset="relaxed"))
         api = _api("/server/aux/bms/ship")

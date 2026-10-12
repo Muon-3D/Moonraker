@@ -9,6 +9,7 @@ import ipaddress
 from typing import Any, Dict, List, Optional, Tuple
 
 from moonraker import muon_access_policy as policy
+from moonraker import muon_floor
 from moonraker.common import RequestType, WebRequest
 from moonraker.components.muon_access import MuonAccess
 from moonraker.components.muon_gateway import GatewayUser
@@ -223,7 +224,8 @@ def caller(case: Dict[str, Any]) -> Tuple[Any, Any, Any]:
         return HTTP, LAN, UserInfo("_TRUSTED_USER_", "")
     if kind == "password":
         from moonraker.common import UserInfo
-        return HTTP, LAN, UserInfo("admin", "", source="moonraker")
+        return HTTP, LAN, UserInfo(
+            "admin", "", source="moonraker", groups=[muon_floor.PANEL_LOGIN_GROUP])
     if kind == "gateway":
         user = GatewayUser(
             "muon-link:0123456789abcdef", "", source="muon_gateway",
