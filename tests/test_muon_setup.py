@@ -36,6 +36,15 @@ from muon_setup_fakes import (
 # ==========================================================================
 
 class TestFreshStartAndMigration:
+    def test_an_unchanged_stored_document_notifies_discovery_on_load(self):
+        async def exercise():
+            stored = state_with()
+            h = Harness(stored=stored)
+            await h.setup._startup(poll=False)
+            assert h.server.changes() == [h.setup.public_state()]
+            assert h.stored() == stored
+        run(exercise())
+
     def test_a_new_printer_starts_new_at_language_and_saves_it(self):
         async def go():
             h = await Harness().start()
