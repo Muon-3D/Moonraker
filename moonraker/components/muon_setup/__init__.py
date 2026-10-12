@@ -1156,6 +1156,8 @@ class MuonSetup:
         the new one."""
         self.begin(webreq, caller.RESET)
         await self.wait_resolved(STARTUP_WAIT)
+        ssid, forget = network.cancel_cleanup_info(self)
+        connect = self._join_connect
         if self._marker_task is not None and not self._marker_task.done():
             self._marker_task.cancel()
         if self._op_task is not None and not self._op_task.done():
@@ -1164,6 +1166,13 @@ class MuonSetup:
                 await asyncio.wait_for(asyncio.shield(self._op_task), 15.)
             except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
                 pass
+        # Finish pending join work before replacing the document. New profiles
+        # are cleaned up; owner profiles remain intact and are only awaited.
+        await network.cancel_cleanup(self, ssid, forget)
+        if self._join_cleanup is not None:
+            await asyncio.shield(self._join_cleanup)
+        if connect is not None:
+            await network._connect_result(connect)
         async with self._lock:
             old_rev = self.doc["rev"] if self.doc is not None else 0
             if self.read_only_version is not None:
