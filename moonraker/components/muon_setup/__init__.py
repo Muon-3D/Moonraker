@@ -209,6 +209,7 @@ class MuonSetup:
         self.read_only_version: Optional[Any] = None
         self._resolved = asyncio.Event()
         self._lock = asyncio.Lock()
+        self._reset_lock = asyncio.Lock()
         #: `marker_written` / `marker_by`: the marker's POST reached Aux, and
         #: with which `by`. `marker_clear_pending`: a reset's DELETE has not
         #: yet. `tz_source`: who set the time zone (02 §6 `clock`).
@@ -687,7 +688,7 @@ class MuonSetup:
             return self.envelope(model.error(
                 "aux_unavailable", "setup state is not ready yet"))
         started_op: Optional[Tuple[str, OpRunner]] = None
-        async with self._lock:
+        async with self._reset_lock, self._lock:
             doc = self.doc
             if not protection_exempt:
                 caller.refuse_if_protected(kind, doc["state"])
@@ -1156,46 +1157,47 @@ class MuonSetup:
         the new one."""
         self.begin(webreq, caller.RESET)
         await self.wait_resolved(STARTUP_WAIT)
-        ssid, forget = network.cancel_cleanup_info(self)
-        connect = self._join_connect
-        if self._marker_task is not None and not self._marker_task.done():
-            self._marker_task.cancel()
-        if self._op_task is not None and not self._op_task.done():
-            self._op_task.cancel()
-            try:
-                await asyncio.wait_for(asyncio.shield(self._op_task), 15.)
-            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
-                pass
-        # Finish pending join work before replacing the document. New profiles
-        # are cleaned up; owner profiles remain intact and are only awaited.
-        await network.cancel_cleanup(self, ssid, forget)
-        if self._join_cleanup is not None:
-            await asyncio.shield(self._join_cleanup)
-        if connect is not None:
-            await network._connect_result(connect)
-        async with self._lock:
-            old_rev = self.doc["rev"] if self.doc is not None else 0
-            if self.read_only_version is not None:
-                stored = await self.database.get_item(NAMESPACE, STATE_KEY, None)
-                if isinstance(stored, dict) and isinstance(stored.get("rev"), int):
-                    old_rev = max(old_rev, stored["rev"])
-            for key in (STATE_KEY, INTERNAL_KEY):
+        async with self._reset_lock:
+            ssid, forget = network.cancel_cleanup_info(self)
+            connect = self._join_connect
+            if self._marker_task is not None and not self._marker_task.done():
+                self._marker_task.cancel()
+            if self._op_task is not None and not self._op_task.done():
+                self._op_task.cancel()
                 try:
-                    await self.database.delete_item(NAMESPACE, key)
-                except Exception:
+                    await asyncio.wait_for(asyncio.shield(self._op_task), 15.)
+                except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
                     pass
-            self.read_only_version = None
-            self._internal = {
-                "marker_written": False, "tz_source": None,
-                "marker_clear_pending": True,
-            }
-            doc = model.new_document(manifest.item_ids(self.manifest))
-            doc["rev"] = old_rev + 1
-            self.doc = doc
-            await self._persist()
-            await self._persist_internal()
-            self._resolved.set()
-            self._notify()
+            # Finish pending join work before replacing the document. New profiles
+            # are cleaned up; owner profiles remain intact and are only awaited.
+            await network.cancel_cleanup(self, ssid, forget)
+            if self._join_cleanup is not None:
+                await asyncio.shield(self._join_cleanup)
+            if connect is not None:
+                await network._connect_result(connect)
+            async with self._lock:
+                old_rev = self.doc["rev"] if self.doc is not None else 0
+                if self.read_only_version is not None:
+                    stored = await self.database.get_item(NAMESPACE, STATE_KEY, None)
+                    if isinstance(stored, dict) and isinstance(stored.get("rev"), int):
+                        old_rev = max(old_rev, stored["rev"])
+                for key in (STATE_KEY, INTERNAL_KEY):
+                    try:
+                        await self.database.delete_item(NAMESPACE, key)
+                    except Exception:
+                        pass
+                self.read_only_version = None
+                self._internal = {
+                    "marker_written": False, "tz_source": None,
+                    "marker_clear_pending": True,
+                }
+                doc = model.new_document(manifest.item_ids(self.manifest))
+                doc["rev"] = old_rev + 1
+                self.doc = doc
+                await self._persist()
+                await self._persist_internal()
+                self._resolved.set()
+                self._notify()
         # OS-7's DELETE /setup/complete, so the hotspot's H1 rule sees a new
         # printer again. Retried every 30 s while Aux is down, for as long as
         # the state stays short of `complete`.
