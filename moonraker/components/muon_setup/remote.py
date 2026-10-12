@@ -187,33 +187,34 @@ async def handle_cancel(
     if not await setup.wait_resolved(STARTUP_WAIT) or setup.doc is None:
         return setup.envelope(model.error(
             "aux_unavailable", "setup state is not ready yet"))
-    # The same Level 1 check network/cancel makes (02 §3): at Level 1 the
-    # LAN may not decline a link the panel started.
-    caller.refuse_if_protected(kind, setup.doc["state"])
-    doc = setup.doc
-    step = doc["steps"]["remote"]
-    if step["status"] == "done":
-        return setup.envelope()  # no-op once linked (02 §5.9)
-    task = _next_attempt(setup)
-    generation = setup._remote_generation
-    if task is not None and not task.done():
-        task.cancel()
-        try:
-            await asyncio.wait_for(asyncio.shield(task), 5.)
-        except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
-            pass
-    link = _link(setup)
-    if link is not None:
-        try:
-            await link.cancel()
-        except Exception as exc:
-            logging.info("muon_setup: muon-link cancel failed: %s", exc)
-    async with setup._lock:
-        if setup.doc is not None and generation == setup._remote_generation:
-            setup.doc["steps"]["remote"].update(
-                mode=None, link=None, error=None)
-            await setup._commit()
-    return setup.envelope()
+    async with setup._reset_lock:
+        # The same Level 1 check network/cancel makes (02 §3): at Level 1 the
+        # LAN may not decline a link the panel started.
+        caller.refuse_if_protected(kind, setup.doc["state"])
+        doc = setup.doc
+        step = doc["steps"]["remote"]
+        if step["status"] == "done":
+            return setup.envelope()  # no-op once linked (02 §5.9)
+        task = _next_attempt(setup)
+        generation = setup._remote_generation
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(task), 5.)
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                pass
+        link = _link(setup)
+        if link is not None:
+            try:
+                await link.cancel()
+            except Exception as exc:
+                logging.info("muon_setup: muon-link cancel failed: %s", exc)
+        async with setup._lock:
+            if setup.doc is not None and generation == setup._remote_generation:
+                setup.doc["steps"]["remote"].update(
+                    mode=None, link=None, error=None)
+                await setup._commit()
+        return setup.envelope()
 
 
 # --------------------------------------------------------------------------

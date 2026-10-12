@@ -351,3 +351,78 @@ class TestCloudAttemptLifetime:
             await settle(h)
             assert h.doc["steps"]["remote"] == expected
         run(go())
+
+
+class TestRemoteCancelWriteBoundary:
+    def test_new_cloud_start_waits_for_a_pending_cancel(self):
+        async def go():
+            entered, release = asyncio.Event(), asyncio.Event()
+            link = FakeMuonLink([{"phase": "connecting"}])
+            h = await remote_harness(link)
+            await h.post("/remote", body(mode="cloud", rev=h.doc["rev"]))
+
+            async def blocked_cancel():
+                entered.set()
+                await release.wait()
+                link.cancels += 1
+
+            link.cancel = blocked_cancel
+            cancelling = asyncio.create_task(h.post("/remote/cancel", {}))
+            await entered.wait()
+            starts = link.starts
+            checked = asyncio.Event()
+            wait_resolved = h.setup.wait_resolved
+
+            async def checked_resolution(timeout):
+                result = await wait_resolved(timeout)
+                checked.set()
+                return result
+
+            h.setup.wait_resolved = checked_resolution
+            starting = asyncio.create_task(h.post(
+                "/remote", body(mode="cloud", rev=h.doc["rev"])))
+            await checked.wait()
+            for _ in range(10):
+                await asyncio.sleep(0)
+            escaped = link.starts != starts
+            release.set()
+            await cancelling
+            await starting
+            assert not escaped
+        run(go())
+
+    def test_cancel_waits_for_a_cloud_start_in_flight(self):
+        async def go():
+            entered, release = asyncio.Event(), asyncio.Event()
+            link = FakeMuonLink([{"phase": "connecting"}])
+            h = await remote_harness(link)
+
+            async def blocked_start():
+                entered.set()
+                await release.wait()
+                return {"phase": "connecting"}
+
+            link.start = blocked_start
+            starting = asyncio.create_task(h.post(
+                "/remote", body(mode="cloud", rev=h.doc["rev"])))
+            await entered.wait()
+            checked = asyncio.Event()
+            wait_resolved = h.setup.wait_resolved
+
+            async def checked_resolution(timeout):
+                result = await wait_resolved(timeout)
+                checked.set()
+                return result
+
+            h.setup.wait_resolved = checked_resolution
+            cancelling = asyncio.create_task(h.post("/remote/cancel", {}))
+            await checked.wait()
+            for _ in range(10):
+                await asyncio.sleep(0)
+            escaped = link.cancels != 0
+            release.set()
+            await starting
+            await cancelling
+            assert not escaped
+            assert h.doc["steps"]["remote"]["mode"] is None
+        run(go())
