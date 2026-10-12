@@ -464,7 +464,7 @@ class BaseRemoteConnection(APITransport):
         if auth is None:
             return
         if token is not None:
-            self.user_info = auth.validate_jwt(token)
+            self.user_info = auth.validate_jwt(token, self.authentication_ip)
         elif api_key is not None and self.user_info is None:
             self.user_info = auth.validate_api_key(api_key, self.authentication_ip)
         elif self._need_auth:

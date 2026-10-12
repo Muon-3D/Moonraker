@@ -772,6 +772,64 @@ class TestPanelCredentialBoundary:
         _run(exercise())
 
 class TestPanelApiKeyAndSetupRole:
+    @pytest.mark.parametrize("ip", [LAN, None])
+    @pytest.mark.parametrize("operation", ["login", "refresh"])
+    def test_http_associated_local_socket_cannot_replace_the_request_address(
+        self, ip, operation
+    ):
+        auth = _authorization(force_logins=False)
+        credentials = TestPanelCredentialBoundary._login_request(username="friend")
+        login = _run(auth._login_jwt_user(credentials, create=True))
+        _run(auth.set_panel_login("correct horse"))
+        local = TestPanelCredentialBoundary._socket(LOOPBACK, None)
+        args = (credentials.args if operation == "login" else
+                {"refresh_token": login["refresh_token"]})
+        request = WebRequest(
+            "/access/" + operation, args, RequestType.POST, local,
+            None if ip is None else ipaddress.ip_address(ip),
+            http_headers={})
+        with pytest.raises(ServerError):
+            _run(auth._login_jwt_user(request) if operation == "login"
+                 else auth._handle_refresh_jwt(request))
+        assert local.user_info is None
+
+    @pytest.mark.parametrize("source", ["moonraker", "ldap"])
+    def test_existing_ordinary_credentials_cannot_bypass_the_panel_password(
+        self, source
+    ):
+        auth = _authorization(force_logins=False)
+        request = TestPanelCredentialBoundary._login_request(username="friend")
+        if source == "ldap":
+            class Ldap:
+                async def authenticate_ldap_user(self, *_args):
+                    pass
+            auth.ldap = Ldap()
+            request.args["source"] = source
+        login = _run(auth._login_jwt_user(request, create=source == "moonraker"))
+        user = auth.users["friend"]
+        headers = {"Authorization": "Bearer " + login["token"]}
+        assert _run(auth.authenticate_request(_Request(LAN, headers))) is user
+        socket = TestPanelCredentialBoundary._socket(LAN, user)
+        socket.server = auth.server
+        auth.server.wsm.clients = {socket.uid: socket}
+        _run(auth.set_panel_login("correct horse"))
+        assert socket.closed
+        for ip in (LAN, HOTSPOT):
+            with pytest.raises(HTTPError):
+                _run(auth.authenticate_request(_Request(ip, headers)))
+        with pytest.raises(ServerError):
+            socket.authenticate(token=login["token"])
+        with pytest.raises(ServerError):
+            _run(auth._login_jwt_user(request))
+        with pytest.raises(ServerError):
+            _run(auth._handle_refresh_jwt(WebRequest(
+                "/access/refresh_jwt", {"refresh_token": login["refresh_token"]},
+                RequestType.POST, SimpleNamespace(transport_type=None),
+                ipaddress.ip_address(LAN))))
+        assert _run(auth.authenticate_request(_Request(LOOPBACK, headers))) is user
+        _run(auth.set_panel_login(None))
+        assert _run(auth.authenticate_request(_Request(LAN, headers))) is user
+
     def test_stale_api_identity_cannot_mint_or_redeem_a_network_oneshot(self):
         auth = _authorization()
         user = auth.users[auth_mod.API_USER]

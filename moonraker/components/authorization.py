@@ -433,6 +433,12 @@ class Authorization:
             user_info = self.decode_jwt(refresh_token, token_type="refresh")
         except Exception:
             raise self.server.error("Invalid Refresh Token", 401)
+        conn = web_request.get_client_connection()
+        ip = web_request.get_ip_address()
+        if ip is None and conn is not None and not web_request.is_plain_http():
+            ip = conn.authentication_ip
+        if not self.panel_password_allows(user_info, ip):
+            raise self.server.error("Panel password authentication required", 401)
         username: str = user_info.username
         if user_info.jwt_secret is None or user_info.jwk_id is None:
             raise self.server.error("User not logged in", 401)
@@ -547,6 +553,13 @@ class Authorization:
         ):
             raise self.server.error(
                 "This login can only be created at the printer's panel.", 403)
+        conn = web_request.get_client_connection()
+        ip = web_request.get_ip_address()
+        if ip is None and conn is not None and not web_request.is_plain_http():
+            ip = conn.authentication_ip
+        candidate = self.users.get(username) or UserInfo(username, "", source=source)
+        if not self.panel_password_allows(candidate, ip):
+            raise self.server.error("Panel password authentication required", 401)
         if source == "ldap":
             if create:
                 raise self.server.error("Cannot Create LDAP User")
@@ -592,6 +605,8 @@ class Authorization:
             action = "user_logged_in"
             if hashed_pass != user_info.password:
                 raise self.server.error("Invalid Password")
+        if not self.panel_password_allows(user_info, ip):
+            raise self.server.error("Panel password authentication required", 401)
         jwt_secret_hex: Optional[str] = user_info.jwt_secret
         if jwt_secret_hex is None:
             private_key = Signer()
@@ -679,9 +694,7 @@ class Authorization:
                 muon_floor.is_panel_login(user)
                 and self.users.get(user.username) is user
             )
-        if user.username in (TRUSTED_USER, API_USER):
-            return not self.panel_login_set()
-        return True
+        return not self.panel_login_set()
 
     def _invalidate_panel_password_sessions(self) -> None:
         for token, (ip, user, handle) in list(self.oneshot_tokens.items()):
@@ -829,7 +842,7 @@ class Authorization:
             raise self.server.error("This login is not panel-managed", 401)
         return user_info
 
-    def validate_jwt(self, token: str) -> UserInfo:
+    def validate_jwt(self, token: str, ip: Optional[IPAddr] = None) -> UserInfo:
         try:
             user_info = self.decode_jwt(token)
         except Exception as e:
@@ -838,6 +851,8 @@ class Authorization:
             raise self.server.error(
                 f"Failed to decode JWT: {e}", 401
             ) from e
+        if not self.panel_password_allows(user_info, ip):
+            raise self.server.error("Panel password authentication required", 401)
         return user_info
 
     def validate_api_key(
@@ -1015,17 +1030,21 @@ class Authorization:
         if request.method == "OPTIONS":
             return None
 
-        # Check JSON Web Token
-        jwt_user = self._check_json_web_token(request, auth_required)
-        if jwt_user is not None:
-            return jwt_user
-
         try:
             ip = ipaddress.ip_address(request.remote_ip)  # type: ignore
         except ValueError:
             logging.exception(
                 f"Unable to Create IP Address {request.remote_ip}")
             ip = None
+
+        # Check JSON Web Token against the current panel-password gate.
+        jwt_user = self._check_json_web_token(request, auth_required)
+        if jwt_user is not None:
+            if self.panel_password_allows(jwt_user, ip):
+                return jwt_user
+            if auth_required:
+                raise HTTPError(401, "Panel password authentication required")
+            return None
 
         # Check oneshot access token
         ost: Optional[List[bytes]] = request.arguments.get('token', None)
