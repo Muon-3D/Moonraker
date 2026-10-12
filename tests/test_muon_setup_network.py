@@ -773,6 +773,72 @@ class TestLegacySavedProfileAndUplink:
 
 
 class TestJoinRegionAndResetBoundaries:
+    def test_a_rejoin_waits_until_the_requested_ssid_owns_the_address(self):
+        async def go():
+            script = JoinScript(uplink={"addresses": ["10.0.0.9"], "internet": True})
+            script.current_ssid = "PreviousWiFi"
+            aux = wifi_aux(script)
+            h = await Harness(stored=self.completed(), aux=aux).start()
+            machine = h.server.components["machine"]
+            machine.addresses = ["192.168.1.7"]
+            polls = []
+
+            def status(_body):
+                polls.append(True)
+                if len(polls) >= 4:
+                    script.current_ssid = SSID
+                    machine.addresses = ["10.0.0.9"]
+                return {"state": "activated" if len(polls) >= 4 else "preparing"}
+            aux.routes[("GET", "/wifi/device/status")] = status
+            await h.post("/network", join_body(rev=h.doc["rev"]))
+            await joined(h)
+            assert len(polls) >= 4
+            assert h.doc["steps"]["network"]["addresses"] == ["10.0.0.9"]
+        run(go())
+
+    def test_cancel_disconnects_a_completed_connect_still_waiting_for_dhcp(self):
+        async def go():
+            script = JoinScript()
+            script.current_ssid = SSID
+            h = await Harness(stored=join_state(), aux=wifi_aux(script)).start()
+            h.server.components["machine"].addresses = []
+            await h.post("/network", join_body())
+            for _ in range(12):
+                await asyncio.sleep(0)
+            assert h.setup._join_connect is not None and h.setup._join_connect.done()
+            await h.post("/network/cancel", {})
+            await joined(h)
+            assert len(script.disconnects) == 1 and script.forgets == [SSID]
+        run(go())
+
+    def test_an_owner_timezone_choice_wins_over_a_delayed_region_default(self):
+        async def go():
+            entered, release = asyncio.Event(), asyncio.Event()
+            applied = []
+            aux = wifi_aux(JoinScript())
+
+            async def set_zone(body):
+                if body["tz"] == "Europe/Dublin":
+                    entered.set()
+                    await release.wait()
+                applied.append(body["tz"])
+                return {}
+            aux.routes[("POST", "/time/zone")] = set_zone
+            h = await Harness(stored=join_state(), aux=aux).start()
+            h.setup._live["region"]["declared_country"] = "IE"
+            automatic = asyncio.create_task(network._single_zone_tz(h.setup, h.doc))
+            await entered.wait()
+            h.setup._live["region"]["declared_country"] = "US"
+            owner = asyncio.create_task(h.post(
+                "/timezone", {"rev": h.doc["rev"], "tz": "America/New_York"}))
+            for _ in range(12):
+                await asyncio.sleep(0)
+            release.set()
+            await asyncio.gather(automatic, owner)
+            assert applied[-1] == "America/New_York"
+            assert h.setup._internal["tz_source"] == "owner"
+        run(go())
+
     def test_an_accepted_connect_waits_for_the_later_dhcp_address(self):
         async def go():
             script = JoinScript(uplink={"addresses": ["10.0.0.9"], "internet": True})
@@ -786,6 +852,7 @@ class TestJoinRegionAndResetBoundaries:
                 polls.append(True)
                 if len(polls) >= 3:
                     machine.addresses = ["10.0.0.9"]
+                    script.current_ssid = SSID
                 return {"state": "activated" if len(polls) >= 3 else "ip-config"}
             aux.routes[("GET", "/wifi/device/status")] = status
             await h.post("/network", join_body())

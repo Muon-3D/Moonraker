@@ -192,6 +192,8 @@ class JoinScript:
         def dev_status(body: Any) -> Dict[str, Any]:
             i = min(self.device_reads, len(self.device_states) - 1)
             self.device_reads += 1
+            if self.device_states[i] == "activated" and self.connects:
+                self.current_ssid = self.connects[-1]["ssid"]
             return {"device": "wlan0", "device_type": "wifi",
                     "state": self.device_states[i], "connection": None,
                     "user_disconnected": False}
