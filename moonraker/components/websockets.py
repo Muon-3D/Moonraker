@@ -33,6 +33,7 @@ from typing import (
 )
 
 if TYPE_CHECKING:
+    from ..common import UserInfo
     from ..server import Server
     from .klippy_connection import KlippyConnection as Klippy
     from ..confighelper import ConfigHelper
@@ -391,6 +392,8 @@ class WebSocket(WebSocketHandler, BaseRemoteConnection):
         self.close(code, reason)
 
 class BridgeSocket(WebSocketHandler):
+    current_user: Optional[UserInfo]
+
     def initialize(self) -> None:
         self.server: Server = self.settings['server']
         self.wsm: WebsocketManager = self.server.lookup_component("websockets")
