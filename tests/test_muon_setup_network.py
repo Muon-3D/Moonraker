@@ -773,6 +773,47 @@ class TestLegacySavedProfileAndUplink:
 
 
 class TestJoinRegionAndResetBoundaries:
+    @pytest.mark.parametrize("unavailable", [False, True])
+    def test_unknown_region_is_not_a_confirmed_no_picker_market(self, unavailable):
+        async def go():
+            aux = wifi_aux(JoinScript())
+            if unavailable:
+                aux.routes[("GET", "/region")] = ServerError("down", 503)
+            h = Harness(stored=join_state(), aux=aux)
+            await h.setup._startup(poll=False)
+            if unavailable:
+                await h.setup.refresh_live()
+            await h.post("/network", join_body())
+            await joined(h)
+            assert h.doc["steps"]["network"]["region_confirmed"] is False
+            assert h.doc["steps"]["network"]["status"] == "pending"
+        run(go())
+
+    def test_reset_does_not_cancel_required_cleanup_during_failure_commit(self):
+        async def go():
+            entered, release = asyncio.Event(), asyncio.Event()
+            script = JoinScript(connect_result=ServerError("bad-psk", 400))
+            script.current_ssid = SSID
+            h = await Harness(stored=join_state(), aux=wifi_aux(script)).start()
+            original = h.setup._commit
+
+            async def commit():
+                if h.doc["op"] is None and h.doc["steps"]["network"]["error"]:
+                    entered.set()
+                    await release.wait()
+                await original()
+            h.setup._commit = commit
+            await h.post("/network", join_body())
+            await entered.wait()
+            resetting = asyncio.create_task(h.post("/reset", {}))
+            for _ in range(12):
+                await asyncio.sleep(0)
+            release.set()
+            await resetting
+            await h.setup.drain()
+            assert script.forgets == [SSID] and len(script.disconnects) == 1
+        run(go())
+
     def test_reset_excludes_a_join_write_that_is_still_validating(self):
         async def go():
             entered, release = asyncio.Event(), asyncio.Event()
@@ -817,6 +858,7 @@ class TestJoinRegionAndResetBoundaries:
             step = h.doc["steps"]["network"]
             assert step["status"] == "pending" and step["addresses"] == []
             assert step["error"] is not None
+            assert not aux.posted("/update/check")
         run(go())
 
     @pytest.mark.parametrize("endpoint", ["/region", "/network"])
