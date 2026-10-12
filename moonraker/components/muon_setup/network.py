@@ -626,6 +626,9 @@ def _region_runner(setup: MuonSetup, country: str, from_join: bool):
             return
         await handle.finish(
             lambda doc: _region_outcome(setup, doc, country, None, from_join))
+        # A post-setup join may wait here for its region confirmation.
+        if setup.doc is not None and setup.doc["state"] == "complete":
+            setup._spawn(setup.schedule_hotspot_off())
     return run
 
 

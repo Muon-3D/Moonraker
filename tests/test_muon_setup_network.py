@@ -1182,12 +1182,15 @@ class TestReviewConnectionSampling:
             await h.post("/network", join_body(rev=h.doc["rev"]))
             await joined(h)
             assert h.doc["steps"]["network"]["status"] == "pending"
+            assert aux.posted("/wifi/ap/auto_off") == []
             out = await h.post("/region", {"rev": h.doc["rev"], "country": "DE"})
             assert out["ok"]
             await joined(h)
             assert h.doc["steps"]["network"]["status"] == "done"
             assert h.doc["steps"]["network"]["region_confirmed"] is True
             assert h.doc["state"] == "complete" and h.doc["cursor"] == "finish"
+            assert aux.posted("/wifi/ap/auto_off") == [
+                {"after_s": h.setup.hotspot_off_delay}]
         run(go())
 
     @pytest.mark.parametrize("frequency,band", [(2412, "2.4"), (5885, "5"),
