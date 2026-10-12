@@ -532,6 +532,7 @@ async def _forget_profile(setup: MuonSetup, ssid: str) -> bool:
         missing = f"Connection profile '{ssid}' not found"
         if isinstance(cause, ServerError) and cause.status_code == 404 and (
             str(cause) == missing or str(cause).startswith(missing + ": ")
+            or str(cause) == f"No saved connection profile named '{ssid}'"
         ):
             return True  # The owned profile is already gone.
         logging.info("muon_setup: no Aux DELETE /wifi/forget; keeping cleanup pending")
@@ -688,6 +689,8 @@ async def handle_region(
 ) -> Dict[str, Any]:
     async def handler(ctx: WriteContext) -> Optional[Dict[str, Any]]:
         doc = ctx.doc
+        if doc["state"] != "complete" and not model.reachable(doc, "network"):
+            return model.error("invalid_step", "the network step is not open")
         country = ctx.args.get("country")
         if not isinstance(country, str) or not country:
             return model.error(
@@ -756,6 +759,8 @@ async def handle_network(
 ) -> Dict[str, Any]:
     async def handler(ctx: WriteContext) -> Optional[Dict[str, Any]]:
         doc = ctx.doc
+        if doc["state"] != "complete" and not model.reachable(doc, "network"):
+            return model.error("invalid_step", "the network step is not open")
         step = doc["steps"]["network"]
         args = ctx.args
         kind = args.get("kind")
@@ -860,6 +865,26 @@ def _hostname_local() -> Optional[str]:
     return f"{host}.local" if host else None
 
 
+async def _active_connection_info(
+    setup: MuonSetup, ssid: str
+) -> Tuple[Optional[str], bool]:
+    from . import AuxMissing, AuxRefused, AuxUnavailable
+    try:
+        profile = await setup.aux("GET", "/wifi/show?" + urlencode({"ssid": ssid}))
+    except (AuxMissing, AuxRefused, AuxUnavailable):
+        return None, False
+    if not isinstance(profile, dict):
+        return None, False
+    path = profile.get("GENERAL.DBUS-PATH")
+    prefix = "/org/freedesktop/NetworkManager/ActiveConnection/"
+    if not isinstance(path, str) or not path.startswith(prefix):
+        return None, False
+    number = path[len(prefix):]
+    if not number.isascii() or not number.isdigit():
+        return None, False
+    return path, profile.get("GENERAL.STATE") == "activated"
+
+
 def _join_runner(
     setup: MuonSetup, ssid: str, psk: Optional[str], security: str,
     region_arg: Optional[str], saved_before: bool
@@ -888,8 +913,40 @@ def _join_runner(
         # status poll moves `op.phase`.
         if not saved_before:
             await remember_cleanup(setup, ssid)
-        connect = setup._spawn(
-            _connect(setup, ssid, psk))
+        try:
+            previous = await setup.aux("GET", "/wifi/current")
+        except (AuxMissing, AuxRefused, AuxUnavailable):
+            previous = MISSING_UPLINK
+        known_previous = (previous is None or (
+            isinstance(previous, dict) and isinstance(previous.get("ssid"), str)
+            and bool(previous["ssid"])))
+        need_fresh = (not known_previous or (
+            isinstance(previous, dict) and previous.get("ssid") == ssid))
+        previous_path = None
+        if need_fresh:
+            previous_path, _ = await _active_connection_info(setup, ssid)
+        transitioned = False
+        activation_failed = False
+
+        def observe_state(value: Any, after_request: bool) -> None:
+            nonlocal transitioned, activation_failed
+            if not after_request or not isinstance(value, dict):
+                return
+            observed = value.get("state")
+            if observed == "failed":
+                activation_failed = True
+            elif observed in ("preparing", "configuring", "need-auth", "ip-config",
+                              "ip-check", "secondaries", "deactivating",
+                              "disconnected"):
+                transitioned = True
+
+        requested = asyncio.Event()
+
+        async def request_connect() -> Tuple[Any, Any]:
+            requested.set()
+            return await _connect(setup, ssid, psk)
+
+        connect = setup._spawn(request_connect())
         setup._join_connect = connect
         deadline = time.monotonic() + setup.join_timeout
         address: Optional[str] = None
@@ -897,10 +954,12 @@ def _join_runner(
         while handle.current():
             if connect.done() and connect_done is None:
                 connect_done = await _connect_result(connect)
+            after_request = requested.is_set()
             try:
                 status = await setup.aux("GET", "/wifi/device/status")
             except (AuxMissing, AuxRefused, AuxUnavailable):
                 status = None
+            observe_state(status, after_request)
             if isinstance(status, dict):
                 phase = DEVICE_PHASES.get(str(status.get("state", "")))
                 if phase is not None:
@@ -908,23 +967,52 @@ def _join_runner(
             # Verify the target before sampling its activation and IPv4.
             # Earlier samples can belong to the previous network on a rejoin.
             if connect_done is not None:
+                current_known = False
                 try:
                     current = await setup.aux("GET", "/wifi/current")
+                    current_known = True
                 except (AuxMissing, AuxRefused, AuxUnavailable):
                     current = None
+                if current_known and (current is None or (
+                    isinstance(current, dict) and isinstance(current.get("ssid"), str)
+                    and bool(current["ssid"]) and current["ssid"] != ssid
+                )):
+                    transitioned = True
                 if isinstance(current, dict) and current.get("ssid") == ssid:
+                    fresh = not need_fresh or transitioned
+                    profile_active = False
+                    profile_read = False
+                    if not fresh and previous_path is not None:
+                        path, profile_active = await _active_connection_info(
+                            setup, ssid)
+                        profile_read = True
+                        fresh = path is not None and path != previous_path
                     try:
                         verified_status = await setup.aux(
                             "GET", "/wifi/device/status")
                     except (AuxMissing, AuxRefused, AuxUnavailable):
                         verified_status = None
-                    activated = (not isinstance(verified_status, dict)
-                                 or verified_status.get("state") == "activated")
+                    observe_state(verified_status, True)
+                    fresh = fresh or transitioned
+                    activated = (isinstance(verified_status, dict)
+                                 and verified_status.get("state") == "activated")
+                    if not isinstance(verified_status, dict):
+                        if need_fresh:
+                            if not profile_read:
+                                _, profile_active = await _active_connection_info(
+                                    setup, ssid)
+                            activated = profile_active
+                        else:
+                            # Legacy: a different SSID now owns the IPv4.
+                            activated = True
                     candidate_address = interface_ipv4(setup, "wlan0")
-                    if activated and candidate_address is not None:
+                    if (fresh and activated and not activation_failed
+                            and candidate_address is not None):
                         address = candidate_address
                         break
-            if connect_done is not None and _connect_outcome(connect_done)[0] != "ok":
+            if connect_done is not None and (
+                activation_failed or _connect_outcome(connect_done)[0] != "ok"
+            ):
                 break
             if time.monotonic() > deadline:
                 break
