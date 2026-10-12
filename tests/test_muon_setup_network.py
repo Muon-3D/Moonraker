@@ -773,6 +773,43 @@ class TestLegacySavedProfileAndUplink:
 
 
 class TestJoinRegionAndResetBoundaries:
+    def test_the_rejoin_deadline_never_recovers_the_previous_network_address(self):
+        async def go():
+            script = JoinScript(uplink={"addresses": ["10.0.0.9"], "internet": True})
+            script.current_ssid = "PreviousWiFi"
+            aux = wifi_aux(script)
+            h = await Harness(stored=self.completed(), aux=aux).start()
+            h.setup.join_timeout = 0.01
+            h.server.components["machine"].addresses = ["192.168.1.7"]
+            aux.routes[("GET", "/wifi/device/status")] = {"state": "preparing"}
+            await h.post("/network", join_body(rev=h.doc["rev"]))
+            await joined(h)
+            step = h.doc["steps"]["network"]
+            assert step["status"] == "pending" and step["addresses"] == []
+            assert step["error"] is not None
+        run(go())
+
+    @pytest.mark.parametrize("endpoint", ["/region", "/network"])
+    def test_zone_uses_the_applied_country_when_region_refresh_fails(self, endpoint):
+        async def go():
+            applied = []
+            aux = wifi_aux(JoinScript())
+            aux.routes[("GET", "/region")] = dict(REGION_174, declared_country="GB")
+            aux.routes[("POST", "/time/zone")] = \
+                lambda body: applied.append(body["tz"]) or {}
+
+            def declare(body):
+                aux.routes[("GET", "/region")] = ServerError("temporarily down", 503)
+                return {"declared_country": body["country"]}
+            aux.routes[("POST", "/region/country")] = declare
+            h = await Harness(stored=join_state(), aux=aux).start()
+            args = ({"rev": h.doc["rev"], "country": "IE"} if endpoint == "/region"
+                    else join_body(region="IE", rev=h.doc["rev"]))
+            await h.post(endpoint, args)
+            await h.setup.drain()
+            assert applied == ["Europe/Dublin"]
+        run(go())
+
     def test_a_rejoin_waits_until_the_requested_ssid_owns_the_address(self):
         async def go():
             script = JoinScript(uplink={"addresses": ["10.0.0.9"], "internet": True})
