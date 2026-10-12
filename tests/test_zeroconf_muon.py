@@ -195,6 +195,70 @@ def test_registration_waits_for_the_stored_setup_document() -> None:
     asyncio.run(exercise())
 
 
+def test_disabled_octoprint_discovery_does_not_wait_for_setup() -> None:
+    class UnresolvedSetup(FakeSetup):
+        async def wait_resolved(self, timeout=None):
+            pytest.fail("disabled discovery waited for setup")
+    _, runner, _ = build(
+        dict(M1, octoprint_discovery="False"), UnresolvedSetup(None))
+    assert len(runner.registered) == 1
+
+
+def test_ssdp_uses_a_resolvable_host_for_the_loopback_proxy_bind() -> None:
+    server = FakeServer(None)
+    reg = zc.ZeroconfRegistrar(FakeConfig(server, M1))
+    reg.runner = RecordingRunner()
+    captured = []
+
+    class Ssdp:
+        async def start(self):
+            pass
+
+        def register_service(self, name, address, port):
+            captured.append((address, port))
+    reg.ssdp_server = Ssdp()
+    asyncio.run(reg.component_init())
+    assert captured == [("Muon-walnut-8987.local", 80)]
+
+
+def test_network_rebind_waits_for_txt_record_commit() -> None:
+    reg, runner, server = build(M1, FakeSetup(state("in_progress")))
+    reg.bound_all = True
+    runner.needs_rebind = lambda _addresses: True
+
+    async def exercise():
+        entered, release = asyncio.Event(), asyncio.Event()
+        original_update = runner.update_services
+        rebound = []
+
+        async def blocking_update(infos):
+            entered.set()
+            await release.wait()
+            await original_update(infos)
+
+        async def rebind(infos, _addresses):
+            rebound.extend(txt(info) for info in infos
+                           if info.type == zc.OCTO_SERVICE_TYPE)
+
+        runner.update_services = blocking_update
+        runner.rebind_services = rebind
+        update = asyncio.create_task(
+            server.handlers["muon_setup:muon_setup_changed"](state("complete")))
+        await entered.wait()
+        network = {"eth0": {"ip_addresses": [
+            {"address": "192.168.1.8", "is_link_local": False}]}}
+        rebinding = asyncio.create_task(reg._update_service(network))
+        try:
+            await asyncio.sleep(0)
+            assert rebound == []
+        finally:
+            release.set()
+            await asyncio.gather(update, rebinding)
+        assert rebound[0]["setup"] == "complete"
+        assert reg.octo_service_info.addresses == [bytes([192, 168, 1, 8])]
+    asyncio.run(exercise())
+
+
 def test_a_change_re_announces_the_record_under_the_same_name() -> None:
     reg, runner, server = build(M1, FakeSetup(state("in_progress")))
     before = reg.octo_service_info

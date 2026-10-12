@@ -305,7 +305,8 @@ class ZeroconfRegistrar:
         zc_service_name = f"{instance_name} @ {host}.{ZC_SERVICE_TYPE}"
         server_name = self.mdns_name or instance_name.lower()
         port = self.advertised_port or hi["port"]
-        setup = self.server.lookup_component("muon_setup", None)
+        setup = (self.server.lookup_component("muon_setup", None)
+                 if self.octoprint_discovery else None)
         if setup is not None:
             # Wait for normal stored-state loading, but still advertise an
             # unresolved migration. Its later state event fills these keys.
@@ -344,8 +345,8 @@ class ZeroconfRegistrar:
         await self._announce_muon_txt()
         if self.ssdp_server is not None:
             addr = self.cfg_addr if not self.bound_all else machine.public_ip
-            if not addr:
-                addr = f"{self.mdns_name}.local"
+            if not addr or ipaddress.ip_address(self.cfg_addr).is_loopback:
+                addr = machine.public_ip or f"{hi['hostname']}.local"
             name = f"{instance_name} ({host})"
             if len(name) > 64:
                 name = instance_name
@@ -402,6 +403,11 @@ class ZeroconfRegistrar:
         self.octo_service_info = new
 
     async def _update_service(self, network: Dict[str, Any]) -> None:
+        # A TXT replacement must commit before a rebind snapshots the records.
+        async with self._muon_txt_lock:
+            await self._update_service_locked(network)
+
+    async def _update_service_locked(self, network: Dict[str, Any]) -> None:
         if self.bound_all:
             try:
                 addresses = [x for x in self._extract_ip_addresses(network)]
