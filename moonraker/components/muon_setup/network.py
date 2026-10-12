@@ -103,7 +103,11 @@ async def prepare_boot_cleanup(setup: MuonSetup, stored: Dict[str, Any]) -> None
     if isinstance(op, dict) and op.get("kind") == "join" and op.get("forget") is True:
         ssid = op.get("ssid")
         if isinstance(ssid, str) and ssid:
-            await remember_cleanup(setup, ssid)
+            if op.get("connect_started") is False:
+                await _clear_cleanup(setup, ssid)
+            else:
+                # Legacy ops had no flag; retain their conservative recovery.
+                await remember_cleanup(setup, ssid)
 
 
 async def remember_cleanup(setup: MuonSetup, ssid: str) -> None:
@@ -520,6 +524,7 @@ async def _join_cleanup(setup: MuonSetup, ssid: str) -> None:
     finally:
         if connect is not None and connect.done() and setup._join_connect is connect:
             setup._join_connect = None
+            setup._join_requested = None
 
 
 async def _forget_profile(setup: MuonSetup, ssid: str) -> bool:
@@ -567,11 +572,33 @@ def cancel_cleanup_info(setup: MuonSetup) -> Tuple[Optional[str], bool]:
             op.get("forget") is True)
 
 
+def cleanup_possible(setup: MuonSetup, ssid: str) -> bool:
+    requested = setup._join_requested
+    if requested is not None:
+        return requested.is_set()
+    return (setup._join_connect is not None
+            or setup._internal.get("join_cleanup_ssid") == ssid)
+
+
 async def cancel_cleanup(setup: MuonSetup, ssid: Optional[str],
                          forget: bool) -> None:
     """02 §5.6a: a cancelled join removes the partial profile -- unless the
     SSID was already saved before the join."""
     if ssid is not None and forget:
+        if not cleanup_possible(setup, ssid):
+            # Cancel a queued connect before deciding that its reservation is unused.
+            connect = setup._join_connect
+            if connect is not None and not connect.done():
+                connect.cancel()
+                try:
+                    await connect
+                except (asyncio.CancelledError, Exception):
+                    pass
+            if not cleanup_possible(setup, ssid):
+                await _clear_cleanup(setup, ssid)
+                setup._join_connect = None
+                setup._join_requested = None
+                return
         await _forget_after_join(setup, ssid)
 
 
@@ -839,6 +866,8 @@ async def handle_network(
             # owner choice when a later Wi-Fi join needs confirmation.
             step["region_confirmed"] = isinstance(
                 setup._internal.get("owner_region"), str)
+        setup._join_connect = None  # A completed prior request no longer owns this op.
+        setup._join_requested = None
         step.update(ssid=ssid, status=model.PENDING, kind=None, addresses=[],
                     hostname_local=None, internet=None)
         step["error"] = None
@@ -849,7 +878,7 @@ async def handle_network(
                          region_arg.upper() if isinstance(region_arg, str)
                          else None,
                          saved_before),
-            phase="saving", ssid=ssid, forget=not saved_before)
+            phase="saving", ssid=ssid, forget=not saved_before, connect_started=False)
         return None
     return await setup.write(webreq, handler, after_complete=True)
 
@@ -911,8 +940,15 @@ def _join_runner(
                 return
         # Step 4: the join. The connect call runs as a task while the device
         # status poll moves `op.phase`.
+        requested = asyncio.Event()
+        setup._join_requested = requested
         if not saved_before:
             await remember_cleanup(setup, ssid)
+        try:
+            baseline = await setup.aux("GET", "/wifi/device/status")
+        except (AuxMissing, AuxRefused, AuxUnavailable):
+            baseline = None
+        stale_failure = isinstance(baseline, dict) and baseline.get("state") == "failed"
         try:
             previous = await setup.aux("GET", "/wifi/current")
         except (AuxMissing, AuxRefused, AuxUnavailable):
@@ -929,18 +965,23 @@ def _join_runner(
         activation_failed = False
 
         def observe_state(value: Any, after_request: bool) -> None:
-            nonlocal transitioned, activation_failed
+            nonlocal transitioned, activation_failed, stale_failure
             if not after_request or not isinstance(value, dict):
                 return
             observed = value.get("state")
             if observed == "failed":
-                activation_failed = True
+                if not stale_failure:
+                    activation_failed = True
+            elif observed == "activated":
+                stale_failure = False
             elif observed in ("preparing", "configuring", "need-auth", "ip-config",
                               "ip-check", "secondaries", "deactivating",
                               "disconnected"):
                 transitioned = True
+                stale_failure = False
 
-        requested = asyncio.Event()
+        if not await handle.update(connect_started=True):
+            return
 
         async def request_connect() -> Tuple[Any, Any]:
             requested.set()
@@ -1042,6 +1083,7 @@ def _join_runner(
                 # update check reached Aux is the internet verdict.
                 internet = True if checked else None
             setup._join_connect = None
+            setup._join_requested = None
             await _finish_join(setup, handle, ssid, address, internet,
                                saved_before, bool(region_arg))
             return
@@ -1201,5 +1243,6 @@ async def _finish_fail(
     connect = setup._join_connect
     if connect is not None and connect.done():
         setup._join_connect = None
+        setup._join_requested = None
     if cleanup is not None:
         await asyncio.shield(cleanup)

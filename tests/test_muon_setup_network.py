@@ -150,8 +150,10 @@ class TestJoin:
         op and deletes the not-previously-saved profile."""
         async def go():
             gate = asyncio.Event()
+            started = asyncio.Event()
 
             async def slow_connect(body: Any) -> Any:
+                started.set()
                 await gate.wait()
                 return {"status": "connecting", "ssid": body["ssid"]}
             script = JoinScript()
@@ -160,14 +162,17 @@ class TestJoin:
             h = await Harness(stored=join_state(), aux=aux).start()
             out = await h.post("/network", join_body())
             assert out["ok"] is True
+            await asyncio.wait_for(started.wait(), 30.)
             busy = await h.post("/skip", {"rev": h.doc["rev"],
                                           "step": "network"})
             assert busy["ok"] is False and busy["error"]["code"] == "busy"
             cancel = await h.post("/network/cancel", {})
             assert cancel["ok"] is True
             assert h.doc["op"] is None
-            assert script.forgets == [SSID]
+            assert script.forgets == []
             gate.set()  # let the connect task finish
+            await joined(h)
+            assert script.forgets == [SSID]
         run(go())
 
     def test_cancel_keeps_a_previously_saved_profile(self):
@@ -1607,4 +1612,127 @@ class TestNetworkStepReachability:
             assert h.doc["op"] is None
             assert aux.posted("/wifi/connect") == []
             assert aux.posted("/region/country") == []
+        run(go())
+
+
+class TestReviewAttemptBoundaries:
+    @pytest.mark.parametrize("status", [403, 503])
+    def test_confirmed_region_absence_survives_a_transient_error(self, status):
+        async def go():
+            aux = wifi_aux(JoinScript())
+            aux.routes[("GET", "/region")] = ServerError("Not Found", 404)
+            h = await Harness(stored=join_state(), aux=aux).start()
+            assert network._region_market(h.setup) == "none"
+            aux.routes[("GET", "/region")] = ServerError("temporary error", status)
+            await h.setup._refresh_region()
+            assert network._region_market(h.setup) == "none"
+            await h.post("/network", join_body(rev=h.doc["rev"]))
+            await joined(h)
+            assert h.doc["steps"]["network"]["status"] == "done"
+            aux.routes[("GET", "/region")] = REGION_174
+            await h.setup._refresh_region()
+            assert network._region_market(h.setup) == "picker"
+        run(go())
+
+    @pytest.mark.parametrize("new_failure", [False, True])
+    def test_the_old_failed_state_does_not_poison_a_new_attempt(self, monkeypatch, new_failure):
+        async def go():
+            monkeypatch.setattr(network, "STATUS_POLL", 0.01)
+            script = JoinScript()
+            aux = wifi_aux(script)
+            aux.routes[("GET", "/region")] = ServerError("Not Found", 404)
+            reads = []
+            gate = asyncio.Event()
+
+            def status(_body):
+                reads.append(True)
+                if not script.connects:
+                    return {"state": "failed"}
+                if len(reads) < 4:
+                    return {"state": "failed"}
+                if len(reads) == 4:
+                    return {"state": "preparing"}
+                if len(reads) == 5:
+                    gate.set()
+                    return {"state": "failed" if new_failure else "ip-config"}
+                script.current_ssid = SSID
+                return {"state": "activated"}
+
+            async def connect(body):
+                script.connects.append(body)
+                await gate.wait()
+                return {"status": "connecting", "ssid": SSID}
+
+            aux.routes[("GET", "/wifi/device/status")] = status
+            aux.routes[("POST", "/wifi/connect")] = connect
+            h = await Harness(stored=join_state(), aux=aux).start()
+            await h.post("/network", join_body(rev=h.doc["rev"]))
+            await joined(h)
+            step = h.doc["steps"]["network"]
+            assert step["status"] == ("pending" if new_failure else "done")
+        run(go())
+
+    @pytest.mark.parametrize("reset", [False, True])
+    def test_cancel_during_region_apply_does_not_reserve_a_profile(self, reset):
+        async def go():
+            entered, release = asyncio.Event(), asyncio.Event()
+            aux = wifi_aux(JoinScript())
+
+            async def country(_body):
+                entered.set()
+                await release.wait()
+                return {"declared_country": "DE"}
+
+            aux.routes[("POST", "/region/country")] = country
+            aux.routes[("DELETE", "/wifi/forget")] = ServerError("Not Found", 404)
+            h = await Harness(stored=join_state(), aux=aux).start()
+            await h.post("/network", join_body(region="DE", rev=h.doc["rev"]))
+            await entered.wait()
+            out = await h.post("/reset" if reset else "/network/cancel", {})
+            assert out["ok"]
+            assert not aux.posted("/wifi/connect")
+            assert not h.setup._internal.get("join_cleanup_ssid")
+            if not reset:
+                out = await h.post("/network", join_body(rev=h.doc["rev"]))
+                assert out["ok"]
+            await h.setup.close()
+        run(go())
+
+
+class TestUnusedCleanupReservation:
+    @pytest.mark.parametrize("reset", [False, True])
+    def test_cancel_during_preflight_clears_an_unused_reservation(self, reset):
+        async def go():
+            entered, release = asyncio.Event(), asyncio.Event()
+            aux = wifi_aux(JoinScript())
+
+            async def current(_body):
+                entered.set()
+                await release.wait()
+                return None
+
+            aux.routes[("GET", "/wifi/current")] = current
+            aux.routes[("DELETE", "/wifi/forget")] = ServerError("Not Found", 404)
+            h = await Harness(stored=join_state(), aux=aux).start()
+            await h.post("/network", join_body(rev=h.doc["rev"]))
+            await entered.wait()
+            out = await h.post("/reset" if reset else "/network/cancel", {})
+            assert out["ok"]
+            assert not aux.posted("/wifi/connect")
+            assert not h.setup._internal.get("join_cleanup_ssid")
+        run(go())
+
+    def test_boot_discards_a_reservation_known_to_precede_the_request(self):
+        async def go():
+            doc = join_state()
+            doc["op"] = {"id": "op_preflight", "kind": "join", "phase": "saving",
+                         "ssid": SSID, "forget": True, "connect_started": False}
+            script = JoinScript(saved=[SSID])
+            script.current_ssid = SSID
+            h = await Harness(stored=doc, aux=wifi_aux(script), namespaces={
+                "muon_setup": {"internal": {"join_cleanup_ssid": SSID}}}).start()
+            await joined(h)
+            assert h.doc["op"] is None
+            assert script.forgets == [] and script.disconnects == []
+            assert not h.setup._internal.get("join_cleanup_ssid")
         run(go())
