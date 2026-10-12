@@ -795,8 +795,8 @@ def _join_runner(
                 if phase is not None:
                     await handle.update(phase=phase)
             # An uplink IPv4 is what decides (02 §5.6 step 5).
-            address = interface_ipv4(setup, "wlan0")
-            if address is not None and connect_done is not None:
+            candidate_address = interface_ipv4(setup, "wlan0")
+            if candidate_address is not None and connect_done is not None:
                 try:
                     current = await setup.aux("GET", "/wifi/current")
                 except (AuxMissing, AuxRefused, AuxUnavailable):
@@ -805,8 +805,8 @@ def _join_runner(
                              or status.get("state") == "activated")
                 if (isinstance(current, dict) and current.get("ssid") == ssid
                         and activated):
+                    address = candidate_address
                     break
-                address = None
             if connect_done is not None and _connect_outcome(connect_done)[0] != "ok":
                 break
             if time.monotonic() > deadline:

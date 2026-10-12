@@ -773,15 +773,45 @@ class TestLegacySavedProfileAndUplink:
 
 
 class TestJoinRegionAndResetBoundaries:
+    def test_reset_excludes_a_join_write_that_is_still_validating(self):
+        async def go():
+            entered, release = asyncio.Event(), asyncio.Event()
+            script = JoinScript()
+            aux = wifi_aux(script)
+
+            async def saved(_body):
+                entered.set()
+                await release.wait()
+                return []
+            aux.routes[("GET", "/wifi/saved")] = saved
+            h = await Harness(stored=join_state(), aux=aux).start()
+            joining = asyncio.create_task(h.post("/network", join_body()))
+            await entered.wait()
+            resetting = asyncio.create_task(h.post("/reset", {}))
+            for _ in range(12):
+                await asyncio.sleep(0)
+            release.set()
+            await asyncio.gather(joining, resetting)
+            await h.setup.drain()
+            assert h.doc["state"] == "new" and h.doc["op"] is None
+            assert not aux.posted("/wifi/connect")
+        run(go())
+
     def test_the_rejoin_deadline_never_recovers_the_previous_network_address(self):
         async def go():
             script = JoinScript(uplink={"addresses": ["10.0.0.9"], "internet": True})
             script.current_ssid = "PreviousWiFi"
             aux = wifi_aux(script)
             h = await Harness(stored=self.completed(), aux=aux).start()
-            h.setup.join_timeout = 0.01
+            h.setup.join_timeout = 0.0
             h.server.components["machine"].addresses = ["192.168.1.7"]
-            aux.routes[("GET", "/wifi/device/status")] = {"state": "preparing"}
+
+            async def preparing(_body):
+                # Complete the accepted connect between the loop's initial
+                # done check and its deadline check, without assigning DHCP.
+                await asyncio.sleep(0)
+                return {"state": "preparing"}
+            aux.routes[("GET", "/wifi/device/status")] = preparing
             await h.post("/network", join_body(rev=h.doc["rev"]))
             await joined(h)
             step = h.doc["steps"]["network"]
