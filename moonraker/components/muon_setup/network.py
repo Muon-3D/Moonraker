@@ -236,7 +236,7 @@ def normalize_scan(
                 "band": _band(entry.get("freq")), "channel": channel,
                 "bssids": 1, "saved": ssid in saved_names,
                 "in_use": entry.get("in_use") is True,
-                "supported": security != "wep",
+                "supported": security not in ("wep", "enterprise"),
                 "channel_permitted": not channels or channel in channels,
             }
             merged[ssid] = row
@@ -247,7 +247,7 @@ def normalize_scan(
                 row["band"] = _band(entry.get("freq"))
                 row["channel"] = channel
                 row["security"] = security
-                row["supported"] = security != "wep"
+                row["supported"] = security not in ("wep", "enterprise")
                 row["channel_permitted"] = (
                     not channels or channel in channels)
             if entry.get("in_use") is True:
@@ -795,7 +795,7 @@ def _join_runner(
             address = interface_ipv4(setup, "wlan0")
             if address is not None and connect_done is not None:
                 break
-            if connect_done is not None and connect_done[0] != "connecting":
+            if connect_done is not None and _connect_outcome(connect_done)[0] != "ok":
                 break
             if time.monotonic() > deadline:
                 break
@@ -847,8 +847,14 @@ async def _connect(setup: MuonSetup, ssid: str,
         return await setup.aux("POST", "/wifi/connect", body,
                                timeout=CONNECT_TIMEOUT), None
     except (AuxMissing, AuxRefused, AuxUnavailable) as exc:
+        exc.__traceback__ = None
+        exc.__cause__ = None
+        exc.__context__ = None
         return None, exc
     except Exception as exc:  # noqa: BLE001 -- the join must report, not raise
+        exc.__traceback__ = None
+        exc.__cause__ = None
+        exc.__context__ = None
         return None, exc
 
 
@@ -939,8 +945,7 @@ async def _finish_join(
 
     def mutate(doc: Dict[str, Any]) -> None:
         step = doc["steps"]["network"]
-        current_confirmation = confirmed or (
-            doc["state"] == "complete" and step.get("region_confirmed") is True)
+        current_confirmation = confirmed or step.get("region_confirmed") is True
         step.update(kind="wifi", ssid=ssid, addresses=[address],
                     hostname_local=_hostname_local(),
                     internet=internet,
@@ -969,5 +974,8 @@ async def _finish_fail(
 ) -> None:
     await handle.finish(
         lambda doc: _join_fail(doc, code, phase, ssid, detail))
+    connect = setup._join_connect
+    if connect is not None and connect.done():
+        setup._join_connect = None
     if not saved_before:
         await _forget_after_join(setup, ssid)

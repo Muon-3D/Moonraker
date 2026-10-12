@@ -773,6 +773,68 @@ class TestLegacySavedProfileAndUplink:
 
 
 class TestJoinRegionAndResetBoundaries:
+    def test_an_accepted_connect_waits_for_the_later_dhcp_address(self):
+        async def go():
+            script = JoinScript(uplink={"addresses": ["10.0.0.9"], "internet": True})
+            aux = wifi_aux(script)
+            h = await Harness(stored=join_state(), aux=aux).start()
+            machine = h.server.components["machine"]
+            machine.addresses = []
+            polls = []
+
+            def status(_body):
+                polls.append(True)
+                if len(polls) >= 3:
+                    machine.addresses = ["10.0.0.9"]
+                return {"state": "activated" if len(polls) >= 3 else "ip-config"}
+            aux.routes[("GET", "/wifi/device/status")] = status
+            await h.post("/network", join_body())
+            await joined(h)
+            assert len(polls) >= 3
+            assert h.doc["steps"]["network"]["addresses"] == ["10.0.0.9"]
+            assert h.doc["steps"]["network"]["error"] is None
+        run(go())
+
+    @pytest.mark.parametrize("replacement", [False, True])
+    def test_enterprise_scan_is_unsupported_after_replacement(self, replacement):
+        async def go():
+            h = await Harness(stored=join_state()).start()
+            scan = [{"ssid": "Corp", "security": "802.1X", "signal": 80}]
+            if replacement:
+                scan.insert(0, {"ssid": "Corp", "security": "WPA2", "signal": 20})
+            row, = network.normalize_scan(h.setup, scan, [])
+            assert row["security"] == "enterprise" and row["supported"] is False
+        run(go())
+
+    @pytest.mark.parametrize("detected", ["FR", None])
+    def test_region_confirmed_before_join_stays_confirmed(self, detected):
+        async def go():
+            aux = wifi_aux(JoinScript(uplink={
+                "addresses": ["10.0.0.9"], "internet": True}))
+            aux.routes[("GET", "/region")] = dict(
+                REGION_174, declared_country="DE", detected_country=detected)
+            aux.routes[("POST", "/region/country")] = \
+                lambda body: {"declared_country": body["country"]}
+            h = await Harness(stored=join_state(), aux=aux).start()
+            await h.post("/region", {"rev": h.doc["rev"], "country": "DE"})
+            await h.setup.drain()
+            assert h.doc["steps"]["network"]["region_confirmed"] is True
+            await h.post("/network", join_body(rev=h.doc["rev"]))
+            await joined(h)
+            assert h.doc["steps"]["network"]["region_confirmed"] is True
+            assert h.doc["steps"]["network"]["status"] == "done"
+        run(go())
+
+    def test_connect_failures_do_not_retain_credential_frames_or_chains(self):
+        async def go():
+            aux = wifi_aux(JoinScript(connect_result=ServerError("bad-psk", 400)))
+            h = await Harness(stored=join_state(), aux=aux).start()
+            result, error = await network._connect(h.setup, SSID, PSK)
+            assert result is None and error is not None
+            assert error.__traceback__ is None
+            assert error.__cause__ is None and error.__context__ is None
+        run(go())
+
     @staticmethod
     def completed():
         doc = join_state()
