@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import pathlib
 import logging
+import ipaddress
 from ..common import BaseRemoteConnection, RequestType, TransportType
 from ..utils import get_unix_peer_credentials
 
@@ -24,6 +25,7 @@ if TYPE_CHECKING:
     from ..server import Server
     from ..confighelper import ConfigHelper
     from ..common import WebRequest
+    from ..utils import IPAddress
     from .klippy_connection import KlippyConnection as Klippy
 
 UNIX_BUFFER_LIMIT = 20 * 1024 * 1024
@@ -158,6 +160,11 @@ class ExtensionManager:
             self.uds_server = None
 
 class UnixSocketClient(BaseRemoteConnection):
+    @property
+    def authentication_ip(self) -> IPAddress:
+        # The Unix transport is local, but has no network/floor identity.
+        return ipaddress.ip_address("127.0.0.1")
+
     def __init__(
         self,
         server: Server,
