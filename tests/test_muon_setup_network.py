@@ -838,6 +838,29 @@ class TestJoinRegionAndResetBoundaries:
             assert not aux.posted("/wifi/connect")
         run(go())
 
+    def test_cancel_excludes_a_join_write_that_is_still_validating(self):
+        async def go():
+            entered, release = asyncio.Event(), asyncio.Event()
+            aux = wifi_aux(JoinScript())
+
+            async def saved(_body):
+                entered.set()
+                await release.wait()
+                return []
+            aux.routes[("GET", "/wifi/saved")] = saved
+            h = await Harness(stored=join_state(), aux=aux).start()
+            joining = asyncio.create_task(h.post("/network", join_body()))
+            await entered.wait()
+            cancelling = asyncio.create_task(h.post("/network/cancel", {}))
+            for _ in range(12):
+                await asyncio.sleep(0)
+            release.set()
+            await asyncio.gather(joining, cancelling)
+            await h.setup.drain()
+            assert h.doc["op"] is None
+            assert not aux.posted("/wifi/connect")
+        run(go())
+
     def test_the_rejoin_deadline_never_recovers_the_previous_network_address(self):
         async def go():
             script = JoinScript(uplink={"addresses": ["10.0.0.9"], "internet": True})
