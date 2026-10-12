@@ -246,6 +246,7 @@ class MuonSetup:
         #: network.py's in-flight Aux /wifi/connect, and the cleanup that
         #: waits it out before forgetting a partial profile.
         self._join_connect: Optional[asyncio.Task] = None
+        self._join_requested: Optional[asyncio.Event] = None
         self._join_cleanup: Optional[asyncio.Task] = None
         self._stations_route = True
         self._clock_from_phone = False
@@ -1156,7 +1157,7 @@ class MuonSetup:
             # the LAN may not stop a join the panel started.
             caller.refuse_if_protected(kind, self.doc["state"])
             ssid, forget = network.cancel_cleanup_info(self)
-            if ssid is not None and forget:
+            if ssid is not None and forget and network.cleanup_possible(self, ssid):
                 await network.remember_cleanup(self, ssid)
             await self.cancel_op(("region_apply", "join"))
             # 02 §5.6a: the partial profile goes too (only when the join made
@@ -1175,7 +1176,7 @@ class MuonSetup:
         async with self._reset_lock:
             ssid, forget = network.cancel_cleanup_info(self)
             connect = self._join_connect
-            if ssid is not None and forget:
+            if ssid is not None and forget and network.cleanup_possible(self, ssid):
                 await network.remember_cleanup(self, ssid)
             if self._marker_task is not None and not self._marker_task.done():
                 self._marker_task.cancel()
@@ -1346,7 +1347,7 @@ class MuonSetup:
             self._region_missing = True
             return
         except (AuxUnavailable, AuxRefused):
-            self._region_missing = False
+            # A transient failure does not disprove confirmed route absence.
             return
         if isinstance(state, dict) and isinstance(options, dict):
             self._region_missing = False
