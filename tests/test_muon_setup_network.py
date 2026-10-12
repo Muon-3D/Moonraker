@@ -1258,3 +1258,31 @@ class TestInterruptedJoinCleanup:
             await joined(h)
             assert recovering
         run(go())
+
+
+class TestEthernetToWifiConfirmation:
+    @pytest.mark.parametrize("complete", [False, True])
+    @pytest.mark.parametrize("detected", [None, "FR", "DE"])
+    def test_ethernet_confirmation_is_recomputed_for_wifi(
+        self, monkeypatch, complete, detected
+    ):
+        async def go():
+            doc = join_state()
+            if complete:
+                doc.update(state="complete", cursor="finish")
+            aux = wifi_aux(JoinScript())
+            aux.routes[("GET", "/region")] = dict(
+                REGION_174, declared_country="DE", detected_country=detected)
+            monkeypatch.setattr(network, "interface_ipv4", lambda setup, iface:
+                                "10.10.0.5" if iface == "eth0" else "192.168.1.37")
+            h = await Harness(stored=doc, aux=aux).start()
+            out = await h.post("/network", {"rev": h.doc["rev"], "kind": "ethernet"})
+            assert out["ok"]
+            assert h.doc["steps"]["network"]["region_confirmed"] is True
+            out = await h.post("/network", join_body(rev=h.doc["rev"]))
+            assert out["ok"]
+            await joined(h)
+            step = h.doc["steps"]["network"]
+            assert step["region_confirmed"] is (detected == "DE")
+            assert step["status"] == ("done" if detected == "DE" else "pending")
+        run(go())
