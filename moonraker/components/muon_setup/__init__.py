@@ -281,6 +281,10 @@ class MuonSetup:
             self._internal.update(internal)
         if isinstance(stored, dict):
             self._load(stored)
+            # Discovery may already be registered after a slow database load.
+            # An unchanged document still supplies its initial name/status.
+            self.server.send_event(
+                "muon_setup:muon_setup_changed", self.public_state())
         else:
             await self._migrate()
         if poll:
