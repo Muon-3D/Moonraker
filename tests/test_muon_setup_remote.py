@@ -426,3 +426,27 @@ class TestRemoteCancelWriteBoundary:
             assert not escaped
             assert h.doc["steps"]["remote"]["mode"] is None
         run(go())
+
+
+class TestRemoteStepReachability:
+    @pytest.mark.parametrize("complete", [False, True])
+    @pytest.mark.parametrize("mode", ["local", "later", "cloud"])
+    def test_required_language_blocks_remote_choices_until_completion(self, mode, complete):
+        async def go():
+            doc = cloud_state()
+            doc["steps"]["language"].update(status="pending", value=None)
+            doc["cursor"] = "language"
+            if complete:
+                doc.update(state="complete", cursor="finish")
+            link = FakeMuonLink([{"phase": "linked", "account": "owner@example.test"}])
+            h = await remote_harness(link, stored=doc)
+            out = await h.post("/remote", body(mode=mode, rev=h.doc["rev"]))
+            if complete:
+                assert out["ok"]
+                assert h.doc["state"] == "complete" and h.doc["cursor"] == "finish"
+                assert h.doc["steps"]["remote"]["mode"] == mode
+            else:
+                assert out["error"]["code"] == "invalid_step"
+                assert h.doc["steps"]["remote"]["status"] == "pending"
+                assert link.starts == 0
+        run(go())

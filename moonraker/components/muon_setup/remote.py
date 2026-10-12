@@ -118,6 +118,8 @@ async def handle_remote(
 ) -> Dict[str, Any]:
     async def handler(ctx: WriteContext) -> Optional[Dict[str, Any]]:
         doc = ctx.doc
+        if doc["state"] != "complete" and not model.reachable(doc, "remote"):
+            return model.error("invalid_step", "the remote step is not open")
         step = doc["steps"]["remote"]
         mode = ctx.args.get("mode")
         if mode == "local":
