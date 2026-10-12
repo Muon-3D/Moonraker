@@ -1147,3 +1147,60 @@ class TestJoinRegionAndResetBoundaries:
             assert script.forgets == ([] if saved else [SSID])
             assert len(script.disconnects) == (0 if saved else 1)
         run(go())
+
+
+class TestReviewConnectionSampling:
+    def test_address_is_sampled_after_the_target_ssid_is_verified(self):
+        async def go():
+            script = JoinScript(uplink={"addresses": ["10.0.0.9"], "internet": True})
+            aux = wifi_aux(script)
+            h = await Harness(stored=TestJoinRegionAndResetBoundaries.completed(),
+                              aux=aux).start()
+            machine = h.server.components["machine"]
+            machine.addresses = ["192.168.1.7"]
+
+            def current(_body):
+                machine.addresses = ["10.0.0.9"]
+                return {"ssid": SSID}
+
+            aux.routes[("GET", "/wifi/current")] = current
+            aux.routes[("GET", "/wifi/device/status")] = {"state": "activated"}
+            await h.post("/network", join_body(rev=h.doc["rev"]))
+            await joined(h)
+            assert h.doc["steps"]["network"]["addresses"] == ["10.0.0.9"]
+        run(go())
+
+    def test_region_confirmation_follows_a_post_setup_join_from_skipped(self):
+        async def go():
+            doc = TestJoinRegionAndResetBoundaries.completed()
+            doc["steps"]["network"].update(status="skipped", kind=None,
+                                               addresses=[], region_confirmed=False)
+            aux = wifi_aux(JoinScript())
+            aux.routes[("POST", "/region/country")] = {"declared_country": "DE"}
+            aux.routes[("GET", "/region")] = dict(REGION_174, detected_country=None)
+            h = await Harness(stored=doc, aux=aux).start()
+            await h.post("/network", join_body(rev=h.doc["rev"]))
+            await joined(h)
+            assert h.doc["steps"]["network"]["status"] == "pending"
+            out = await h.post("/region", {"rev": h.doc["rev"], "country": "DE"})
+            assert out["ok"]
+            await joined(h)
+            assert h.doc["steps"]["network"]["status"] == "done"
+            assert h.doc["steps"]["network"]["region_confirmed"] is True
+            assert h.doc["state"] == "complete" and h.doc["cursor"] == "finish"
+        run(go())
+
+    @pytest.mark.parametrize("frequency,band", [(2412, "2.4"), (5885, "5"),
+                                               (5935, "6"), (5955, "6"),
+                                               (6475, "6"), (7115, "6")])
+    def test_scan_reports_the_actual_band(self, frequency, band):
+        async def go():
+            aux = fresh_aux()
+            aux.routes[("GET", "/wifi/scan?rescan=true")] = [
+                {"ssid": "BandTest", "security": "WPA2", "signal": 80,
+                 "freq": frequency, "chan": 1}]
+            h = await Harness(stored=join_state(), aux=aux).start()
+            out = await h.call("panel", "/server/muon/setup/networks",
+                               {"rescan": True}, method="GET")
+            assert out["networks"][0]["band"] == band
+        run(go())

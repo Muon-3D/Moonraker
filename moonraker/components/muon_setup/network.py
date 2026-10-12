@@ -203,7 +203,7 @@ def _band(freq: Any) -> Optional[str]:
         return None
     if mhz < 3000:
         return "2.4"
-    if mhz < 6500:
+    if mhz < 5925:
         return "5"
     return "6"
 
@@ -613,7 +613,7 @@ async def handle_region(
             _region_runner(setup, str(country).upper(), False),
             country=str(country).upper())
         return None
-    return await setup.write(webreq, handler)
+    return await setup.write(webreq, handler, after_complete=True)
 
 
 def _region_runner(setup: MuonSetup, country: str, from_join: bool):
@@ -797,19 +797,25 @@ def _join_runner(
                 phase = DEVICE_PHASES.get(str(status.get("state", "")))
                 if phase is not None:
                     await handle.update(phase=phase)
-            # An uplink IPv4 is what decides (02 §5.6 step 5).
-            candidate_address = interface_ipv4(setup, "wlan0")
-            if candidate_address is not None and connect_done is not None:
+            # Verify the target before sampling its activation and IPv4.
+            # Earlier samples can belong to the previous network on a rejoin.
+            if connect_done is not None:
                 try:
                     current = await setup.aux("GET", "/wifi/current")
                 except (AuxMissing, AuxRefused, AuxUnavailable):
                     current = None
-                activated = (not isinstance(status, dict)
-                             or status.get("state") == "activated")
-                if (isinstance(current, dict) and current.get("ssid") == ssid
-                        and activated):
-                    address = candidate_address
-                    break
+                if isinstance(current, dict) and current.get("ssid") == ssid:
+                    try:
+                        verified_status = await setup.aux(
+                            "GET", "/wifi/device/status")
+                    except (AuxMissing, AuxRefused, AuxUnavailable):
+                        verified_status = None
+                    activated = (not isinstance(verified_status, dict)
+                                 or verified_status.get("state") == "activated")
+                    candidate_address = interface_ipv4(setup, "wlan0")
+                    if activated and candidate_address is not None:
+                        address = candidate_address
+                        break
             if connect_done is not None and _connect_outcome(connect_done)[0] != "ok":
                 break
             if time.monotonic() > deadline:
