@@ -31,7 +31,8 @@ SECRETS = {
 class TestTheHelper:
     def test_the_fields(self):
         assert redact.SENSITIVE_FIELDS == {
-            "signer_name", "password", "key", "reentry_token"}
+            "signer_name", "password", "key", "reentry_token",
+            "credentials", "access_code"}
 
     def test_every_field_at_any_depth_and_case(self):
         value = {

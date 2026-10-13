@@ -85,6 +85,9 @@ STRICT = dict(
 READ_ROWS = {"read"}
 VIEWER_ROWS = {"read", "emergency_stop"}
 HOME_ONLY = {"wifi", "hotspot", "updates", "config"}
+#: Rows beyond the design's section 3. bridge: muon_bridge (KAN-527), the
+#: owner's alone, from home, whatever the preset.
+EXTRA_HOME_ONLY = {"bridge"}
 ADMIN_FROM_AWAY = {"wifi", "hotspot", "updates"}
 
 # One request for each row, as a client would send it.
@@ -179,7 +182,8 @@ class TestTheTableIsTheDesign:
                 assert got == level, (name, row)
 
     def test_flags_match_section_3(self):
-        assert {n for n, a in policy.ACTIONS.items() if a.home_only} == HOME_ONLY
+        assert {n for n, a in policy.ACTIONS.items() if a.home_only} == (
+            HOME_ONLY | EXTRA_HOME_ONLY)
         assert {n for n, a in policy.ACTIONS.items()
                 if a.admin_from_away} == ADMIN_FROM_AWAY
         # access_request: asking the panel is not acting (design 2.5)
@@ -191,7 +195,7 @@ class TestTheTableIsTheDesign:
         # ACC-24, plus emergency stop's "never above this"
         fixed = {n for n, a in policy.ACTIONS.items() if a.fixed}
         assert fixed == {"emergency_stop", "protection", "owner", "dev_mode",
-                         "setup", "access_api", "access_request"}
+                         "setup", "access_api", "access_request", "bridge"}
 
     def test_each_sample_is_classified_as_its_row(self):
         for row, (endpoint, rtype, args) in SAMPLES.items():

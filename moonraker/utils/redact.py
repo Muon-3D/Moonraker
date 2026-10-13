@@ -9,6 +9,8 @@
 #     /server/aux/dev_mode). A person's name, kept on the device only.
 #   * password, key -- the Wi-Fi password and the hotspot key.
 #   * reentry_token -- the token that lets a phone back into setup.
+#   * credentials, access_code -- what muon_bridge is handed for another
+#     printer: a Bambu access code, a PrusaLink user name and password.
 #
 # Matched by field name, case-insensitively, at any depth.
 
@@ -18,7 +20,10 @@ import json
 from typing import Any, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-SENSITIVE_FIELDS = frozenset(("signer_name", "password", "key", "reentry_token"))
+SENSITIVE_FIELDS = frozenset((
+    "signer_name", "password", "key", "reentry_token", "credentials",
+    "access_code",
+))
 REDACTED = "<redacted>"
 
 
