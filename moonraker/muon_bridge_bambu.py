@@ -287,10 +287,10 @@ class BambuPrinter:
         return frame
 
     async def close(self) -> None:
+        self.access_code.wipe()
         if self.mqtt is not None:
             mqtt, self.mqtt = self.mqtt, None
             try:
                 await mqtt.close()
             except Exception:
                 logging.exception("muon_bridge: closing MQTT")
-        self.access_code.wipe()

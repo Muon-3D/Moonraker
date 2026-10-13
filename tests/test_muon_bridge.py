@@ -19,6 +19,8 @@ from moonraker.muon_bridge_common import (
     BridgeError, RateLimit, Secret, check_filename, parse_target
 )
 from moonraker.muon_bridge_prusa import check_api_path
+from moonraker.muon_bridge_prusa import PrusaPrinter
+from moonraker.muon_bridge_mqtt import MqttClient
 from moonraker.utils import redact
 from moonraker.utils.exceptions import ServerError
 
@@ -715,3 +717,101 @@ def test_never_mistaken_for_this_printers_klipper() -> None:
     described = session.describe()
     assert described["bridged"] is True and described["kind"] == "bambu"
     assert not {"klippy", "printer", "objects"} & set(described)
+
+
+def test_refused_caller_does_not_leave_credentials_in_request() -> None:
+    component = bridge()
+    args = bambu_args()
+    credentials = args["credentials"]
+    ip, user = gateway("member")
+    request = WebRequest("/server/muon_bridge/open_session", args,
+                         RequestType.POST, Connection(ip, user), ip, user)
+    with pytest.raises(ServerError):
+        asyncio.run(component.open_session(request))
+    assert "credentials" not in args
+    assert credentials == {}
+
+
+def test_disconnect_while_opening_cannot_revive_session(monkeypatch: Any
+                                                      ) -> None:
+    async def run() -> None:
+        state = PrusaState(qop=True)
+        server, port = start_prusa(state)
+        component = bridge()
+        component.dialer = lambda host, p: ("127.0.0.1", port)
+        ready, release = asyncio.Event(), asyncio.Event()
+        original = PrusaPrinter.open
+
+        async def delayed_open(printer: PrusaPrinter) -> None:
+            await original(printer)
+            ready.set()
+            await release.wait()
+
+        monkeypatch.setattr(PrusaPrinter, "open", delayed_open)
+        conn = Connection(*OWNER)
+        opening = asyncio.create_task(call(component, "open_session",
+                                           prusa_args(), conn))
+        try:
+            await asyncio.wait_for(ready.wait(), 2)
+            session = next(iter(component.sessions.values()))
+            component._client_removed(conn)
+            await settle(lambda: session.closing)
+            release.set()
+            with pytest.raises(ServerError) as info:
+                await opening
+            assert info.value.status_code == 410
+            assert not session.connected and session.poller is None
+            assert not _holds(session, PRUSA_PASSWORD)
+            assert component.sessions == {}
+        finally:
+            release.set()
+            await asyncio.gather(opening, return_exceptions=True)
+            await component.close()
+            server.stop()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("answer_pings", [False, True])
+def test_mqtt_keepalive_drops_only_unresponsive_printer(
+        authorities: Dict[str, Authority], answer_pings: bool,
+        monkeypatch: Any) -> None:
+    original = MqttClient.__init__
+
+    def fast_init(self: MqttClient, *args: Any, **kwargs: Any) -> None:
+        original(self, *args, **kwargs, keepalive=1)
+
+    monkeypatch.setattr(MqttClient, "__init__", fast_init)
+    async def run() -> None:
+        async with Bambu(authorities["bambu"]) as printer:
+            printer.broker.answer_pings = answer_pings
+            opened = await call(printer.bridge, "open_session", bambu_args())
+            session = printer.bridge.sessions[opened["session_id"]]
+            assert session.printer is not None
+            if answer_pings:
+                await asyncio.sleep(3)
+                assert session.connected
+            else:
+                await settle(lambda: not printer.bridge.sessions, 2.5)
+                assert not _holds(session, ACCESS_CODE)
+    asyncio.run(run())
+
+
+def test_prusalink_upload_and_start_filename_with_spaces() -> None:
+    async def run() -> None:
+        state = PrusaState(qop=True)
+        server, port = start_prusa(state)
+        component = bridge()
+        component.dialer = lambda host, p: ("127.0.0.1", port)
+        try:
+            opened = await call(component, "open_session", prusa_args())
+            args = {"session_id": opened["session_id"],
+                    "filename": "Benchy (v2).gcode"}
+            await call(component, "upload", {
+                **args, "data": base64.b64encode(b"G28\n").decode()})
+            await call(component, "start", args)
+            assert state.files == {"files/usb/Benchy (v2).gcode": b"G28\n"}
+            assert state.actions == ["POST files/usb/Benchy (v2).gcode"]
+        finally:
+            await component.close()
+            server.stop()
+    asyncio.run(run())

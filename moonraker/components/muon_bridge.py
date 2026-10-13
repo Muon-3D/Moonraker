@@ -84,6 +84,7 @@ class Session:
         self.pending: Dict[str, Any] = {}
         self.flush: Optional[asyncio.TimerHandle] = None
         self.poller: Optional[asyncio.Task] = None
+        self.opening: Optional[asyncio.Task] = None
         self.closing = False
 
     def describe(self) -> Dict[str, Any]:
@@ -206,13 +207,13 @@ class MuonBridge:
 
     @_api
     async def open_session(self, web_request: WebRequest) -> Dict[str, Any]:
-        principal = self.gate(web_request)
         args = web_request.get_args()
         # Out of the request's arguments first, whatever happens next.
         handed = args.pop("credentials", None)
         creds: Dict[str, Any] = handed if isinstance(handed, dict) else {}
         held: List[Secret] = []
         try:
+            principal = self.gate(web_request)
             connection = web_request.get_client_connection()
             if connection is None:
                 raise BridgeError(
@@ -259,14 +260,23 @@ class MuonBridge:
             session.printer = printer
             self.sessions[session.id] = session
             try:
-                await asyncio.wait_for(printer.open(), self.connect_timeout)
+                session.opening = asyncio.create_task(printer.open())
+                await asyncio.wait_for(session.opening, self.connect_timeout)
+                if session.closing or connection.is_closed:
+                    raise BridgeError("the browser disconnected while opening",
+                                      410)
             except BaseException as exc:
                 self.sessions.pop(session.id, None)
                 await printer.close()
+                if session.closing:
+                    raise BridgeError("the browser disconnected while opening",
+                                      410) from None
                 if isinstance(exc, asyncio.TimeoutError):
                     raise BridgeError(f"{ip} did not answer in time", 504) \
                         from None
                 raise
+            finally:
+                session.opening = None
         except BaseException:
             for secret in held:
                 secret.wipe()
@@ -297,6 +307,9 @@ class MuonBridge:
         session.closing = True
         session.connected = False
         self.sessions.pop(session.id, None)
+        if session.opening is not None and not session.opening.done():
+            session.opening.cancel()
+            await asyncio.gather(session.opening, return_exceptions=True)
         if session.flush is not None:
             session.flush.cancel()
         if session.poller is not None and \

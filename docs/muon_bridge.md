@@ -86,6 +86,11 @@ cases:
 - a session fails to open;
 - Moonraker shuts down.
 
+A browser disconnect during connection setup cancels that setup. It cannot
+leave a connected session or status poller behind. MQTT sends a keepalive
+ping every 30 seconds and closes the session if no PINGRESP arrives within
+the next 30 seconds.
+
 `credentials` and `access_code` are among `utils/redact.py`'s sensitive
 fields, so Moonraker's request logging never writes them. The Digest code
 does not cache HA1, because HA1 works as well as the password. It is computed
@@ -136,6 +141,10 @@ Status notifications look like this:
 `status` carries only what has changed. Changes are gathered for 0.5 s before
 a notification is sent. When a session ends, the last notification has
 `"connected": false` and a `reason`.
+
+PrusaLink upload and start paths encode the filename as a URL segment.
+Filenames with spaces and parentheses therefore use the same encoded path
+in both the HTTP request and its Digest authentication.
 
 ## Bambu Lab: TLS
 

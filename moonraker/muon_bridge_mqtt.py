@@ -96,6 +96,7 @@ class MqttClient:
         self._ids = 0
         self._tasks: list = []
         self._closing = False
+        self._pong = asyncio.Event()
 
     def _next_id(self) -> int:
         self._ids = self._ids % 0xFFFF + 1
@@ -188,6 +189,8 @@ class MqttClient:
                 kind, flags, body = await read_packet(self.reader)
                 if kind == PUBLISH:
                     self._handle_publish(flags, body)
+                elif kind == PINGRESP:
+                    self._pong.set()
         except asyncio.CancelledError:
             return
         except BridgeError as exc:
@@ -202,9 +205,14 @@ class MqttClient:
         try:
             while self.writer is not None and not self.writer.is_closing():
                 await asyncio.sleep(self.keepalive)
+                self._pong.clear()
                 self.writer.write(packet(PINGREQ, 0, b""))
-        except (asyncio.CancelledError, OSError):
+                await asyncio.wait_for(self._pong.wait(), self.keepalive)
+        except asyncio.CancelledError:
             return
+        except (asyncio.TimeoutError, OSError):
+            if not self._closing:
+                await self.on_close("the printer did not answer MQTT keepalive")
 
     async def _abort(self) -> None:
         if self.writer is not None:

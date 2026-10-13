@@ -15,6 +15,7 @@ import json
 import os
 import re
 from typing import Any, Dict, Optional, Tuple
+from urllib.parse import quote
 
 from tornado.httpclient import AsyncHTTPClient, HTTPRequest
 
@@ -278,12 +279,12 @@ class PrusaPrinter:
 
     async def start(self, filename: Any, options: Dict[str, Any]) -> None:
         check_filename(filename, UPLOAD_EXTENSIONS)
-        await self._json("POST", f"/api/v1/files/{self.storage}/{filename}")
+        await self._json("POST", f"/api/v1/files/{self.storage}/{quote(filename)}")
 
     async def upload(self, filename: Any, data: bytes) -> None:
         check_filename(filename, UPLOAD_EXTENSIONS)
         code, _, _ = await self.request(
-            "PUT", f"/api/v1/files/{self.storage}/{filename}", data,
+            "PUT", f"/api/v1/files/{self.storage}/{quote(filename)}", data,
             {"Content-Type": "application/octet-stream",
              "Overwrite": "?1", "Print-After-Upload": "?0"},
             timeout=600.0)

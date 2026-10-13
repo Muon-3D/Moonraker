@@ -93,6 +93,7 @@ class FakeBroker:
         self.server: Optional[asyncio.AbstractServer] = None
         self.port = 0
         self.got_request = asyncio.Event()
+        self.answer_pings = True
 
     async def start(self) -> None:
         self.server = await asyncio.start_server(
@@ -155,7 +156,8 @@ class FakeBroker:
                                      "nozzle_temper": 24.5,
                                      "command": "push_status"})
                 elif kind == PINGREQ:
-                    writer.write(packet(PINGRESP, 0, b""))
+                    if self.answer_pings:
+                        writer.write(packet(PINGRESP, 0, b""))
                 elif kind == DISCONNECT:
                     self.disconnects += 1
                     return
