@@ -540,6 +540,19 @@ async def _forget_profile(setup: MuonSetup, ssid: str) -> bool:
             or str(cause) == f"No saved connection profile named '{ssid}'"
         ):
             return True  # The owned profile is already gone.
+        # Legacy images may have no forget route. A named missing-profile
+        # response from their existing show route proves there is nothing to remove.
+        try:
+            await setup.aux("GET", "/wifi/show?" + urlencode({"ssid": ssid}))
+        except AuxMissing as lookup:
+            proof = lookup.__cause__
+            if isinstance(proof, ServerError) and proof.status_code == 404 and (
+                str(proof) == missing or str(proof).startswith(missing + ": ")
+                or str(proof) == f"No saved connection profile named '{ssid}'"
+            ):
+                return True
+        except (AuxRefused, AuxUnavailable):
+            pass
         logging.info("muon_setup: no Aux DELETE /wifi/forget; keeping cleanup pending")
         return False
     except (AuxRefused, AuxUnavailable) as exc:
