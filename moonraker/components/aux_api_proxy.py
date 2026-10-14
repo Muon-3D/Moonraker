@@ -220,6 +220,12 @@ _REDEEM_FIELDS = {
 # restarts Klipper, which Aux waits up to 60 s for.
 DEV_MODE_OPEN_TIMEOUT = 8.
 DEV_MODE_REDEEM_TIMEOUT = 120.
+# muon-link's LinkPhase, as Aux's dev_mode_owner reads it: `linked` names the
+# owner, every other known phase is a printer nobody owns, and a phase this
+# code does not know is no answer.
+LINKED_PHASE = "linked"
+UNOWNED_PHASES = frozenset(
+    ("unavailable", "unlinked", "connecting", "code", "offer", "failed"))
 
 
 def owner_headers(ip_addr: Any, user: Any) -> Dict[str, str]:
@@ -734,6 +740,10 @@ class AuxAutoProxy:
     async def _dev_mode_request_handler(self, webreq):
         """Ask for a developer-mode change, poll it, or complete it.
 
+        GET
+            Who may ask, for a client deciding whether to offer the switch:
+            {"as_owner", "owner": {"linked", "account"}, "may_ask",
+            "waiver"}. Advisory; Aux decides when asked.
         POST {"enabled": bool}
             Opens a challenge for that direction (Aux POST /dev_mode/consent).
             The printer's panel asks the person there. For turning on, the
@@ -758,7 +768,7 @@ class AuxAutoProxy:
         if webreq.get_action() == "GET":
             challenge_id = self._challenge_id_arg(args.get("challenge_id"))
             if challenge_id is None:
-                raise self.server.error("'challenge_id' is required", 400)
+                return await self._dev_mode_request_probe(owner)
             state = await self._dev_mode_call(
                 "GET", f"/dev_mode/consent/{challenge_id}", None, {},
                 DEV_MODE_OPEN_TIMEOUT)
@@ -796,6 +806,54 @@ class AuxAutoProxy:
         if isinstance(status.get("reentry_token"), str):
             answer["reentry_token"] = status["reentry_token"]
         return answer
+
+    async def _dev_mode_request_probe(
+        self, owner: Dict[str, str]
+    ) -> Dict[str, Any]:
+        """What a client needs to decide whether to offer the switch.
+
+        `owner` is the link as muon-link reports it: linked or not, and the
+        account, never the link code (APP-38). Aux reads the same answer when
+        it decides, and names the account in owner_required anyway, so this
+        says nothing a request would not. `may_ask` follows #378's rule: the
+        owner, or anyone while nobody owns the printer; an unknown link is
+        the owner's alone. `waiver` is what turning on will ask to
+        acknowledge, or null if Aux could not say.
+        """
+        link = await self._link_owner()
+        try:
+            found = await self._dev_mode_call(
+                "GET", "/dev_mode/waiver", None, {}, DEV_MODE_OPEN_TIMEOUT)
+            waiver: Optional[Dict[str, Any]] = {
+                "version": found.get("version"), "text": found.get("text")}
+        except ServerError:
+            waiver = None
+        return {
+            "as_owner": bool(owner),
+            "owner": link,
+            "may_ask": bool(owner) or link["linked"] is False,
+            "waiver": waiver,
+        }
+
+    async def _link_owner(self) -> Dict[str, Any]:
+        """{"linked": True | False | None, "account": str | None}."""
+        unknown: Dict[str, Any] = {"linked": None, "account": None}
+        link = self.server.lookup_component("muon_link", None)
+        if link is None:
+            return unknown
+        try:
+            status = await link.status()
+        except Exception:
+            return unknown
+        phase = status.get("phase") if isinstance(status, dict) else None
+        if phase == LINKED_PHASE:
+            account = status.get("account")
+            return {"linked": True,
+                    "account": account if isinstance(account, str)
+                    and account else None}
+        if phase in UNOWNED_PHASES:
+            return {"linked": False, "account": None}
+        return unknown
 
     def _challenge_id_arg(self, value: Any) -> Optional[str]:
         if value is None:

@@ -192,12 +192,30 @@ class FakeAux:
         return Response(404, {"detail": "Not Found"})
 
 
+class FakeLink:
+    """Moonraker's muon_link: muon-link's GET /link, as status()."""
+
+    def __init__(self, answer: Any) -> None:
+        self.answer = answer
+
+    async def status(self) -> Any:
+        if isinstance(self.answer, Exception):
+            raise self.answer
+        return self.answer
+
+
+LINKED = {"phase": "linked", "account": OWNER_ACCOUNT, "connected": True}
+UNLINKED = {"phase": "unlinked"}
+
+
 class FakeServer:
-    def __init__(self, http_client: Any) -> None:
+    def __init__(self, http_client: Any, link: Any = None) -> None:
         self.endpoints: Dict[str, Tuple[List[str], Any]] = {}
         self.components: Dict[str, Any] = {
             "http_client": http_client, "database": FakeDatabase(),
         }
+        if link is not None:
+            self.components["muon_link"] = link
 
     def lookup_component(self, name: str, default: Any = None) -> Any:
         return self.components.get(name, default)
@@ -231,9 +249,11 @@ def _token(monkeypatch, tmp_path):
     monkeypatch.setattr(aux_api_proxy, "AUX_TOKEN_FILE", token)
 
 
-def make(aux: Optional[FakeAux] = None) -> Tuple[AuxAutoProxy, FakeAux, Any]:
+def make(
+    aux: Optional[FakeAux] = None, link: Any = None,
+) -> Tuple[AuxAutoProxy, FakeAux, Any]:
     aux = aux or FakeAux()
-    server = FakeServer(aux)
+    server = FakeServer(aux, link)
     proxy = AuxAutoProxy(FakeConfig(server))
     verbs, handler = server.endpoints[ENDPOINT]
     assert sorted(verbs) == ["GET", "POST"]
@@ -511,13 +531,76 @@ def test_a_malformed_request_is_refused_before_aux_is_asked(args, message):
     assert aux.calls == []
 
 
-def test_a_poll_needs_a_challenge_id():
-    _proxy, aux, handler = make()
+# --------------------------------------------------------------------------
+# Who may ask: what a client reads before it offers the switch
+# --------------------------------------------------------------------------
 
-    error = refused(handler, request("GET", {}))
+def test_the_owner_is_told_it_may_ask_and_what_turning_on_agrees_to():
+    _proxy, aux, handler = make(FakeAux(linked=True), FakeLink(LINKED))
 
-    assert error.status_code == 400
-    assert aux.calls == []
+    answer = call(handler, request("GET", {}))
+
+    assert answer == {
+        "as_owner": True,
+        "owner": {"linked": True, "account": OWNER_ACCOUNT},
+        "may_ask": True,
+        "waiver": WAIVER,
+    }
+    # Reading it asks nothing of the panel.
+    assert aux.paths() == [("GET", "/dev_mode/waiver")]
+
+
+@pytest.mark.parametrize("ip, user", [
+    (SENTINEL, CONSOLE_OPERATOR), (SENTINEL, NO_PRINCIPAL), (SENTINEL, MEMBER),
+    (LAN, TRUSTED_USER), (LOOPBACK, None),
+])
+def test_on_a_linked_printer_nobody_else_may_ask(ip, user):
+    _proxy, _aux, handler = make(FakeAux(linked=True), FakeLink(LINKED))
+
+    answer = call(handler, request("GET", {}, ip, user))
+
+    assert answer["as_owner"] is False
+    assert answer["may_ask"] is False
+    assert answer["owner"] == {"linked": True, "account": OWNER_ACCOUNT}
+
+
+def test_on_a_printer_nobody_owns_anyone_may_ask_and_no_code_is_shown():
+    """The `code` phase carries the link code, which only the panel shows
+    (APP-38): a printer waiting to be linked is not owned yet."""
+    code = {"phase": "code", "code": "493-117", "expires_at": 9,
+            "url": "https://muon3d.com/link?c=493-117"}
+    _proxy, _aux, handler = make(FakeAux(linked=False), FakeLink(code))
+
+    answer = call(handler, request("GET", {}, LAN, TRUSTED_USER))
+
+    assert answer["may_ask"] is True
+    assert answer["owner"] == {"linked": False, "account": None}
+    assert "493-117" not in json.dumps(answer)
+
+
+@pytest.mark.parametrize("link", [
+    None, FakeLink(RuntimeError("muon-link down")),
+    FakeLink({"phase": "a_phase_from_later"}), FakeLink("not an object"),
+])
+def test_a_link_nobody_can_read_is_the_owners_alone(link):
+    for user, may in ((CONSOLE_OPERATOR, False), (OWNER_AWAY, True)):
+        _proxy, _aux, handler = make(FakeAux(linked=True), link)
+
+        answer = call(handler, request("GET", {}, SENTINEL, user))
+
+        assert answer["owner"] == {"linked": None, "account": None}
+        assert answer["may_ask"] is may
+
+
+def test_the_answer_stands_without_the_waiver():
+    aux = FakeAux()
+    aux.answer = Response(500)
+    _proxy, _aux, handler = make(aux, FakeLink(LINKED))
+
+    answer = call(handler, request("GET", {}))
+
+    assert answer["waiver"] is None
+    assert answer["may_ask"] is True
 
 
 def test_a_real_aux_500_keeps_its_status_and_its_words():
