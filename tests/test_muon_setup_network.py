@@ -1485,7 +1485,7 @@ class TestAlreadyRemovedCleanup:
     ])
     def test_only_a_named_absent_profile_clears_pending_cleanup(self, message, gone):
         async def go():
-            aux = wifi_aux(JoinScript())
+            aux = wifi_aux(JoinScript(saved=[] if gone else [SSID]))
             aux.routes[("DELETE", "/wifi/forget")] = ServerError(message, 404)
             h = await Harness(stored=join_state(), aux=aux, namespaces={
                 "muon_setup": {"internal": {"join_cleanup_ssid": SSID}}}).start()
@@ -1621,6 +1621,7 @@ class TestReviewAttemptBoundaries:
         async def go():
             aux = wifi_aux(JoinScript())
             aux.routes[("GET", "/region")] = ServerError("Not Found", 404)
+            aux.routes[("GET", "/region/options")] = ServerError("Not Found", 404)
             h = await Harness(stored=join_state(), aux=aux).start()
             assert network._region_market(h.setup) == "none"
             aux.routes[("GET", "/region")] = ServerError("temporary error", status)
@@ -1630,6 +1631,7 @@ class TestReviewAttemptBoundaries:
             await joined(h)
             assert h.doc["steps"]["network"]["status"] == "done"
             aux.routes[("GET", "/region")] = REGION_174
+            aux.routes[("GET", "/region/options")] = REGION_OPTIONS_174
             await h.setup._refresh_region()
             assert network._region_market(h.setup) == "picker"
         run(go())
@@ -1641,6 +1643,7 @@ class TestReviewAttemptBoundaries:
             script = JoinScript()
             aux = wifi_aux(script)
             aux.routes[("GET", "/region")] = ServerError("Not Found", 404)
+            aux.routes[("GET", "/region/options")] = ServerError("Not Found", 404)
             reads = []
             gate = asyncio.Event()
 
@@ -1735,4 +1738,92 @@ class TestUnusedCleanupReservation:
             assert h.doc["op"] is None
             assert script.forgets == [] and script.disconnects == []
             assert not h.setup._internal.get("join_cleanup_ssid")
+        run(go())
+
+
+class TestPartialCapabilities:
+    @pytest.mark.parametrize("lookup", [
+        "absent", "absent_plain", "absent_named", "present", "unknown",
+        "other_profile", "unavailable", "refused", "method_missing", "malformed",
+    ])
+    def test_legacy_forget_absence_uses_only_a_confirmed_profile_lookup(self, lookup):
+        async def go():
+            script = JoinScript(saved=[SSID])
+            aux = wifi_aux(script)
+            aux.routes[("GET", "/wifi/current")] = lambda _body: None
+            aux.routes[("DELETE", "/wifi/forget")] = ServerError("Not Found", 404)
+            if lookup == "absent":
+                aux.routes[("GET", "/wifi/show")] = ServerError(
+                    f"Connection profile '{SSID}' not found: unknown connection", 404)
+            elif lookup == "absent_plain":
+                aux.routes[("GET", "/wifi/show")] = ServerError(
+                    f"Connection profile '{SSID}' not found", 404)
+            elif lookup == "absent_named":
+                aux.routes[("GET", "/wifi/show")] = ServerError(
+                    f"No saved connection profile named '{SSID}'", 404)
+            elif lookup in ("unknown", "other_profile", "unavailable", "refused",
+                            "method_missing"):
+                message, status = {
+                    "unknown": ("Not Found", 404),
+                    "other_profile": ("Connection profile 'OtherWiFi' not found", 404),
+                    "unavailable": ("Aux is unavailable", 503),
+                    "refused": ("Forbidden", 403),
+                    "method_missing": (f"Connection profile '{SSID}' not found", 405),
+                }[lookup]
+                aux.routes[("GET", "/wifi/show")] = ServerError(message, status)
+            elif lookup == "malformed":
+                aux.routes[("GET", "/wifi/show")] = []
+            doc = join_state()
+            doc["op"] = {"id": "op_ambiguous", "kind": "join", "phase": "saving",
+                         "ssid": SSID, "forget": True, "connect_started": True}
+            h = await Harness(stored=doc, aux=aux, namespaces={
+                "muon_setup": {"internal": {"join_cleanup_ssid": SSID}}}).start()
+            await joined(h)
+            gone = lookup in ("absent", "absent_plain", "absent_named")
+            internal = h.db.namespaces["muon_setup"]["internal"]
+            assert bool(internal.get("join_cleanup_ssid")) is (not gone)
+            assert not script.connects and not script.disconnects
+            out = await h.post("/network", join_body(rev=h.doc["rev"]))
+            if gone:
+                assert out["ok"] and out["state"]["op"]["kind"] == "join"
+            else:
+                assert out["error"]["code"] == "busy"
+            await h.setup.close()
+        run(go())
+
+    @pytest.mark.parametrize("present", ["state", "options"])
+    @pytest.mark.parametrize("answer", ["valid", "malformed"])
+    def test_a_returning_endpoint_revokes_confirmed_region_absence(self, present, answer):
+        async def go():
+            aux = wifi_aux(JoinScript())
+            aux.routes[("GET", "/region")] = ServerError("Not Found", 404)
+            aux.routes[("GET", "/region/options")] = ServerError("Not Found", 404)
+            h = await Harness(stored=join_state(), aux=aux).start()
+            assert network._region_market(h.setup) == "none"
+            path = "/region" if present == "state" else "/region/options"
+            value = REGION_174 if present == "state" else REGION_OPTIONS_174
+            aux.routes[("GET", path)] = value if answer == "valid" else []
+            await h.setup._refresh_region()
+            assert network._region_market(h.setup) == "unknown"
+            await h.post("/network", join_body(rev=h.doc["rev"]))
+            await joined(h)
+            step = h.doc["steps"]["network"]
+            assert step["region_confirmed"] is False
+            assert step["status"] == "pending"
+        run(go())
+
+    @pytest.mark.parametrize("missing", ["state", "options", "both"])
+    def test_one_region_endpoint_does_not_prove_the_capability_absent(self, missing):
+        async def go():
+            aux = wifi_aux(JoinScript())
+            if missing in ("state", "both"):
+                aux.routes[("GET", "/region")] = ServerError("Not Found", 404)
+            if missing in ("options", "both"):
+                aux.routes[("GET", "/region/options")] = ServerError("Not Found", 404)
+            h = await Harness(stored=join_state(), aux=aux).start()
+            await h.post("/network", join_body(rev=h.doc["rev"]))
+            await joined(h)
+            step = h.doc["steps"]["network"]
+            assert step["region_confirmed"] is (missing == "both")
+            assert step["status"] == ("done" if missing == "both" else "pending")
         run(go())

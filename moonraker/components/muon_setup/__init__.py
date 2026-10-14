@@ -212,6 +212,8 @@ class MuonSetup:
         self._reset_lock = asyncio.Lock()
         self._internal_lock = asyncio.Lock()
         self._region_missing = False
+        self._region_state_missing = False
+        self._region_options_missing = False
         #: `marker_written` / `marker_by`: the marker's POST reached Aux, and
         #: with which `by`. `marker_clear_pending`: a reset's DELETE has not
         #: yet. `tz_source`: who set the time zone (02 §6 `clock`).
@@ -1332,20 +1334,36 @@ class MuonSetup:
         self._live["hotspot"]["ssid"] = identity.get("ssid")
 
     async def _refresh_region(self) -> None:
+        state: Any = None
+        options: Any = None
         try:
             state = await self.aux("GET", "/region")
+        except AuxMissing:
+            self._region_state_missing = True
+        except (AuxUnavailable, AuxRefused):
+            pass  # Preserve prior evidence until this endpoint answers.
+        else:
+            # Even a malformed successful reply proves the route exists.
+            self._region_state_missing = False
+        try:
             options = await self.aux("GET", "/region/options")
         except AuxMissing:
-            self._live["region"] = None
-            self._region_missing = True
-            return
+            self._region_options_missing = True
         except (AuxUnavailable, AuxRefused):
-            # A transient failure does not disprove confirmed route absence.
-            return
-        if isinstance(state, dict) and isinstance(options, dict):
-            self._region_missing = False
-            # Aux GET /region verbatim, plus the derived market (02 §6).
+            pass
+        else:
+            self._region_options_missing = False
+        self._region_missing = (
+            self._region_state_missing and self._region_options_missing)
+        if self._region_missing:
+            self._live["region"] = None
+        elif isinstance(state, dict) and isinstance(options, dict):
             self._live["region"] = region.state_region(state, options)
+        elif isinstance(state, dict):
+            # A partial capability must not imply an unrestricted market.
+            self._live["region"] = dict(state, market="unknown")
+        elif self._region_state_missing or self._region_options_missing:
+            self._live["region"] = None
 
     def _refresh_capabilities(self) -> None:
         caps = self._live["capabilities"]
