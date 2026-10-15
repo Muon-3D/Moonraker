@@ -111,6 +111,97 @@ class TestModes:
             assert out["ok"] is True
             assert h.doc["steps"]["remote"]["error"]["code"] == (
                 "link_unavailable")
+            assert h.stored()["steps"]["remote"]["mode"] == "cloud"
+            assert h.stored()["steps"]["remote"]["status"] == "pending"
+        run(go())
+
+    @pytest.mark.parametrize("mode,status", [("local", "done"), ("later", "skipped")])
+    def test_completion_card_cloud_without_component_records_pending(self, mode, status):
+        async def go():
+            doc = cloud_state()
+            doc.update(state="complete", cursor="finish")
+            doc["steps"]["remote"].update(mode=mode, status=status)
+            h = await Harness(stored=doc).start()
+            h.setup._live["clock"]["synced"] = True
+            out = await h.post("/remote", body(mode="cloud", rev=h.doc["rev"]))
+            assert out["ok"] is True
+            step = h.stored()["steps"]["remote"]
+            assert step["mode"] == "cloud" and step["status"] == "pending"
+            assert step["error"]["code"] == "link_unavailable"
+            assert h.doc["state"] == "complete" and h.doc["cursor"] == "finish"
+            assert h.setup._remote_poll_task is None
+        run(go())
+
+    @pytest.mark.parametrize("mode,status", [("local", "done"), ("later", "skipped")])
+    @pytest.mark.parametrize("phase", ["code", "offer"])
+    @pytest.mark.parametrize("complete", [False, True])
+    def test_leaving_cloud_cancels_the_daemon_ceremony(self, mode, status, phase, complete):
+        async def go():
+            doc = cloud_state()
+            if complete:
+                doc.update(state="complete", cursor="finish")
+            ceremony = {"phase": phase, "code": "123456", "expires_at": 9999999999}
+            link = FakeMuonLink([ceremony])
+            h = await remote_harness(link, stored=doc)
+            await h.post("/remote", body(mode="cloud", rev=h.doc["rev"]))
+            await settle(h)
+            assert h.doc["steps"]["remote"]["link"]["phase"] == phase
+            out = await h.post("/remote", body(mode=mode, rev=h.doc["rev"]))
+            assert out["ok"] is True
+            assert (await link.status())["phase"] == "unlinked"
+            step = h.stored()["steps"]["remote"]
+            assert step["mode"] == mode and step["status"] == status
+            assert step["link"] is None
+            assert h.setup._remote_poll_task is None
+        run(go())
+
+    @pytest.mark.parametrize("mode", ["local", "later"])
+    def test_mode_change_waits_for_daemon_cancellation(self, mode):
+        async def go():
+            entered, release = asyncio.Event(), asyncio.Event()
+            link = FakeMuonLink()
+            h = await remote_harness(link)
+            await h.post("/remote", body(mode="cloud", rev=h.doc["rev"]))
+            cancel = link.cancel
+
+            async def blocked_cancel():
+                entered.set()
+                await release.wait()
+                return await cancel()
+
+            link.cancel = blocked_cancel
+            changing = asyncio.create_task(h.post(
+                "/remote", body(mode=mode, rev=h.doc["rev"])))
+            try:
+                await asyncio.wait_for(asyncio.shield(changing), 0.1)
+            except asyncio.TimeoutError:
+                pass
+            try:
+                assert entered.is_set()
+                assert not changing.done()
+                assert h.stored()["steps"]["remote"]["mode"] == "cloud"
+            finally:
+                release.set()
+                await changing
+            assert h.stored()["steps"]["remote"]["mode"] == mode
+        run(go())
+
+    @pytest.mark.parametrize("mode", ["local", "later"])
+    def test_failed_daemon_cancellation_does_not_commit_new_mode(self, mode):
+        async def go():
+            link = FakeMuonLink()
+            h = await remote_harness(link)
+            await h.post("/remote", body(mode="cloud", rev=h.doc["rev"]))
+            before = h.stored()
+
+            async def failed_cancel():
+                raise OSError("daemon unavailable")
+
+            link.cancel = failed_cancel
+            out = await h.post("/remote", body(mode=mode, rev=h.doc["rev"]))
+            assert out["ok"] is False
+            assert out["error"]["code"] == "link_unavailable"
+            assert h.stored() == before
         run(go())
 
 

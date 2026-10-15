@@ -122,15 +122,19 @@ async def handle_remote(
             return model.error("invalid_step", "the remote step is not open")
         step = doc["steps"]["remote"]
         mode = ctx.args.get("mode")
-        if mode == "local":
+        if mode in ("local", "later"):
             _next_attempt(setup)
-            step.update(mode="local", status="done", error=None)
-            if doc["state"] != "complete":
-                setup.advance()
-            return None
-        if mode == "later":
-            _next_attempt(setup)
-            step.update(mode="later", status="skipped", error=None)
+            if step.get("mode") == "cloud" and step["status"] != "done":
+                link = _link(setup)
+                if link is not None:
+                    try:
+                        await link.cancel()
+                    except Exception:
+                        return model.error(
+                            "link_unavailable", "muon-link could not cancel")
+                step["link"] = None
+            step.update(mode=mode, error=None,
+                        status="done" if mode == "local" else "skipped")
             if doc["state"] != "complete":
                 setup.advance()
             return None
@@ -146,13 +150,13 @@ async def handle_remote(
         if setup._live["clock"].get("synced") is not True:
             return model.error(
                 "clock_unsynced", "cloud linking needs a synced clock")
+        _next_attempt(setup)
+        step.update(mode="cloud", status="pending", link=None, error=None)
         link = _link(setup)
         if link is None:
             step["error"] = model.error(
                 "link_unavailable", "muon-link is not configured")
             return None
-        _next_attempt(setup)
-        step.update(mode="cloud", status="pending", error=None)
         try:
             status = await link.start()
         except Exception:
