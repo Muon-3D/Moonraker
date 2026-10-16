@@ -7,6 +7,9 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
       - uses: weibullguy/python-lint-plus@v1.12.0
         with:
           python-root-list: "moonraker scripts"
@@ -18,3 +21,19 @@ jobs:
           mypy-version: "==1.5.1"
           extra-flake8-options: "--ignore=E226,E301,E302,E303,W503,W504 --max-line-length=88 --max-doc-length=88"
           extra-mypy-options: "--ignore-missing-imports --follow-imports=silent"
+      - name: Install pytest dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libsodium-dev
+          python -m pip install \
+            -r scripts/moonraker-requirements.txt \
+            -r scripts/moonraker-test-requirements.txt
+      - name: Run pytest
+        run: |
+          # KAN-570: these four legacy suites still need the old
+          # event-loop harness. Keep every exclusion explicit until it is ported.
+          python -m pytest -ra \
+            --deselect tests/test_config.py \
+            --deselect tests/test_database.py \
+            --deselect tests/test_klippy_connection.py \
+            --deselect tests/test_server.py
