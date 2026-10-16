@@ -20,18 +20,20 @@ from moonraker.components import application
 from moonraker.utils import redact
 
 NAME = "Ada Lovelace"
+PSK = "setup-psk-98765"
 SECRETS = {
     "signer_name": NAME,
     "password": "correct horse",
     "key": "hotspot-key-123",
     "reentry_token": "tok-456",
+    "psk": PSK,
 }
 
 
 class TestTheHelper:
     def test_the_fields(self):
         assert redact.SENSITIVE_FIELDS == {
-            "signer_name", "password", "key", "reentry_token"}
+            "signer_name", "password", "key", "psk", "reentry_token"}
 
     def test_every_field_at_any_depth_and_case(self):
         value = {

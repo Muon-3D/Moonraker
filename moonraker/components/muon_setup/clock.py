@@ -239,16 +239,17 @@ async def handle_clock(setup: MuonSetup, webreq: WebRequest) -> Dict[str, Any]:
     zone_error: Optional[Dict[str, Any]] = None
     if tz is not None:
         if valid_zone(tz):
-            try:
-                await _set_zone(setup, tz)
-            except AuxRefused as exc:
-                zone_error = model.error("invalid_timezone", str(exc))
-            except (AuxMissing, AuxUnavailable) as exc:
-                logging.warning("muon_setup: zone %s not set: %s", tz, exc)
-            else:
-                setup._internal["tz_source"] = "phone"
-                await setup._persist_internal()
-                changed = True
+            async with setup._lock:
+                try:
+                    await _set_zone(setup, tz)
+                except AuxRefused as exc:
+                    zone_error = model.error("invalid_timezone", str(exc))
+                except (AuxMissing, AuxUnavailable) as exc:
+                    logging.warning("muon_setup: zone %s not set: %s", tz, exc)
+                else:
+                    setup._internal["tz_source"] = "phone"
+                    await setup._persist_internal()
+                    changed = True
         else:
             logging.info("muon_setup: ignored an unknown zone from the phone")
     if changed:

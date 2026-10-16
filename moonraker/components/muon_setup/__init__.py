@@ -36,7 +36,9 @@ from typing import (
 )
 from urllib.parse import urlencode
 
-from . import caller, clock, language, manifest, model, name, ready, region, update
+from . import (
+    caller, clock, language, manifest, model, name, network, ready, region,
+    update)
 from .model import DONE, FINISH, HIDDEN, PENDING, SKIPPED
 from ...utils.exceptions import ServerError
 
@@ -207,6 +209,11 @@ class MuonSetup:
         self.read_only_version: Optional[Any] = None
         self._resolved = asyncio.Event()
         self._lock = asyncio.Lock()
+        self._reset_lock = asyncio.Lock()
+        self._internal_lock = asyncio.Lock()
+        self._region_missing = False
+        self._region_state_missing = False
+        self._region_options_missing = False
         #: `marker_written` / `marker_by`: the marker's POST reached Aux, and
         #: with which `by`. `marker_clear_pending`: a reset's DELETE has not
         #: yet. `tz_source`: who set the time zone (02 §6 `clock`).
@@ -234,6 +241,11 @@ class MuonSetup:
         self._tasks: Set[asyncio.Task] = set()
         self._lapse_timer: Optional[asyncio.TimerHandle] = None
         self._poll_task: Optional[asyncio.Task] = None
+        #: network.py's in-flight Aux /wifi/connect, and the cleanup that
+        #: waits it out before forgetting a partial profile.
+        self._join_connect: Optional[asyncio.Task] = None
+        self._join_requested: Optional[asyncio.Event] = None
+        self._join_cleanup: Optional[asyncio.Task] = None
         self._stations_route = True
         self._clock_from_phone = False
         self._closed = False
@@ -261,7 +273,7 @@ class MuonSetup:
         reg("/server/muon/setup/network/cancel", ["POST"],
             self._handle_network_cancel)
         # The steps' own endpoints, one module each.
-        for step_module in (language, clock, name, update, ready):
+        for step_module in (language, clock, name, update, ready, network):
             step_module.register(self)
 
     # ------------------------------------------------------------------
@@ -280,7 +292,9 @@ class MuonSetup:
         if isinstance(internal, dict):
             self._internal.update(internal)
         if isinstance(stored, dict):
+            await network.prepare_boot_cleanup(self, stored)
             self._load(stored)
+            network.resume_cleanup(self)
             # Discovery may already be registered after a slow database load.
             # An unchanged document still supplies its initial name/status.
             self.server.send_event(
@@ -593,8 +607,9 @@ class MuonSetup:
         await self.database.insert_item(NAMESPACE, STATE_KEY, stored)
 
     async def _persist_internal(self) -> None:
-        await self.database.insert_item(
-            NAMESPACE, INTERNAL_KEY, dict(self._internal))
+        async with self._internal_lock:
+            await self.database.insert_item(
+                NAMESPACE, INTERNAL_KEY, dict(self._internal))
 
     async def _persist_quietly(self) -> None:
         async with self._lock:
@@ -681,7 +696,7 @@ class MuonSetup:
             return self.envelope(model.error(
                 "aux_unavailable", "setup state is not ready yet"))
         started_op: Optional[Tuple[str, OpRunner]] = None
-        async with self._lock:
+        async with self._reset_lock, self._lock:
             doc = self.doc
             if not protection_exempt:
                 caller.refuse_if_protected(kind, doc["state"])
@@ -1132,11 +1147,18 @@ class MuonSetup:
         if not await self.wait_resolved(STARTUP_WAIT) or self.doc is None:
             return self.envelope(model.error(
                 "aux_unavailable", "setup state is not ready yet"))
-        # Not through write(), so the Level 1 check is made here: at Level 1
-        # the LAN may not stop a join the panel started.
-        caller.refuse_if_protected(kind, self.doc["state"])
-        await self.cancel_op(("region_apply", "join"))
-        return self.envelope()
+        async with self._reset_lock:
+            # Not through write(), so the Level 1 check is made here: at Level 1
+            # the LAN may not stop a join the panel started.
+            caller.refuse_if_protected(kind, self.doc["state"])
+            ssid, forget = network.cancel_cleanup_info(self)
+            if ssid is not None and forget and network.cleanup_possible(self, ssid):
+                await network.remember_cleanup(self, ssid)
+            await self.cancel_op(("region_apply", "join"))
+            # 02 §5.6a: the partial profile goes too (only when the join made
+            # it -- an owner's saved profile is never deleted).
+            await network.cancel_cleanup(self, ssid, forget)
+            return self.envelope()
 
     async def _handle_reset(self, webreq: WebRequest) -> Dict[str, Any]:
         """Development and support only (02 §5.11, 07 S11). Floored, and
@@ -1146,37 +1168,52 @@ class MuonSetup:
         the new one."""
         self.begin(webreq, caller.RESET)
         await self.wait_resolved(STARTUP_WAIT)
-        if self._marker_task is not None and not self._marker_task.done():
-            self._marker_task.cancel()
-        if self._op_task is not None and not self._op_task.done():
-            self._op_task.cancel()
-            try:
-                await asyncio.wait_for(asyncio.shield(self._op_task), 15.)
-            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
-                pass
-        async with self._lock:
-            old_rev = self.doc["rev"] if self.doc is not None else 0
-            if self.read_only_version is not None:
-                stored = await self.database.get_item(NAMESPACE, STATE_KEY, None)
-                if isinstance(stored, dict) and isinstance(stored.get("rev"), int):
-                    old_rev = max(old_rev, stored["rev"])
-            for key in (STATE_KEY, INTERNAL_KEY):
+        async with self._reset_lock:
+            ssid, forget = network.cancel_cleanup_info(self)
+            connect = self._join_connect
+            if ssid is not None and forget and network.cleanup_possible(self, ssid):
+                await network.remember_cleanup(self, ssid)
+            if self._marker_task is not None and not self._marker_task.done():
+                self._marker_task.cancel()
+            if self._op_task is not None and not self._op_task.done():
+                self._op_task.cancel()
                 try:
-                    await self.database.delete_item(NAMESPACE, key)
-                except Exception:
+                    await asyncio.wait_for(asyncio.shield(self._op_task), 15.)
+                except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
                     pass
-            self.read_only_version = None
-            self._internal = {
-                "marker_written": False, "tz_source": None,
-                "marker_clear_pending": True,
-            }
-            doc = model.new_document(manifest.item_ids(self.manifest))
-            doc["rev"] = old_rev + 1
-            self.doc = doc
-            await self._persist()
-            await self._persist_internal()
-            self._resolved.set()
-            self._notify()
+            # Finish pending join work before replacing the document. New profiles
+            # are cleaned up; owner profiles remain intact and are only awaited.
+            await network.cancel_cleanup(self, ssid, forget)
+            network.resume_cleanup(self)
+            if self._join_cleanup is not None:
+                await asyncio.shield(self._join_cleanup)
+            if connect is not None:
+                await network._connect_result(connect)
+            if self._internal.get("join_cleanup_ssid") is not None:
+                raise ServerError("join profile cleanup has not finished", 409)
+            async with self._lock:
+                old_rev = self.doc["rev"] if self.doc is not None else 0
+                if self.read_only_version is not None:
+                    stored = await self.database.get_item(NAMESPACE, STATE_KEY, None)
+                    if isinstance(stored, dict) and isinstance(stored.get("rev"), int):
+                        old_rev = max(old_rev, stored["rev"])
+                for key in (STATE_KEY, INTERNAL_KEY):
+                    try:
+                        await self.database.delete_item(NAMESPACE, key)
+                    except Exception:
+                        pass
+                self.read_only_version = None
+                self._internal = {
+                    "marker_written": False, "tz_source": None,
+                    "marker_clear_pending": True,
+                }
+                doc = model.new_document(manifest.item_ids(self.manifest))
+                doc["rev"] = old_rev + 1
+                self.doc = doc
+                await self._persist()
+                await self._persist_internal()
+                self._resolved.set()
+                self._notify()
         # OS-7's DELETE /setup/complete, so the hotspot's H1 rule sees a new
         # printer again. Retried every 30 s while Aux is down, for as long as
         # the state stays short of `complete`.
@@ -1297,17 +1334,36 @@ class MuonSetup:
         self._live["hotspot"]["ssid"] = identity.get("ssid")
 
     async def _refresh_region(self) -> None:
+        state: Any = None
+        options: Any = None
         try:
             state = await self.aux("GET", "/region")
+        except AuxMissing:
+            self._region_state_missing = True
+        except (AuxUnavailable, AuxRefused):
+            pass  # Preserve prior evidence until this endpoint answers.
+        else:
+            # Even a malformed successful reply proves the route exists.
+            self._region_state_missing = False
+        try:
             options = await self.aux("GET", "/region/options")
         except AuxMissing:
-            self._live["region"] = None
-            return
+            self._region_options_missing = True
         except (AuxUnavailable, AuxRefused):
-            return
-        if isinstance(state, dict) and isinstance(options, dict):
-            # Aux GET /region verbatim, plus the derived market (02 §6).
+            pass
+        else:
+            self._region_options_missing = False
+        self._region_missing = (
+            self._region_state_missing and self._region_options_missing)
+        if self._region_missing:
+            self._live["region"] = None
+        elif isinstance(state, dict) and isinstance(options, dict):
             self._live["region"] = region.state_region(state, options)
+        elif isinstance(state, dict):
+            # A partial capability must not imply an unrestricted market.
+            self._live["region"] = dict(state, market="unknown")
+        elif self._region_state_missing or self._region_options_missing:
+            self._live["region"] = None
 
     def _refresh_capabilities(self) -> None:
         caps = self._live["capabilities"]
