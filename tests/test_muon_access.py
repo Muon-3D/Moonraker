@@ -135,9 +135,21 @@ def state(**kwargs: Any) -> policy.AccessState:
 
 @pytest.fixture(autouse=True)
 def _reset():
-    yield
-    policy.set_state(None)
-    muon_floor.set_protection_level(muon_floor.LEVEL_OPEN)
+    # APIDefinition.create() returns an existing definition for an endpoint.
+    # Keep these unit tests independent of definitions registered by tests
+    # which happened to run before them.
+    api_cache = dict(APIDefinition._cache)
+    file_guard = policy._files
+    APIDefinition._cache.clear()
+    policy.set_files(None)
+    try:
+        yield
+    finally:
+        APIDefinition._cache.clear()
+        APIDefinition._cache.update(api_cache)
+        policy.set_files(file_guard)
+        policy.set_state(None)
+        muon_floor.set_protection_level(muon_floor.LEVEL_OPEN)
 
 
 def _api(endpoint: str) -> APIDefinition:
