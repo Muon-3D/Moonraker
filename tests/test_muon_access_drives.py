@@ -11,6 +11,7 @@ import asyncio
 from typing import Any, Dict, List, Optional
 
 import pytest
+import tornado.web
 
 from moonraker import muon_access_files as files
 from moonraker import muon_access_policy as policy
@@ -322,3 +323,48 @@ class TestTheHandlersAreWired:
         # plan before the file is placed, finish after
         assert post.index("plan_upload") < post.index("finalize_upload")
         assert post.index("finalize_upload") < post.index("finish_upload")
+
+    def test_upload_handler_refuses_before_publishing_file(self):
+        """The multipart handler bypasses APIDefinition, so exercise it.
+
+        Source-wiring assertions cannot prove that the handler supplies the
+        parsed root and caller to the access check, or that refusal happens
+        before file_manager publishes the staged file.
+        """
+        from types import SimpleNamespace
+        from moonraker.components import application
+
+        a_printer("shared", entry="protected")
+        finalized = []
+
+        async def finalize_upload(form_args):
+            finalized.append(form_args)
+            return {"item": {"root": "gcodes", "path": "part.gcode"}}
+
+        _transport, ip, user = PASSWORD
+        handler = SimpleNamespace(
+            parse_failed=False,
+            _targets={
+                "root": SimpleNamespace(value=b"gcodes"),
+                "print": SimpleNamespace(value=b"false"),
+                "path": SimpleNamespace(value=b""),
+                "checksum": SimpleNamespace(value=b""),
+            },
+            _sha256_target=SimpleNamespace(value="digest"),
+            _file=SimpleNamespace(
+                multipart_filename="part.gcode", filename="/tmp/staged"),
+            request=SimpleNamespace(
+                remote_ip=str(ip), protocol="http", host="printer.local"),
+            current_user=user,
+            file_manager=SimpleNamespace(finalize_upload=finalize_upload),
+            location_prefix="server/files",
+            set_header=lambda *_args: None,
+            set_status=lambda *_args: None,
+            finish=lambda *_args: None,
+            _remove_temp_file=lambda: None,
+        )
+
+        with pytest.raises(tornado.web.HTTPError) as err:
+            asyncio.run(application.FileUploadHandler.post(handler))
+        assert err.value.status_code == 403
+        assert finalized == []
