@@ -237,7 +237,8 @@ class APIDefinition:
         transport: Optional[APITransport] = None,
         ip_addr: Optional[IPAddress] = None,
         user: Optional[UserInfo] = None,
-        http_headers: Optional[Mapping[str, str]] = None
+        http_headers: Optional[Mapping[str, str]] = None,
+        response_sent: Optional[Awaitable[Any]] = None,
     ) -> Coroutine:
         # MUON, SEC-2: the one place every transport converges.  The HTTP
         # handler, JsonRPC.execute_method and InternalTransport.call_method all
@@ -262,7 +263,7 @@ class APIDefinition:
             self.callback(
                 WebRequest(
                     self.endpoint, args, request_type, transport, ip_addr,
-                    user, http_headers
+                    user, http_headers, response_sent
                 )
             ),
         )
@@ -368,6 +369,11 @@ class APITransport:
         raise NotImplementedError
 
 class BaseRemoteConnection(APITransport):
+    @property
+    def authentication_ip(self) -> Optional[IPAddress]:
+        """Address for credential admission, independent of floor authority."""
+        return self.ip_addr
+
     def on_create(self, server: Server) -> None:
         self.server = server
         self.eventloop = server.get_event_loop()
@@ -462,9 +468,9 @@ class BaseRemoteConnection(APITransport):
         if auth is None:
             return
         if token is not None:
-            self.user_info = auth.validate_jwt(token)
+            self.user_info = auth.validate_jwt(token, self.authentication_ip)
         elif api_key is not None and self.user_info is None:
-            self.user_info = auth.validate_api_key(api_key)
+            self.user_info = auth.validate_api_key(api_key, self.authentication_ip)
         elif self._need_auth:
             raise self.server.error("Unauthorized", 401)
 
@@ -567,7 +573,8 @@ class WebRequest:
         transport: Optional[APITransport] = None,
         ip_addr: Optional[IPAddress] = None,
         user: Optional[UserInfo] = None,
-        http_headers: Optional[Mapping[str, str]] = None
+        http_headers: Optional[Mapping[str, str]] = None,
+        response_sent: Optional[Awaitable[Any]] = None,
     ) -> None:
         self.endpoint = endpoint
         self.args = args
@@ -576,6 +583,7 @@ class WebRequest:
         self.ip_addr: Optional[IPAddress] = ip_addr
         self.current_user = user
         self.http_headers = http_headers
+        self.response_sent = response_sent
 
     def get_endpoint(self) -> str:
         return self.endpoint
@@ -617,6 +625,14 @@ class WebRequest:
 
     def is_plain_http(self) -> bool:
         return self.http_headers is not None
+
+    async def wait_for_response_sent(self) -> None:
+        """Wait until a plain HTTP response has left its request handler.
+
+        Other transports have no HTTP response boundary and return at once.
+        """
+        if self.response_sent is not None:
+            await self.response_sent
 
     def _get_converted_arg(self,
                            key: str,

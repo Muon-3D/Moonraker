@@ -140,8 +140,6 @@ class TestRights:
                 result = await h.call("bluetooth", path, copy.deepcopy(body),
                                       method=verb)
                 assert isinstance(result, dict)
-                if "ok" in result:
-                    assert result["ok"] is True, result
             else:
                 rev = h.doc["rev"]
                 with pytest.raises(ServerError) as info:

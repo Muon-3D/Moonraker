@@ -5,6 +5,7 @@
 # This file may be distributed under the terms of the GNU GPLv3 license
 
 from __future__ import annotations
+import asyncio
 import os
 import mimetypes
 import logging
@@ -604,6 +605,12 @@ class DynamicRequestHandler(AuthorizedRequestHandler):
         self.wrap_result = wrap_result
         self.content_type = content_type
         self.auth_required = api_definition.auth_required
+        self._response_sent: Optional[asyncio.Future] = None
+
+    def on_finish(self) -> None:
+        """Release work which must happen only after the HTTP response."""
+        if self._response_sent is not None and not self._response_sent.done():
+            self._response_sent.set_result(None)
 
     # Converts query string values with type hints
     def _convert_type(self, value: str, hint: str) -> Any:
@@ -707,11 +714,12 @@ class DynamicRequestHandler(AuthorizedRequestHandler):
         self._log_debug(f"HTTP Request::{req}", args)
         try:
             ip = parse_ip_address(self.request.remote_ip or "")
+            self._response_sent = asyncio.get_running_loop().create_future()
             # MUON, KAN-203: pass the headers on, so a component can apply
             # its own CSRF and DNS-rebinding checks (WebRequest.get_http_headers)
             result = await self.api_defintion.request(
                 args, req_type, transport, ip, self.current_user,
-                self.request.headers
+                self.request.headers, self._response_sent
             )
         except ServerError as e:
             if self.server.is_verbose_enabled():
@@ -750,6 +758,11 @@ class RPCHandler(AuthorizedRequestHandler, APITransport):
     def screen_rpc_request(
         self, api_def: APIDefinition, req_type: RequestType, args: Dict[str, Any]
     ) -> None:
+        auth: AuthComp = self.server.lookup_component("authorization", None)
+        if auth is not None and not auth.panel_password_allows(
+            self.current_user, self.ip_addr
+        ):
+            self.current_user = None
         if self.current_user is None and api_def.auth_required:
             raise self.server.error("Unauthorized", 401)
         if api_def.endpoint == "objects/subscribe":

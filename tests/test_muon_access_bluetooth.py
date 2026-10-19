@@ -438,6 +438,44 @@ class TestAfterSetupIsComplete:
         assert (p.kind, p.level, p.role, p.home) == (
             "gateway", policy.MEMBER, "viewer", False)
 
+    @pytest.mark.parametrize("endpoint,rtype,args", [
+        ("objects/subscribe", RequestType.POST,
+         {"objects": {"print_stats": None}}),
+        ("gcode/script", RequestType.POST, {"script": "G28\nM104 S200"}),
+        ("/printer/print/start", RequestType.POST, {"filename": "demo.gcode"}),
+        ("pause_resume/pause", RequestType.POST, {}),
+        ("pause_resume/resume", RequestType.POST, {}),
+        ("pause_resume/cancel", RequestType.POST, {}),
+        ("emergency_stop", RequestType.POST, {}),
+        ("/server/files/list", RequestType.GET, {}),
+    ])
+    def test_an_enrolled_admin_operator_gets_normal_control(
+        self, endpoint: str, rtype: RequestType, args: Dict[str, Any]
+    ) -> None:
+        setup_is_complete()
+        policy.set_state(policy.AccessState(
+            entry="protected", owner="account", preset="standard", home=HOME))
+        assert refusal(endpoint, rtype, args, BLUETOOTH,
+                       token("admin", "operator", False)) is None
+
+    def test_an_enrolled_client_may_upgrade_to_websocket(self) -> None:
+        setup_is_complete()
+        user = token("admin", "operator", False)
+        muon_floor.check_bluetooth("/websocket", HTTP, BLUETOOTH)
+        policy.set_state(policy.AccessState(
+            entry="protected", owner="account", preset="standard", home=HOME))
+        policy.check_access(
+            "/websocket", RequestType.GET, {}, HTTP, BLUETOOTH, user)
+
+    def test_after_complete_the_address_without_an_enrolled_token_is_nobody(self):
+        setup_is_complete()
+        policy.set_state(policy.AccessState(
+            entry="open", owner="none", preset="relaxed", home=HOME))
+        for user in (None, TRUSTED_USER,
+                     UserInfo("admin", "", source="moonraker")):
+            assert refusal("/server/files/list", RequestType.GET, {},
+                           BLUETOOTH, user) is not None
+
     def test_home_only_rows_are_refused_although_the_token_says_home(self):
         setup_is_complete()
         policy.set_state(policy.AccessState(

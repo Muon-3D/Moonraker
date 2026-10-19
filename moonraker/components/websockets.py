@@ -34,6 +34,7 @@ from typing import (
 )
 
 if TYPE_CHECKING:
+    from ..common import UserInfo
     from ..server import Server
     from .klippy_connection import KlippyConnection as Klippy
     from ..confighelper import ConfigHelper
@@ -174,6 +175,11 @@ class WebsocketManager:
         return ret
 
     def add_client(self, sc: BaseRemoteConnection) -> None:
+        auth: AuthComp = self.server.lookup_component("authorization", None)
+        if auth is not None and not auth.panel_password_allows(
+            sc.user_info, sc.authentication_ip
+        ):
+            self._close_password_client(sc)
         self.clients[sc.uid] = sc
         self.server.send_event("websockets:client_added", sc)
         logging.debug(f"New Websocket Added: {sc.uid}")
@@ -186,8 +192,45 @@ class WebsocketManager:
         self._check_closed_event()
 
     def add_bridge_connection(self, bc: BridgeSocket) -> None:
+        auth: AuthComp = self.server.lookup_component("authorization", None)
+        if auth is not None and not auth.panel_password_allows(
+            bc.current_user, bc.ip_addr
+        ):
+            self._close_password_bridge(bc)
+            return
         self.bridge_connections[bc.uid] = bc
         logging.debug(f"New Bridge Connection Added: {bc.uid}")
+
+    @staticmethod
+    def _close_password_bridge(bc: BridgeSocket) -> None:
+        bc.is_closed = True
+        bc.klippy_write_buf.clear()
+        if bc.klippy_writer is not None:
+            bc.klippy_writer.close()
+            bc.klippy_writer = None
+        bc.close_socket(1008, "Panel password changed")
+
+    def _close_password_client(self, sc: BaseRemoteConnection) -> None:
+        if sc.user_info is not None:
+            sc.on_user_logout(sc.user_info.username)
+        kconn: Optional[Klippy] = self.server.lookup_component(
+            "klippy_connection", None)
+        if kconn is not None:
+            kconn.remove_subscription(sc)
+        sc.close_socket(1008, "Panel password changed")
+
+    def invalidate_panel_password_sessions(self) -> None:
+        auth: AuthComp = self.server.lookup_component("authorization", None)
+        if auth is None:
+            return
+        for sc in list(self.clients.values()):
+            if sc.user_info is not None and not auth.panel_password_allows(
+                sc.user_info, sc.authentication_ip
+            ):
+                self._close_password_client(sc)
+        for bc in list(self.bridge_connections.values()):
+            if not auth.panel_password_allows(bc.current_user, bc.ip_addr):
+                self._close_password_bridge(bc)
 
     def remove_bridge_connection(self, bc: BridgeSocket) -> None:
         old_bc = self.bridge_connections.pop(bc.uid, None)
@@ -356,6 +399,8 @@ class WebSocket(WebSocketHandler, BaseRemoteConnection):
         self.close(code, reason)
 
 class BridgeSocket(WebSocketHandler):
+    current_user: Optional[UserInfo]
+
     def initialize(self) -> None:
         self.server: Server = self.settings['server']
         self.wsm: WebsocketManager = self.server.lookup_component("websockets")
