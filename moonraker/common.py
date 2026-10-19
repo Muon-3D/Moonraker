@@ -368,6 +368,11 @@ class APITransport:
         raise NotImplementedError
 
 class BaseRemoteConnection(APITransport):
+    @property
+    def authentication_ip(self) -> Optional[IPAddress]:
+        """Address for credential admission, independent of floor authority."""
+        return self.ip_addr
+
     def on_create(self, server: Server) -> None:
         self.server = server
         self.eventloop = server.get_event_loop()
@@ -462,9 +467,9 @@ class BaseRemoteConnection(APITransport):
         if auth is None:
             return
         if token is not None:
-            self.user_info = auth.validate_jwt(token)
+            self.user_info = auth.validate_jwt(token, self.authentication_ip)
         elif api_key is not None and self.user_info is None:
-            self.user_info = auth.validate_api_key(api_key)
+            self.user_info = auth.validate_api_key(api_key, self.authentication_ip)
         elif self._need_auth:
             raise self.server.error("Unauthorized", 401)
 

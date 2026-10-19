@@ -171,6 +171,11 @@ trusted_clients:
 [octoprint_compat]
 
 [zeroconf]
+# KAN-475 (MR-8): Moonraker is bound to 127.0.0.1:7125 ([server] above), so
+# 7125 is unreachable from the network. nginx on 80 is the front door and
+# proxies every path these records lead a client to (/server, /printer, /api,
+# /access, /websocket). Without this a slicer's Browse lists <ip>:7125.
+advertised_port: 80
 octoprint_discovery: True
 octoprint_model_name: Muon M1
 octoprint_addr_pref: hostname

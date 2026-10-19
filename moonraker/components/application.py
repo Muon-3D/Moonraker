@@ -750,6 +750,11 @@ class RPCHandler(AuthorizedRequestHandler, APITransport):
     def screen_rpc_request(
         self, api_def: APIDefinition, req_type: RequestType, args: Dict[str, Any]
     ) -> None:
+        auth: AuthComp = self.server.lookup_component("authorization", None)
+        if auth is not None and not auth.panel_password_allows(
+            self.current_user, self.ip_addr
+        ):
+            self.current_user = None
         if self.current_user is None and api_def.auth_required:
             raise self.server.error("Unauthorized", 401)
         if api_def.endpoint == "objects/subscribe":

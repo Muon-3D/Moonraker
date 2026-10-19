@@ -36,6 +36,15 @@ from muon_setup_fakes import (
 # ==========================================================================
 
 class TestFreshStartAndMigration:
+    def test_an_unchanged_stored_document_notifies_discovery_on_load(self):
+        async def exercise():
+            stored = state_with()
+            h = Harness(stored=stored)
+            await h.setup._startup(poll=False)
+            assert h.server.changes() == [h.setup.public_state()]
+            assert h.stored() == stored
+        run(exercise())
+
     def test_a_new_printer_starts_new_at_language_and_saves_it(self):
         async def go():
             h = await Harness().start()
@@ -616,6 +625,15 @@ KINDS = ["panel", "hotspot", "lan", "remote", "other"]
 ACCESS = [
     ("", "GET", None, {"panel", "hotspot", "lan", "remote"}),
     ("/options", "GET", None, {"panel", "hotspot", "lan"}),
+    ("/networks", "GET", {"rescan": False}, {"panel", "hotspot", "lan"}),
+    ("/network", "POST",
+     {"rev": 5, "kind": "wifi", "ssid": "HomeWiFi", "security": "wpa2",
+      "psk": "test-psk-12345"}, {"panel", "hotspot", "lan"}),
+    ("/region", "POST", {"rev": 5, "country": "DE"},
+     {"panel", "hotspot", "lan"}),
+    ("/remote", "POST", {"rev": 5, "mode": "local"},
+     {"panel", "hotspot", "lan"}),
+    ("/remote/cancel", "POST", {}, {"panel", "hotspot", "lan"}),
     ("/driver", "POST", {"rev": 5, "kind": "web", "client_id": "c"},
      {"hotspot", "lan"}),
     ("/goto", "POST", {"rev": 5, "step": "language"},
@@ -698,8 +716,13 @@ PROTECTED_WRITES = [
     ("/name", {"rev": 5, "name": "Workshop"}, WRITERS),
     ("/timezone", {"rev": 5, "tz": "Europe/London"}, WRITERS),
     ("/update", {"rev": 5, "action": "later"}, WRITERS),
+    ("/network", {"rev": 5, "kind": "wifi", "ssid": "HomeWiFi",
+                  "security": "wpa2", "psk": "test-psk-12345"}, WRITERS),
+    ("/region", {"rev": 5, "country": "DE"}, WRITERS),
+    ("/remote", {"rev": 5, "mode": "local"}, WRITERS),
     ("/ready", {"rev": 5, "item": "load_filament", "action": "skip"}, WRITERS),
     ("/network/cancel", {}, WRITERS),
+    ("/remote/cancel", {}, WRITERS),
     ("/clock", {"epoch_ms": CLOCK_NOW_MS}, {"hotspot", "internal"}),
 ]
 

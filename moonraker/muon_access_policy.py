@@ -465,11 +465,7 @@ def _bluetooth_principal(
 
 
 def _is_password_user(user: Any) -> bool:
-    return (
-        user is not None
-        and getattr(user, "username", None) == PASSWORD_LOGIN_USER
-        and getattr(user, "source", None) == "moonraker"
-    )
+    return muon_floor.is_panel_login(user)
 
 
 def resolve_principal(
@@ -822,6 +818,16 @@ def refusal(decision: Decision) -> ServerError:
     )
 
 
+# Credential validation still runs in the endpoint. These exact home-network
+# entry points must be reachable before the caller has acquired an identity.
+AUTH_BOOTSTRAP = frozenset((
+    ("/access/login", "POST"),
+    ("/access/info", "GET"),
+    ("/access/refresh_jwt", "POST"),
+    ("/server/connection/identify", "POST"),
+))
+
+
 def check_access(
     endpoint: str,
     request_type: Optional[Any] = None,
@@ -843,6 +849,13 @@ def check_access(
         # files still hide from it (design 2.7).
         if _files is not None:
             _files.check(endpoint, request_type, args or {}, PANEL_PRINCIPAL)
+        return
+    if (
+        (endpoint, getattr(request_type, "name", None)) in AUTH_BOOTSTRAP
+        and ip_addr is not None
+        and not muon_floor._is_gateway_address(ip_addr)
+        and current.home.contains(ip_addr)
+    ):
         return
     principal = resolve_principal(
         transport, ip_addr, user, current.entry, current.home
