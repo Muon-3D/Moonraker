@@ -473,6 +473,9 @@ BLUETOOTH_SENTINEL = ipaddress.ip_address("192.0.2.2")
 GATEWAY_ADDRESSES = frozenset({GATEWAY_SENTINEL, BLUETOOTH_SENTINEL})
 #: ``UserInfo.source`` for a user ``muon_gateway`` authenticated.
 GATEWAY_USER_SOURCE = "muon_gateway"
+_ENROLLED_LEVELS = frozenset(
+    {"signed_out_guest", "signed_in_guest", "member", "admin"})
+_ENROLLED_ROLES = frozenset({"operator", "viewer"})
 
 # Open here, so a Moonraker with no [muon_protection] section keeps upstream
 # behaviour. The component raises this to Protected as soon as it loads, and
@@ -639,13 +642,26 @@ def is_bluetooth_setup_endpoint(endpoint: str) -> bool:
 
 
 def bluetooth_setup_caller(
-    transport: Optional[Any] = None, ip_addr: Optional[Any] = None
+    transport: Optional[Any] = None, ip_addr: Optional[Any] = None,
+    user: Optional[Any] = None,
 ) -> bool:
-    """Is this a caller ``check_bluetooth`` holds to the setup routes?"""
+    """Is this caller held to the Bluetooth setup routes?
+
+    After setup, only a gateway token carrying an explicit enrolled principal
+    may leave those routes.  A token without principal fields is also what the
+    out-of-box connection carries, so treating that legacy token as an admin
+    creates a control window while muon-link is closing the setup connection.
+    """
+    enrolled = (
+        user is not None
+        and getattr(user, "source", None) == GATEWAY_USER_SOURCE
+        and getattr(user, "access_level", None) in _ENROLLED_LEVELS
+        and getattr(user, "access_role", None) in _ENROLLED_ROLES
+    )
     return (
         not _is_internal(transport)
         and is_bluetooth_address(ip_addr)
-        and not setup_complete()
+        and (not setup_complete() or not enrolled)
     )
 
 
@@ -653,11 +669,10 @@ def check_bluetooth(
     endpoint: str,
     transport: Optional[Any] = None,
     ip_addr: Optional[Any] = None,
+    user: Optional[Any] = None,
 ) -> None:
-    """Raise 403 when a phone setting the printer up over Bluetooth asks for
-    anything but the setup routes. Never refuses another caller, and never
-    refuses anything once setup is complete."""
-    if not bluetooth_setup_caller(transport, ip_addr):
+    """Hold an unenrolled Bluetooth caller to the setup routes."""
+    if not bluetooth_setup_caller(transport, ip_addr, user):
         return
     if is_bluetooth_setup_endpoint(endpoint):
         return

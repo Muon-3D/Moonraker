@@ -979,7 +979,7 @@ def _check_file_access(
     the Bluetooth setup rule (KAN-436), which they would bypass too."""
     ip_addr = parse_ip_address(request.remote_ip or "")
     try:
-        muon_floor.check_bluetooth(endpoint, None, ip_addr)
+        muon_floor.check_bluetooth(endpoint, None, ip_addr, user)
         muon_access_policy.check_access(
             endpoint, request_type, args, None, ip_addr, user,
         )

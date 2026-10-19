@@ -232,11 +232,16 @@ class TestTheFloorHoldsBluetoothToSetup:
         # An in-process call carries no address and is never held
         muon_floor.check_bluetooth("/server/files/list", INTERNAL, BLUETOOTH)
 
-    def test_once_setup_is_complete_the_floor_lets_it_through(self):
+    def test_only_an_enrolled_principal_leaves_setup_after_completion(self):
         setup_is_complete()
+        message = refusal("/server/files/list", RequestType.GET, {},
+                          BLUETOOTH, LEGACY_TOKEN)
+        assert message is not None and FLOOR_REFUSAL in message
+        enrolled = token("admin", "operator", False)
         assert refusal("/server/files/list", RequestType.GET, {},
-                       BLUETOOTH, LEGACY_TOKEN) is None
-        muon_floor.check_bluetooth("/websocket", None, BLUETOOTH)
+                       BLUETOOTH, enrolled) is None
+        muon_floor.check_bluetooth(
+            "/websocket", None, BLUETOOTH, enrolled)
 
     def test_not_known_is_not_complete(self):
         assert not muon_floor.setup_complete()
@@ -310,6 +315,10 @@ class TestMuonSetupSaysWhenSetupIsComplete:
         assert not muon_floor.setup_complete()
         harness.setup.doc["state"] = "complete"
         assert muon_floor.setup_complete()
+        assert muon_floor.bluetooth_setup_caller(
+            HTTP, BLUETOOTH, LEGACY_TOKEN)
+        assert not muon_floor.bluetooth_setup_caller(
+            HTTP, BLUETOOTH, token("member", "operator", False))
         harness.setup.doc["state"] = "new"
         assert not muon_floor.setup_complete()
 
@@ -418,20 +427,24 @@ class TestTheTableHoldsBluetoothToSetup:
             "muon_setup_changed", [{"rev": 1}], socket) == [{"rev": 1}]
         setup_is_complete()
         assert policy.filter_notification(
+            "gcode_response", ["ok"], socket) is None
+        socket.user_info = token("admin", "operator", False)
+        assert policy.filter_notification(
             "gcode_response", ["ok"], socket) == ["ok"]
 
 
 class TestAfterSetupIsComplete:
     """muon-link closes setup connections and admits only paired clients over
-    Bluetooth. 192.0.2.2 is then such a client: its token decides, and it is
-    never on the home network."""
+    Bluetooth. An explicit principal makes 192.0.2.2 such a client: its token
+    decides, and it is never on the home network. A fieldless setup token stays
+    restricted if connection teardown has not completed yet."""
 
     def test_a_paired_client_over_bluetooth_is_the_gateway_principal(self):
         setup_is_complete()
         p = policy.resolve_principal(HTTP, BLUETOOTH, LEGACY_TOKEN, "open", HOME)
         assert p is not None
         assert (p.kind, p.level, p.role, p.home) == (
-            "gateway", policy.ADMIN, "operator", False)
+            "bluetooth", policy.SIGNED_OUT_GUEST, "viewer", False)
         p = policy.resolve_principal(
             HTTP, BLUETOOTH, token("member", "viewer", True), "open", HOME)
         assert p is not None
@@ -461,7 +474,7 @@ class TestAfterSetupIsComplete:
     def test_an_enrolled_client_may_upgrade_to_websocket(self) -> None:
         setup_is_complete()
         user = token("admin", "operator", False)
-        muon_floor.check_bluetooth("/websocket", HTTP, BLUETOOTH)
+        muon_floor.check_bluetooth("/websocket", HTTP, BLUETOOTH, user)
         policy.set_state(policy.AccessState(
             entry="protected", owner="account", preset="standard", home=HOME))
         policy.check_access(
@@ -504,10 +517,11 @@ class TestAfterSetupIsComplete:
             language={"status": "done", "value": "en"}))
         run(harness.start())
         harness.setup.doc["state"] = "complete"
-        p = policy.resolve_principal(HTTP, BLUETOOTH, LEGACY_TOKEN, "open", HOME)
+        enrolled = token("admin", "operator", False)
+        p = policy.resolve_principal(HTTP, BLUETOOTH, enrolled, "open", HOME)
         assert p is not None and p.kind == "gateway"
         harness.setup.doc["state"] = "new"
-        p = policy.resolve_principal(HTTP, BLUETOOTH, LEGACY_TOKEN, "open", HOME)
+        p = policy.resolve_principal(HTTP, BLUETOOTH, enrolled, "open", HOME)
         assert p is not None and p.kind == "bluetooth"
 
 

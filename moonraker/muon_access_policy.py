@@ -455,7 +455,7 @@ def _bluetooth_principal(
     Bluetooth setup principal: the lowest level, a Viewer's role, not home,
     not identified, whatever the token names. After, the paired client the
     token names, never on the home network."""
-    if muon_floor.bluetooth_setup_caller(transport, ip_addr):
+    if muon_floor.bluetooth_setup_caller(transport, ip_addr, user):
         name = str(getattr(user, "username", "") or "")
         return Principal(
             BLUETOOTH, f"bluetooth:{name}", SIGNED_OUT_GUEST, VIEWER, False,
@@ -945,7 +945,8 @@ def filter_notification(name: str, data: Any, connection: Any) -> Any:
     current = _state
     if (
         current is not None
-        and muon_floor.bluetooth_setup_caller(connection, connection.ip_addr)
+        and muon_floor.bluetooth_setup_caller(
+            connection, connection.ip_addr, connection.user_info)
         and name not in BLUETOOTH_NOTIFICATIONS
     ):
         # KAN-436: muon_floor refuses a Bluetooth phone a websocket while

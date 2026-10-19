@@ -248,7 +248,7 @@ class APIDefinition:
         muon_floor.check_floor(self.endpoint, transport, ip_addr, request_type)
         # MUON, KAN-436: a phone setting the printer up over Bluetooth reaches
         # the setup routes only, whatever muon-link let through.
-        muon_floor.check_bluetooth(self.endpoint, transport, ip_addr)
+        muon_floor.check_bluetooth(self.endpoint, transport, ip_addr, user)
         # MUON, SEC-8: the same convergence point, for the level the owner
         # chose. After the floor, so a floor surface keeps the floor's reason.
         muon_floor.check_protection(self.endpoint, transport, ip_addr, user)
