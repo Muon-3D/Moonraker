@@ -1107,6 +1107,25 @@ class TestFinish:
         # The deadline is the OS's, read back from GET /wifi/ap/stations.
         assert h.setup.public_state()["hotspot"]["auto_off_at"] == 1790252700.0
 
+    def test_finish_does_not_write_marker_before_http_response_is_sent(self):
+        """The BLE gateway enrols the caller only after the finish response."""
+        async def go() -> Any:
+            h = await Harness(stored=self._stored()).start()
+            response_sent = asyncio.Event()
+            webreq = request(
+                "bluetooth", "/server/muon/setup/finish", {"rev": 5},
+                response_sent=response_sent.wait(),
+            )
+            await h.server.endpoints["/server/muon/setup/finish"][1](webreq)
+            await asyncio.sleep(0)
+            assert h.aux.posted("/setup/complete") == []
+            response_sent.set()
+            await h.setup.drain()
+            return h
+
+        h = run(go())
+        assert h.aux.posted("/setup/complete") == [{"by": "muon_setup"}]
+
     def test_keep_by_default_keeps_a_real_name(self):
         """finish answers a pending name with "Keep", which must keep the
         name, not store null (02 §5.7)."""
@@ -1433,9 +1452,9 @@ class TestLiveFields:
         async def go():
             return (await Harness().start()).setup.public_state()
         assert list(run(go())) == [
-            "version", "rev", "state", "cursor", "driver", "op", "printer",
-            "hotspot", "clock", "region", "capabilities", "card_dismissed",
-            "steps"]
+            "version", "rev", "state", "cursor", "driver", "nearby", "op",
+            "printer", "hotspot", "clock", "region", "capabilities",
+            "card_dismissed", "steps"]
 
 
 class TestOptions:

@@ -5,6 +5,7 @@
 # This file may be distributed under the terms of the GNU GPLv3 license
 
 from __future__ import annotations
+import asyncio
 import os
 import mimetypes
 import logging
@@ -26,6 +27,7 @@ from tornado.log import access_log
 from ..utils import ServerError, source_info, parse_ip_address, redact
 from ..utils.real_ip import validate_real_ip_header
 from .. import muon_access_policy
+from .. import muon_floor
 from ..common import (
     JsonRPC,
     WebRequest,
@@ -603,6 +605,12 @@ class DynamicRequestHandler(AuthorizedRequestHandler):
         self.wrap_result = wrap_result
         self.content_type = content_type
         self.auth_required = api_definition.auth_required
+        self._response_sent: Optional[asyncio.Future] = None
+
+    def on_finish(self) -> None:
+        """Release work which must happen only after the HTTP response."""
+        if self._response_sent is not None and not self._response_sent.done():
+            self._response_sent.set_result(None)
 
     # Converts query string values with type hints
     def _convert_type(self, value: str, hint: str) -> Any:
@@ -706,11 +714,12 @@ class DynamicRequestHandler(AuthorizedRequestHandler):
         self._log_debug(f"HTTP Request::{req}", args)
         try:
             ip = parse_ip_address(self.request.remote_ip or "")
+            self._response_sent = asyncio.get_running_loop().create_future()
             # MUON, KAN-203: pass the headers on, so a component can apply
             # its own CSRF and DNS-rebinding checks (WebRequest.get_http_headers)
             result = await self.api_defintion.request(
                 args, req_type, transport, ip, self.current_user,
-                self.request.headers
+                self.request.headers, self._response_sent
             )
         except ServerError as e:
             if self.server.is_verbose_enabled():
@@ -966,11 +975,13 @@ def _check_file_access(
     request_type: RequestType,
     args: Dict[str, Any],
 ) -> None:
-    """The level table for the file handlers that bypass APIDefinition."""
+    """The level table for the file handlers that bypass APIDefinition, and
+    the Bluetooth setup rule (KAN-436), which they would bypass too."""
+    ip_addr = parse_ip_address(request.remote_ip or "")
     try:
+        muon_floor.check_bluetooth(endpoint, None, ip_addr, user)
         muon_access_policy.check_access(
-            endpoint, request_type, args, None,
-            parse_ip_address(request.remote_ip or ""), user,
+            endpoint, request_type, args, None, ip_addr, user,
         )
     except ServerError as e:
         raise tornado.web.HTTPError(e.status_code, reason=str(e)) from e

@@ -5,6 +5,11 @@
 # (nginx's X-Real-IP, validated by utils/real_ip.py) and the user
 # authorization.py stamped. The floor still applies on top: `reset` is in
 # muon_floor.FLOOR_PREFIXES, so a network caller never reaches the handler.
+#
+# KAN-436 adds `bluetooth` (ADR 0032 D4 and D7, in Muon_Internal_Documentation
+# 40-audits/decisions/0032-iroh-ble-on-the-m1.md): a phone on muon-link's
+# Bluetooth transport. Its rights follow `state`, so every check here takes
+# whether setup is complete (rights_of).
 
 from __future__ import annotations
 
@@ -27,12 +32,18 @@ PANEL = "panel"
 HOTSPOT = "hotspot"
 LAN = "lan"
 REMOTE = "remote"
+#: KAN-436, ADR 0032 D4: a phone on muon-link's Bluetooth transport.
+BLUETOOTH = "bluetooth"
 INTERNAL = "internal"
 OTHER = "other"
 
 #: muon-link's forwarded requests carry this address (GATE-2(b)).
-GATEWAY_SENTINEL = ipaddress.ip_address("192.0.2.1")
-GATEWAY_USER_SOURCE = "muon_gateway"
+GATEWAY_SENTINEL = muon_floor.GATEWAY_SENTINEL
+#: ...and this one when the connection started on the Bluetooth transport
+#: (ADR 0032 D4 rule 3). muon_gateway binds a token to it only when muon-link
+#: asks for a Bluetooth one.
+BLUETOOTH_SENTINEL = muon_floor.BLUETOOTH_SENTINEL
+GATEWAY_USER_SOURCE = muon_floor.GATEWAY_USER_SOURCE
 #: The hotspot's subnet: NetworkManager's shared mode on ap0.
 HOTSPOT_NET = ipaddress.ip_network("10.42.0.0/24")
 HOTSPOT_ADDRESS = "10.42.0.1"
@@ -46,8 +57,11 @@ PANEL_ONLY = frozenset({PANEL, INTERNAL})
 #: 02 §3: `reset` is the one thing another component may not do.
 RESET = frozenset({PANEL})
 
-#: Which driver surface a write from each kind of caller claims (01 §3).
-SURFACE_FOR_KIND = {PANEL: "panel", HOTSPOT: "phone", LAN: "web"}
+#: Which driver surface a write from each kind of caller claims (01 §3). A
+#: Bluetooth caller's claim is always `bluetooth`, whatever kind it names
+#: (ADR 0032 D7 "Caller class"): the panel's words come from the transport.
+SURFACE_FOR_KIND = {PANEL: "panel", HOTSPOT: "phone", LAN: "web",
+                    BLUETOOTH: "bluetooth"}
 
 #: SEC-8 Level 1 (02 §3): who loses setup writes once setup is complete. The
 #: panel and in-process calls keep them. A paired client arrives as `remote`,
@@ -60,14 +74,27 @@ def caller_kind(webreq: WebRequest) -> str:
     if getattr(transport, "transport_type", None) == TransportType.INTERNAL:
         return INTERNAL
     user = webreq.get_current_user()
-    if user is not None and getattr(user, "source", None) == GATEWAY_USER_SOURCE:
-        return REMOTE
     ip = webreq.get_ip_address()
+    if user is not None and getattr(user, "source", None) == GATEWAY_USER_SOURCE:
+        # The user is muon_gateway's: its one-shot token came over the uid-0
+        # socket and is bound to the address muon-link asked for, so a token
+        # minted for Bluetooth arrives only with 192.0.2.2 and one minted for
+        # a paired session only with 192.0.2.1 (Authorization's
+        # _check_oneshot_token compares them). Both halves are needed.
+        if _same_address(ip, BLUETOOTH_SENTINEL):
+            return BLUETOOTH
+        return REMOTE
     if ip is None:
         # MQTT and the like: no address, so nothing to trust.
         return OTHER
     if _same_address(ip, GATEWAY_SENTINEL):
         return REMOTE
+    if _same_address(ip, BLUETOOTH_SENTINEL):
+        # The Bluetooth address without the gateway's token is not the
+        # gateway: muon-link never forwards it unauthenticated. Unlike
+        # `remote`, it grants hotspot rights, so an address alone must never
+        # reach them (ADR 0032 D4).
+        return OTHER
     if muon_floor.local_address(ip):
         return PANEL
     if _in_network(ip, HOTSPOT_NET):
@@ -77,8 +104,22 @@ def caller_kind(webreq: WebRequest) -> str:
     return OTHER
 
 
-def require(kind: str, allowed: Iterable[str]) -> None:
-    if kind not in allowed:
+def rights_of(kind: str, complete: bool) -> str:
+    """The kind whose rights a caller has (ADR 0032 D4 rule 4).
+
+    `bluetooth` has the hotspot's rights while setup is not complete and the
+    rights of `remote` after. Every other kind is its own. Pass
+    `complete=True` whenever the state is not known yet: the narrower rights.
+    """
+    if kind == BLUETOOTH:
+        return REMOTE if complete else HOTSPOT
+    return kind
+
+
+def require(kind: str, allowed: Iterable[str], complete: bool = True) -> None:
+    """403 unless this caller's rights are among `allowed`. The message names
+    the caller's own kind, `bluetooth` included."""
+    if rights_of(kind, complete) not in allowed:
         raise ServerError(f"muon_setup: not allowed from {kind}", 403)
 
 
@@ -98,6 +139,44 @@ def refuse_if_protected(kind: str, state: str) -> None:
         and muon_floor.protection_level() == muon_floor.LEVEL_PROTECTED
     ):
         raise ServerError("muon_setup: protected", 403)
+
+
+# --------------------------------------------------------------------------
+# The code a Bluetooth phone shows (ADR 0032 D7 "State").
+#
+# The gateway sends the SEC-7 comparison value of the Bluetooth connection as
+# `X-Muon-Ble-Code: F6QTDH`, and drops whatever header the client sent. It is
+# six symbols of Crockford's base32 alphabet, upper case, no separator:
+# muon_link_crypto's `Sas` (pairing.rs, SAS_SYMBOLS = 6) drawn from
+# base32.rs's ALPHABET, "0123456789ABCDEFGHJKMNPQRSTVWXYZ" -- no I, L, O or U.
+# The panel shows it as `F6Q TDH`; that grouping is the panel's, not ours.
+# --------------------------------------------------------------------------
+
+BLE_CODE_HEADER = "X-Muon-Ble-Code"
+BLE_CODE_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+_BLE_CODE_RE = re.compile(r"[0-9A-HJKMNP-TV-Z]{6}")
+
+
+def ble_code(webreq: WebRequest) -> Optional[str]:
+    """The well-formed code this request carries, else None.
+
+    Only a header from the gateway is read, so call it for a `bluetooth`
+    caller only. A second copy of the header is malformed, not a choice.
+    """
+    headers = webreq.get_http_headers()
+    if headers is None:
+        return None
+    get_list = getattr(headers, "get_list", None)
+    if get_list is not None:
+        values = get_list(BLE_CODE_HEADER)
+        if len(values) != 1:
+            return None
+        value: Optional[str] = values[0]
+    else:
+        value = headers.get(BLE_CODE_HEADER)
+    if not isinstance(value, str) or not _BLE_CODE_RE.fullmatch(value):
+        return None
+    return value
 
 
 def _same_address(ip: Any, other: Any) -> bool:
@@ -205,6 +284,7 @@ def check_hygiene(
     hosts: Set[str],
     component: str = "muon_setup",
     extra_origins: AbstractSet[str] = frozenset(),
+    host_exempt: bool = False,
 ) -> None:
     """Raise 415/403 for a write that fails 02 §3's rules.
 
@@ -214,6 +294,15 @@ def check_hygiene(
     muon_link applies the same rules to its writes. `extra_origins` are whole
     Origin values accepted besides the printer's own names, compared exactly;
     muon_setup passes none.
+
+    `host_exempt` skips the Host allow-list and nothing else. muon_setup sets
+    it for a `bluetooth` caller only (KAN-436): muon-link-client's HTTP
+    encoder always writes `Host: printer` and refuses a caller-supplied Host
+    (crates/muon-link-client/src/http.rs, RESERVED), and the gateway forwards
+    it unchanged, so the app cannot name the printer there. The Host rule is
+    against DNS rebinding from a browser, and a `bluetooth` request carries
+    muon_gateway's one-shot token bound to 192.0.2.2, which no browser page
+    can hold. Content-Type, and Origin when one is sent, are still checked.
     """
     headers: Optional[Mapping[str, str]] = webreq.get_http_headers()
     if headers is None:
@@ -229,9 +318,10 @@ def check_hygiene(
             raise ServerError(
                 f"{component}: writes need Content-Type: application/json", 415
             )
-    host = bare_host(headers.get("Host"))
-    if host is None or host not in hosts:
-        raise ServerError(f"{component}: Host is not this printer", 403)
+    if not host_exempt:
+        host = bare_host(headers.get("Host"))
+        if host is None or host not in hosts:
+            raise ServerError(f"{component}: Host is not this printer", 403)
     if is_websocket:
         return
     origin = headers.get("Origin")

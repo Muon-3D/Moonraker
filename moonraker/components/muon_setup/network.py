@@ -358,7 +358,8 @@ async def handle_networks(
     setup: MuonSetup, webreq: WebRequest
 ) -> Dict[str, Any]:
     from . import AuxMissing, AuxRefused, AuxUnavailable, STARTUP_WAIT
-    caller.require(caller.caller_kind(webreq), caller.READ)
+    caller.require(
+        caller.caller_kind(webreq), caller.READ, setup.is_complete())
     await setup.wait_resolved(STARTUP_WAIT)
     rescan = str(webreq.get_args().get("rescan", "")).lower() == "true"
     try:
