@@ -69,6 +69,17 @@ class ParseRequestTests(unittest.TestCase):
             with self.assertRaises(ValueError, msg=bad):
                 parse_request(bad)
 
+    def test_request_size_limit_is_independent_of_field_validation(self) -> None:
+        # A valid client plus an ignored field isolates the 512-byte framing
+        # limit.  An overlong client would still be rejected if that limit
+        # disappeared, so it cannot prove the resource bound is enforced.
+        prefix = b'{"client":"ab12","padding":"'
+        suffix = b'"}'
+        request = prefix + b"x" * (513 - len(prefix) - len(suffix)) + suffix
+        self.assertEqual(len(request), 513)
+        with self.assertRaisesRegex(ValueError, "request too long"):
+            parse_request(request)
+
 
 @unittest.skipUnless(UNIX, "needs Unix sockets and SO_PEERCRED")
 class TokenSocketTests(unittest.IsolatedAsyncioTestCase):
