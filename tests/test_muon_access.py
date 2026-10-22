@@ -351,10 +351,63 @@ class TestPrincipals:
     def test_no_address_is_nobody(self):
         assert policy.resolve_principal(None, None, TRUSTED_USER, "open", HOME) is None
 
-    def test_a_token_naming_no_principal_is_the_gateway_as_it_was(self):
+    def test_a_token_naming_no_principal_is_the_least_there_is(self):
+        # KAN-877: it used to be admin with Operator
         p = policy.resolve_principal(HTTP, SENTINEL, LEGACY_GATEWAY_USER, "open", HOME)
         assert p is not None
-        assert (p.level, p.role) == (policy.ADMIN, "operator")
+        assert (p.kind, p.level, p.role, p.home, p.identified) == (
+            "gateway", policy.SIGNED_OUT_GUEST, "viewer", False, False)
+
+    def test_a_half_named_principal_is_not_admin_either(self):
+        # Level without role (or the reverse) never reaches the parser, but
+        # the resolver must not read it as admin: the lowest level, or a
+        # Viewer's role, comes of whatever is missing.
+        for level, role in ((None, "operator"), ("admin", None)):
+            user = GatewayUser(
+                "muon-link:0123456789abcdef", "", source="muon_gateway",
+                principal="device:abcd", access_level=level, access_role=role)
+            p = policy.resolve_principal(HTTP, SENTINEL, user, "open", HOME)
+            assert p is not None
+            assert (p.level, p.role) in (
+                (policy.SIGNED_OUT_GUEST, "operator"), (policy.ADMIN, "viewer"))
+
+    def test_a_principal_less_token_may_not_touch_any_write_row(self):
+        # The fix, per row and per preset: only reads and (a Viewer's)
+        # emergency stop get through, nothing that changes the printer.
+        for preset in ("relaxed", "standard", "strict"):
+            policy.set_state(state(entry="open", preset=preset,
+                                   owner="account"))
+            for row in SAMPLES:
+                message = refused(row, SENTINEL, LEGACY_GATEWAY_USER)
+                if row in ("read", "emergency_stop") and not (
+                    preset == "strict" and row == "read"
+                ):
+                    continue
+                assert message is not None, (preset, row)
+
+    def test_a_principal_less_token_cannot_reach_admin_rows_with_an_open_entry(self):
+        policy.set_state(state(entry="open", preset="relaxed", owner="none"))
+        for row in ("console", "protection", "updates", "hotspot", "wifi",
+                    "rename", "files_others", "print", "motion"):
+            assert refused(row, SENTINEL, LEGACY_GATEWAY_USER) is not None, row
+
+    def test_control_an_explicit_admin_principal_still_reaches_every_row(self):
+        # Negative control for the refusals above: the same requests are
+        # reached by a token that names an admin Operator at home, so the
+        # refusals come from the missing principal, not a blanket deny.
+        policy.set_state(state(entry="protected", preset="standard",
+                               owner="account"))
+        for row in SAMPLES:
+            assert refused(row, SENTINEL, gateway("admin", "operator")) is None, row
+
+    def test_the_panel_and_in_process_callers_do_not_need_a_principal(self):
+        policy.set_state(state(entry="protected", preset="strict",
+                               owner="account"))
+        for row in SAMPLES:
+            assert refused(row, LOOPBACK, None) is None, row
+        assert policy.resolve_principal(
+            INTERNAL, None, None, "protected", HOME
+        ) is policy.INTERNAL_PRINCIPAL
 
     def test_a_token_carries_level_role_and_home(self):
         p = policy.resolve_principal(

@@ -79,7 +79,7 @@ def has_account(principal: policy.Principal) -> bool:
 
 def can_tag(principal: policy.Principal) -> bool:
     """ACC-34: only a caller the printer holds a key for has an identity."""
-    return principal.kind == "gateway"
+    return principal.kind == "gateway" and principal.identified
 
 
 def is_admin(principal: policy.Principal) -> bool:
