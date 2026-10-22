@@ -62,8 +62,9 @@
 # says the session's path is on the printer's own network (default: false, so
 # a home-only action is refused unless muon-link vouches for the path). The
 # user the token carries holds them, and a request is decided on them. A
-# request without them is the gateway as it was: muon-link's policy is the
-# only limit, and `muon_access` treats it as admin with Operator.
+# request without them names nobody, and `muon_access` decides it as the least
+# there is: a signed-out guest with a Viewer's role, off the home network and
+# unidentified (KAN-877). It used to be admin with Operator.
 
 from __future__ import annotations
 
