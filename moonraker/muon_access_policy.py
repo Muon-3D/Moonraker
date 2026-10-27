@@ -152,6 +152,10 @@ class Action:
     #: Reachable by a caller on the home network that is not admitted: a
     #: new device asking the panel to let it in (ACC-6) is not, yet.
     home_unadmitted: bool = False
+    #: The row this one was split from. Until it has an override of its own
+    #: it follows that row's, so a setting made before the split still
+    #: covers everything it covered (KAN-878).
+    inherits: Optional[str] = None
 
     def level_for(self, preset: str) -> int:
         return {RELAXED: self.relaxed, STANDARD: self.standard,
@@ -169,8 +173,14 @@ _ROWS = (
     _A("print", SIGNED_OUT_GUEST, SIGNED_IN_GUEST, MEMBER),
     # Upload and delete own files
     _A("files", SIGNED_OUT_GUEST, SIGNED_IN_GUEST, MEMBER),
-    # Move, home, heat, load filament, macros
+    # Move, home, load filament, macros
     _A("motion", SIGNED_OUT_GUEST, MEMBER, MEMBER),
+    # Set a heater's target (KAN-878). Split from motion, at the same
+    # levels, so that a caller can be capped on heating apart from moving:
+    # the remote access plan's agents may move or heat only on a click, and
+    # Gate 3 has to be able to tell the two apart. Turning heaters off stays
+    # in motion, and macros that heat (LOAD_FILAMENT) are motion too.
+    _A("heat", SIGNED_OUT_GUEST, MEMBER, MEMBER, inherits="motion"),
     # Delete or reprint others' files
     _A("files_others", MEMBER, ADMIN, ADMIN),
     # Raw G-code console
@@ -335,6 +345,15 @@ def effective_preset(state: AccessState) -> str:
     return state.preset or default_preset(state.owner, state.entry)
 
 
+def _override(action: Action, state: AccessState) -> Optional[int]:
+    """The row's own override, else the one of the row it was split from."""
+    if action.name in state.overrides:
+        return state.overrides[action.name]
+    if action.inherits is not None:
+        return state.overrides.get(action.inherits)
+    return None
+
+
 def required_level(action: Action, state: AccessState) -> int:
     """The lowest level that may do this action on this printer now.
 
@@ -361,9 +380,9 @@ def required_level(action: Action, state: AccessState) -> int:
     if action.fixed:
         base = action.standard
     else:
-        base = state.overrides.get(
-            action.name, action.level_for(effective_preset(state))
-        )
+        override = _override(action, state)
+        base = (override if override is not None
+                else action.level_for(effective_preset(state)))
     if state.owner in (OWNER_NONE, OWNER_UNKNOWN):
         # (OWNER_UNKNOWN only for a delegated row, handled above otherwise)
         if action.name == "protection":
@@ -585,11 +604,15 @@ GCODE_PRINT = frozenset((
     "PAUSE", "RESUME", "CANCEL_PRINT", "CLEAR_PAUSE", "SDCARD_PRINT_FILE",
     "SDCARD_RESET_FILE", "M24", "M25",
 ))
+#: Commands that give a heater a target, or wait on one (KAN-878).
+GCODE_HEAT = frozenset((
+    "M104", "M109", "M140", "M190", "SET_HEATER_TEMPERATURE",
+    "TEMPERATURE_WAIT",
+))
 GCODE_MOTION = frozenset((
     "G0", "G1", "G2", "G3", "G4", "G10", "G11", "G28", "G90", "G91",
-    "M18", "M82", "M83", "M84", "M104", "M106", "M107", "M109", "M117",
-    "M140", "M190", "M220", "M221", "M400",
-    "SET_HEATER_TEMPERATURE", "TEMPERATURE_WAIT", "TURN_OFF_HEATERS",
+    "M18", "M82", "M83", "M84", "M106", "M107", "M117",
+    "M220", "M221", "M400", "TURN_OFF_HEATERS",
     "SET_FAN_SPEED", "SAVE_GCODE_STATE", "RESTORE_GCODE_STATE",
     "BED_MESH_CALIBRATE", "BED_MESH_CLEAR", "BED_MESH_PROFILE",
     # The M1's own operator macros (core/M1/macros in Muon3D_Klipper)
@@ -629,6 +652,8 @@ def gcode_actions(script: Any) -> Tuple[Action, ...]:
             name = "emergency_stop"
         elif command in GCODE_PRINT:
             name = "print"
+        elif command in GCODE_HEAT:
+            name = "heat"
         elif command in GCODE_MOTION:
             name = "motion"
         else:
