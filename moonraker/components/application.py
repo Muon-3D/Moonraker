@@ -464,6 +464,32 @@ class MoonrakerApp:
         self.template_cache[asset_name] = asset_tmpl
         return asset_tmpl
 
+def _status_line_reason(status_code: int, message: str) -> str:
+    # The reason phrase goes on the status line, so it must be one line.
+    # Klipper ends a macro's error with the newline that
+    # traceback.format_exception_only() leaves, and Tornado refuses a status
+    # line holding CR or LF only *after* it has committed to the body's
+    # Content-Length. Its fallback finish() then raised HTTPOutputError and
+    # the client got an empty reply instead of the refusal (KAN-991). The
+    # full message still goes in the JSON body.
+    for line in message.splitlines():
+        line = line.strip()
+        if line:
+            return line
+    return tornado.httputil.responses.get(status_code, "Unknown")
+
+def _write_json_error(
+    req_hdlr: tornado.web.RequestHandler, status_code: int, **kwargs
+) -> None:
+    message: str = req_hdlr._reason
+    err: Dict[str, Any] = {'code': status_code, 'message': message}
+    if 'exc_info' in kwargs:
+        err['traceback'] = "\n".join(
+            traceback.format_exception(*kwargs['exc_info']))
+    req_hdlr.set_status(status_code, _status_line_reason(status_code, message))
+    req_hdlr.set_header("Content-Type", "application/json; charset=UTF-8")
+    req_hdlr.finish(jsonw.dumps({'error': err}))
+
 def _set_cors_headers(req_hdlr: tornado.web.RequestHandler) -> None:
     request = req_hdlr.request
     origin: Optional[str] = request.headers.get("Origin")
@@ -534,12 +560,7 @@ class AuthorizedRequestHandler(tornado.web.RequestHandler):
         return conn
 
     def write_error(self, status_code: int, **kwargs) -> None:
-        err = {'code': status_code, 'message': self._reason}
-        if 'exc_info' in kwargs:
-            err['traceback'] = "\n".join(
-                traceback.format_exception(*kwargs['exc_info']))
-        self.set_header("Content-Type", "application/json; charset=UTF-8")
-        self.finish(jsonw.dumps({'error': err}))
+        _write_json_error(self, status_code, **kwargs)
 
 # Due to the way Python treats multiple inheritance its best
 # to create a separate authorized handler for serving files
@@ -577,12 +598,7 @@ class AuthorizedFileHandler(tornado.web.StaticFileHandler):
             super(AuthorizedFileHandler, self).options()
 
     def write_error(self, status_code: int, **kwargs) -> None:
-        err = {'code': status_code, 'message': self._reason}
-        if 'exc_info' in kwargs:
-            err['traceback'] = "\n".join(
-                traceback.format_exception(*kwargs['exc_info']))
-        self.set_header("Content-Type", "application/json; charset=UTF-8")
-        self.finish(jsonw.dumps({'error': err}))
+        _write_json_error(self, status_code, **kwargs)
 
     def _check_need_auth(self) -> bool:
         if self.request.method != "GET":
@@ -1150,12 +1166,7 @@ class AuthorizedErrorHandler(AuthorizedRequestHandler):
         pass
 
     def write_error(self, status_code: int, **kwargs) -> None:
-        err = {'code': status_code, 'message': self._reason}
-        if 'exc_info' in kwargs:
-            err['traceback'] = "\n".join(
-                traceback.format_exception(*kwargs['exc_info']))
-        self.set_header("Content-Type", "application/json; charset=UTF-8")
-        self.finish(jsonw.dumps({'error': err}))
+        _write_json_error(self, status_code, **kwargs)
 
 class RedirectHandler(AuthorizedRequestHandler):
     def initialize(self) -> None:
