@@ -170,11 +170,20 @@ LINK_SECRETS = ("code", "url")
 CHANGED_NOTIFICATION = "muon_setup_changed"
 
 
+#: Who is shown the code: the callers that may read the setup state, less
+#: `remote`. An allow-list, so a kind that may not read the state at all
+#: (`other`) is not sent the code on the notification either. Example: a
+#: Bluetooth websocket that logs in as an ordinary user after setup arrives
+#: from 192.0.2.2 without the gateway's token, which is `other`.
+LINK_SECRET_READERS = READ_STATE - {REMOTE}
+
+
 def withholds_link_secrets(kind: str, complete: bool) -> bool:
     """Whether this caller gets `remote.link` without code and url: every
-    caller with remote rights, so `bluetooth` too once setup is complete.
-    Pass `complete=True` when the state is not known: the narrower side."""
-    return rights_of(kind, complete) == REMOTE
+    caller whose rights are not in LINK_SECRET_READERS, so `remote`, and
+    `bluetooth` once setup is complete. Pass `complete=True` when the state
+    is not known: the narrower side."""
+    return rights_of(kind, complete) not in LINK_SECRET_READERS
 
 
 def without_link_secrets(state: Any) -> Any:

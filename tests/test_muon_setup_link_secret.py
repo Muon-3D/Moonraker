@@ -163,6 +163,36 @@ class TestNotification:
             "status_update", data, CONNECTIONS["remote"])
         assert out == data
 
+    def test_other_connection_is_not_sent_the_code(self):
+        # Review: 192.0.2.2 logged in as an ordinary user after setup is
+        # `other`, which may not GET the state; nor is it sent the code.
+        conn = FakeConnection(BLUETOOTH_IP, user(["network"]))
+        for state in ("in_progress", "complete"):
+            async def go() -> Any:
+                h = await Harness(stored=code_state(state)).start()
+                return muon_access_policy.filter_notification(
+                    NOTIFICATION, (h.setup.public_state(),), conn)
+            link = link_of(run(go())[0])
+            assert "code" not in link and "url" not in link
+
+    def test_the_real_payload_shape_is_a_tuple(self):
+        # server.py hands notify_clients the event's args: `(state,)`.
+        async def go() -> Any:
+            h = await Harness(stored=code_state()).start()
+            data = (h.setup.public_state(),)
+            return data, muon_access_policy.filter_notification(
+                NOTIFICATION, data, CONNECTIONS["remote"])
+        data, out = run(go())
+        assert link_of(out[0]) == {"phase": "code", "expires_at": EXPIRES}
+        assert link_of(data[0]) == LINK
+
+    def test_the_filter_is_on_the_name_muon_setup_notifies(self):
+        # A rename of the event must not silently drop the filter.
+        h = Harness(stored=code_state())
+        names = [event.split(":", 1)[1] for event in h.server.notifications]
+        assert NOTIFICATION in names
+        assert NOTIFICATION in muon_access_policy._notification_filters
+
     def test_a_payload_without_a_link_passes(self):
         for payload in ([], [None], [{"state": "new"}],
                         [{"steps": {"remote": {"link": None}}}]):
