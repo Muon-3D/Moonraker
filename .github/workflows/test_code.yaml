@@ -1,7 +1,25 @@
 # CI for code style and application tests
 
 name: test-code
-on: [push, pull_request]
+# MUON (KAN-708): upstream is `on: [push, pull_request]`, which builds every
+# commit on a branch with an open pull request twice. As in Muon3D_Klipper's
+# build-test.yaml (KAN-337): `push` only on the default branch, every other
+# branch through `pull_request`, and a newer commit on the same pull request
+# cancels the run it supersedes.
+#
+# runs-on stays `ubuntu-22.04`. This repository is public, so GitHub-hosted
+# minutes are free, and a self-hosted runner on a public repository would
+# let any fork's pull request run code on bigbox (d01f23d reverted 440ef7f
+# for that reason). No `vars.LINUX_RUNS_ON` is defined for this repository.
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+concurrency:
+  group: test-code-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   lint-python-code:
     runs-on: ubuntu-22.04
