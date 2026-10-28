@@ -9,10 +9,13 @@ import sys
 import shlex
 import tempfile
 import subprocess
+import logging
 from typing import Iterator, Dict, AsyncIterator, Any
 from moonraker.server import Server
 from moonraker.eventloop import EventLoop
-from moonraker import utils
+from moonraker.loghelper import LogManager
+from moonraker import confighelper
+from moonraker.utils import json_wrapper
 import dbtool
 from fixtures import KlippyProcess, HttpClient, WebsocketClient
 
@@ -52,11 +55,23 @@ def ssl_certs() -> Iterator[Dict[str, pathlib.Path]]:
             "ssl_key_path": key_path,
         }
 
-@pytest.fixture(scope="class")
-def event_loop() -> Iterator[asyncio.AbstractEventLoop]:
-    loop = asyncio.get_event_loop_policy().new_event_loop()
-    yield loop
-    loop.close()
+# KAN-570: the legacy suites (test_config, test_database, test_server and
+# test_klippy_connection) share one Server per test class, so every test,
+# async fixture and sync fixture in a class has to see the same loop.
+#
+# They used to get it by overriding pytest-asyncio's `event_loop` fixture with
+# a class-scoped one. pytest-asyncio 0.23 deprecated that and 1.0 removed it,
+# and Moonraker's EventLoop now binds to asyncio.get_running_loop(), so a
+# Server cannot even be built outside a running loop. Instead, pytest-asyncio
+# owns one loop per class (`loop_scope="class"` on these fixtures, and
+# `@pytest.mark.asyncio(loop_scope="class")` on the suites' async tests), and
+# `event_loop` is that loop: an async fixture run
+# on it that hands back the running loop. Between tests it is not running, so
+# the sync fixtures and tests that drive it with run_until_complete and
+# run_forever still can.
+@pytest_asyncio.fixture(scope="class", loop_scope="class")
+async def event_loop() -> asyncio.AbstractEventLoop:
+    return asyncio.get_running_loop()
 
 
 @pytest.fixture(scope="session")
@@ -191,26 +206,71 @@ def path_args(request: pytest.FixtureRequest,
         # restore the original uds path
         interpolate_config(mconf_asset, mconf_dest, session_args)
 
+async def _new_event_loop() -> EventLoop:
+    return EventLoop()
+
+
+def app_args(path_args: Dict[str, Any]) -> Dict[str, Any]:
+    """The arguments server.main() builds, for this test session.
+
+    KAN-570: Server reads far more of these than it did when the legacy
+    suites were written (data_path, is_backup_config, structured_logging,
+    ...), so they are built the way main() builds them, with the session's
+    temporary directory as the data path. test_server compares
+    get_app_args() against this.
+    """
+    data_path: pathlib.Path = path_args["temp_path"]
+    cfg_file = str(path_args["moonraker.conf"])
+    return {
+        "data_path": str(data_path),
+        "is_default_data_path": False,
+        "config_file": cfg_file,
+        "backup_config": confighelper.find_config_backup(cfg_file),
+        "startup_warnings": [],
+        "verbose": False,
+        "debug": False,
+        "asyncio_debug": False,
+        "is_backup_config": False,
+        "is_python_package": False,
+        "instance_uuid": "0123456789abcdef0123456789abcdef",
+        "unix_socket_path": str(data_path.joinpath("comms/moonraker.sock")),
+        "structured_logging": False,
+        "software_version": "moonraker-pytest",
+        "log_file": str(path_args.get("moonraker.log", "")),
+        "python_version": sys.version.replace("\n", " "),
+        "launch_args": "moonraker-pytest",
+        "msgspec_enabled": json_wrapper.MSGSPEC_ENABLED,
+        "uvloop_enabled": EventLoop.UVLOOP_ENABLED,
+    }
+
+
 @pytest.fixture(scope="class")
 def base_server(path_args: Dict[str, pathlib.Path],
                 event_loop: asyncio.AbstractEventLoop
                 ) -> Iterator[Server]:
-    evtloop = EventLoop()
-    args = {
-        'config_file': str(path_args['moonraker.conf']),
-        'log_file': str(path_args.get("moonraker.log", "")),
-        'software_version': "moonraker-pytest"
-    }
-    ql = logger = None
-    if args["log_file"]:
-        ql, logger, warning = utils.setup_logging(args)
-        if warning:
-            args["log_warning"] = warning
-    yield Server(args, logger, evtloop)
-    if ql is not None:
-        ql.stop()
+    # EventLoop() binds to the running loop, so build it on the class loop.
+    evtloop = event_loop.run_until_complete(_new_event_loop())
+    args = app_args(path_args)
+    # LogManager replaces every root handler with its own queue handler.
+    # Put pytest's capture handlers back beside it, and take its handler
+    # away again afterwards, so one class's server cannot swallow the log
+    # records of every test after it.
+    root = logging.getLogger()
+    saved = list(root.handlers)
+    log_manager = LogManager(args, args["startup_warnings"])
+    added = [h for h in root.handlers if h not in saved]
+    for hdlr in saved:
+        root.addHandler(hdlr)
+    try:
+        yield Server(args, log_manager, evtloop)
+    finally:
+        log_manager.stop_logging()
+        for hdlr in added:
+            root.removeHandler(hdlr)
+        if log_manager.file_hdlr is not None:
+            log_manager.file_hdlr.close()
 
-@pytest_asyncio.fixture(scope="class")
+@pytest_asyncio.fixture(scope="class", loop_scope="class")
 async def full_server(base_server: Server) -> AsyncIterator[Server]:
     base_server.load_components()
     ret = base_server.server_init(start_server=False)
@@ -219,7 +279,7 @@ async def full_server(base_server: Server) -> AsyncIterator[Server]:
     if base_server.event_loop.aioloop.is_running():
         await base_server._stop_server(exit_reason="terminate")
 
-@pytest_asyncio.fixture(scope="class")
+@pytest_asyncio.fixture(scope="class", loop_scope="class")
 async def ready_server(full_server: Server, klippy: KlippyProcess):
     ret = full_server.start_server(connect_to_klippy=False)
     await asyncio.wait_for(ret, 4.)
@@ -227,13 +287,13 @@ async def ready_server(full_server: Server, klippy: KlippyProcess):
     await asyncio.wait_for(ret, 4.)
     yield full_server
 
-@pytest_asyncio.fixture(scope="class")
+@pytest_asyncio.fixture(scope="class", loop_scope="class")
 async def http_client() -> AsyncIterator[HttpClient]:
     client = HttpClient()
     yield client
     client.close()
 
-@pytest_asyncio.fixture(scope="class")
+@pytest_asyncio.fixture(scope="class", loop_scope="class")
 async def websocket_client(request: pytest.FixtureRequest
                            ) -> AsyncIterator[WebsocketClient]:
     conn_marker = request.node.get_closest_marker("no_ws_connect")
