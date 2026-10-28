@@ -40,7 +40,7 @@ from . import (
     caller, clock, language, manifest, model, name, network, ready, region,
     remote, update)
 from .model import DONE, FINISH, HIDDEN, PENDING, SKIPPED
-from ... import muon_floor
+from ... import muon_access_policy, muon_floor
 from ...utils.exceptions import ServerError
 
 if TYPE_CHECKING:
@@ -208,6 +208,10 @@ class MuonSetup:
         self.database = self.server.lookup_component("database")
         self.database.register_local_namespace(NAMESPACE, forbidden=True)
         self.server.register_notification("muon_setup:muon_setup_changed")
+        # KAN-429: a remote connection is sent the state without the link
+        # code and url, as _handle_get answers a remote read.
+        muon_access_policy.register_notification_filter(
+            caller.CHANGED_NOTIFICATION, caller.filter_changed_notification)
 
         #: The stored document. None until the migration check has decided
         #: what this printer is (see _startup).
@@ -924,9 +928,13 @@ class MuonSetup:
     # ------------------------------------------------------------------
 
     async def _handle_get(self, webreq: WebRequest) -> Dict[str, Any]:
-        self.authorise(webreq, caller.READ_STATE)
+        kind = self.authorise(webreq, caller.READ_STATE)
         await self.wait_resolved(STARTUP_WAIT)
-        return self.public_state()
+        state = self.public_state()
+        if caller.withholds_link_secrets(kind, self.is_complete()):
+            # KAN-429: a remote read gets remote.link without code and url.
+            state = caller.without_link_secrets(state)
+        return state
 
     async def _handle_options(self, webreq: WebRequest) -> Dict[str, Any]:
         self.authorise(webreq, caller.READ)

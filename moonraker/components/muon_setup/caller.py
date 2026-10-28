@@ -70,11 +70,23 @@ PROTECTED_KINDS = frozenset({HOTSPOT, LAN})
 
 
 def caller_kind(webreq: WebRequest) -> str:
-    transport = webreq.get_subscribable()
+    return _kind(
+        webreq.get_subscribable(), webreq.get_current_user(),
+        webreq.get_ip_address())
+
+
+def connection_kind(connection: Any) -> str:
+    """caller_kind() for a websocket (or other remote) connection, from the
+    same three things: its transport type, its user and its address. Used to
+    filter what each connection is sent (KAN-429)."""
+    return _kind(
+        connection, getattr(connection, "user_info", None),
+        getattr(connection, "ip_addr", None))
+
+
+def _kind(transport: Any, user: Any, ip: Any) -> str:
     if getattr(transport, "transport_type", None) == TransportType.INTERNAL:
         return INTERNAL
-    user = webreq.get_current_user()
-    ip = webreq.get_ip_address()
     if user is not None and getattr(user, "source", None) == GATEWAY_USER_SOURCE:
         # The user is muon_gateway's: its one-shot token came over the uid-0
         # socket and is bound to the address muon-link asked for, so a token
@@ -139,6 +151,77 @@ def refuse_if_protected(kind: str, state: str) -> None:
         and muon_floor.protection_level() == muon_floor.LEVEL_PROTECTED
     ):
         raise ServerError("muon_setup: protected", 403)
+
+
+# --------------------------------------------------------------------------
+# KAN-429 (MR-5): the link code is not for remote readers.
+#
+# 02 §5.9 mirrors muon-link's LinkPhase into `steps.remote.link`, `code` and
+# `url` included: the hotspot phone, the LAN page and the panel show them,
+# and LINK-4 exists so the customer never has to type the code. Rule S5 also
+# lets a `remote` caller (the Iroh gateway) read setup state. It has no use
+# for a claimable code, and a read-only grant must not carry one, so a reader
+# with remote rights gets `remote.link` without them. Everything else in the
+# state, `phase` and `expires_at` included, is unchanged.
+# --------------------------------------------------------------------------
+
+LINK_SECRETS = ("code", "url")
+#: The notification muon_setup sends its state on (__init__.py).
+CHANGED_NOTIFICATION = "muon_setup_changed"
+
+
+def withholds_link_secrets(kind: str, complete: bool) -> bool:
+    """Whether this caller gets `remote.link` without code and url: every
+    caller with remote rights, so `bluetooth` too once setup is complete.
+    Pass `complete=True` when the state is not known: the narrower side."""
+    return rights_of(kind, complete) == REMOTE
+
+
+def without_link_secrets(state: Any) -> Any:
+    """`state` with `steps.remote.link`'s code and url removed.
+
+    Never changes `state` itself, which may be the one payload every
+    connection is sent: it copies only the dicts on the path it changes,
+    and returns `state` unchanged when there is nothing to remove.
+    """
+    if not isinstance(state, dict):
+        return state
+    steps = state.get("steps")
+    remote = steps.get("remote") if isinstance(steps, dict) else None
+    link = remote.get("link") if isinstance(remote, dict) else None
+    if not isinstance(link, dict) or not any(k in link for k in LINK_SECRETS):
+        return state
+    out = dict(state)
+    out_steps = dict(steps)  # type: ignore[arg-type]
+    out_remote = dict(remote)  # type: ignore[arg-type]
+    out_remote["link"] = {
+        k: v for k, v in link.items() if k not in LINK_SECRETS}
+    out_steps["remote"] = out_remote
+    out["steps"] = out_steps
+    return out
+
+
+def filter_changed_notification(data: Any, connection: Any) -> Any:
+    """muon_setup_changed as one connection may be sent it.
+
+    Registered with muon_access_policy.register_notification_filter, which
+    websockets.notify_clients runs for every connection. The payload is
+    `[state]`. Whether setup is complete comes from that state: anything but
+    an explicit "new" or "in_progress" counts as complete, the narrower side
+    for a `bluetooth` connection, as is_complete() does for a request.
+    """
+    if not isinstance(data, (list, tuple)) or not data:
+        return data
+    state = data[0]
+    if not isinstance(state, dict):
+        return data
+    complete = state.get("state") not in ("new", "in_progress")
+    if not withholds_link_secrets(connection_kind(connection), complete):
+        return data
+    trimmed = without_link_secrets(state)
+    if trimmed is state:
+        return data
+    return [trimmed, *data[1:]]
 
 
 # --------------------------------------------------------------------------
