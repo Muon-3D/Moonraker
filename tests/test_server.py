@@ -72,9 +72,9 @@ async def test_file_logger(base_server: Server,
     assert log_path is not None and log_path.exists()
 
 def test_signal_handler(base_server: Server,
-                        event_loop: asyncio.AbstractEventLoop):
+                        class_loop: asyncio.AbstractEventLoop):
     base_server._handle_term_signal()
-    event_loop.run_forever()
+    class_loop.run_forever()
     assert base_server.exit_reason == "terminate"
 
 class TestInstantiation:
@@ -359,7 +359,7 @@ async def test_register_remote_method_running(full_server: Server):
         full_server.register_remote_method(
             "moonraker_test", lambda: None)
 
-@pytest.mark.usefixtures("event_loop")
+@pytest.mark.usefixtures("class_loop")
 def test_main(path_args: Dict[str, pathlib.Path],
               monkeypatch: pytest.MonkeyPatch,
               caplog: pytest.LogCaptureFixture):
@@ -398,7 +398,7 @@ def test_main_config_error(path_args: Dict[str, pathlib.Path],
 
 @pytest.mark.run_paths(moonraker_conf="invalid_config.conf",
                        moonraker_bkp=".moonraker.conf.bkp")
-@pytest.mark.usefixtures("event_loop")
+@pytest.mark.usefixtures("class_loop")
 def test_main_restore_config(path_args: Dict[str, pathlib.Path],
                              monkeypatch: pytest.MonkeyPatch,
                              caplog: pytest.LogCaptureFixture):
@@ -485,7 +485,7 @@ class TestEndpoints:
 
 def test_server_restart(base_server: Server,
                         http_client: HttpClient,
-                        event_loop: asyncio.AbstractEventLoop):
+                        class_loop: asyncio.AbstractEventLoop):
     result = {}
 
     async def do_restart():
@@ -493,14 +493,14 @@ def test_server_restart(base_server: Server,
         await base_server.start_server()
         ret = await http_client.post("/server/restart")
         result.update(ret)
-    event_loop.create_task(do_restart())
-    event_loop.run_forever()
+    class_loop.create_task(do_restart())
+    class_loop.run_forever()
     assert result["result"] == "ok" and base_server.exit_reason == "restart"
 
 @pytest.mark.no_ws_connect
 def test_websocket_restart(base_server: Server,
                            websocket_client: WebsocketClient,
-                           event_loop: asyncio.AbstractEventLoop):
+                           class_loop: asyncio.AbstractEventLoop):
     result = {}
 
     async def do_restart():
@@ -509,8 +509,8 @@ def test_websocket_restart(base_server: Server,
         await websocket_client.connect()
         ret = await websocket_client.request("server.restart")
         result["result"] = ret
-    event_loop.create_task(do_restart())
-    event_loop.run_forever()
+    class_loop.create_task(do_restart())
+    class_loop.run_forever()
     assert result["result"] == "ok" and base_server.exit_reason == "restart"
 
 

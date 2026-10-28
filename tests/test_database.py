@@ -151,12 +151,12 @@ class TestInstantiation:
     @pytest.fixture(scope="class")
     def db(self,
            base_server: Server,
-           event_loop: asyncio.AbstractEventLoop
+           class_loop: asyncio.AbstractEventLoop
            ) -> Iterator[MoonrakerDatabase]:
         db: MoonrakerDatabase
         db = base_server.load_component(base_server.config, "database")
         yield db
-        event_loop.run_until_complete(db.close())
+        class_loop.run_until_complete(db.close())
 
     def test_initial_state(self, db: MoonrakerDatabase):
         mrdb = db.get_item("moonraker").result()
@@ -191,13 +191,13 @@ class TestCoreServerLoaded:
     @pytest.fixture(scope="class")
     def db(self,
            base_server: Server,
-           event_loop: asyncio.AbstractEventLoop
+           class_loop: asyncio.AbstractEventLoop
            ) -> Iterator[MoonrakerDatabase]:
         base_server.load_components()
         db: MoonrakerDatabase
         db = base_server.lookup_component("database")
         yield db
-        event_loop.run_until_complete(
+        class_loop.run_until_complete(
             base_server._stop_server("terminate"))
 
     def test_core_state(self, db: MoonrakerDatabase):

@@ -65,12 +65,14 @@ def ssl_certs() -> Iterator[Dict[str, pathlib.Path]]:
 # Server cannot even be built outside a running loop. Instead, pytest-asyncio
 # owns one loop per class (`loop_scope="class"` on these fixtures, and
 # `@pytest.mark.asyncio(loop_scope="class")` on the suites' async tests), and
-# `event_loop` is that loop: an async fixture run
-# on it that hands back the running loop. Between tests it is not running, so
-# the sync fixtures and tests that drive it with run_until_complete and
-# run_forever still can.
+# `class_loop` is that loop: an async fixture run on it that hands back the
+# running loop. Between tests it is not running, so the sync fixtures and
+# tests that drive it with run_until_complete and run_forever still can.
+# Not named `event_loop`: before 1.0 that name is pytest-asyncio's own, and a
+# class-scoped test reaching it is a collection error. pytest.ini therefore
+# requires pytest-asyncio>=1.0.
 @pytest_asyncio.fixture(scope="class", loop_scope="class")
-async def event_loop() -> asyncio.AbstractEventLoop:
+async def class_loop() -> asyncio.AbstractEventLoop:
     return asyncio.get_running_loop()
 
 
@@ -246,10 +248,10 @@ def app_args(path_args: Dict[str, Any]) -> Dict[str, Any]:
 
 @pytest.fixture(scope="class")
 def base_server(path_args: Dict[str, pathlib.Path],
-                event_loop: asyncio.AbstractEventLoop
+                class_loop: asyncio.AbstractEventLoop
                 ) -> Iterator[Server]:
     # EventLoop() binds to the running loop, so build it on the class loop.
-    evtloop = event_loop.run_until_complete(_new_event_loop())
+    evtloop = class_loop.run_until_complete(_new_event_loop())
     args = app_args(path_args)
     # LogManager replaces every root handler with its own queue handler.
     # Put pytest's capture handlers back beside it, and take its handler
