@@ -95,7 +95,7 @@ TEST_OVERWRITE = {
     "oses": TEST_RECORD
 }
 
-@pytest_asyncio.fixture(scope="class")
+@pytest_asyncio.fixture(scope="class", loop_scope="class")
 async def base_db(base_server: Server) -> AsyncIterator[MoonrakerDatabase]:
     db: MoonrakerDatabase = base_server.load_component(
         base_server.config, "database")
@@ -105,7 +105,7 @@ async def base_db(base_server: Server) -> AsyncIterator[MoonrakerDatabase]:
     yield db
     await db.close()
 
-@pytest_asyncio.fixture(scope="class")
+@pytest_asyncio.fixture(scope="class", loop_scope="class")
 async def running_db(base_server: Server) -> AsyncIterator[MoonrakerDatabase]:
     base_server.load_components()
     db: MoonrakerDatabase = base_server.lookup_component("database")
@@ -135,13 +135,13 @@ def check_future(fut: asyncio.Future,
         pytest.fail("Future not ready before server start")
     return fut.result()
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="class")
 class BaseTest:
     @pytest.fixture(scope="class")
     def db(self, base_db):
         return base_db
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="class")
 class ThreadedTest:
     @pytest.fixture(scope="class")
     def db(self, running_db):
@@ -151,12 +151,12 @@ class TestInstantiation:
     @pytest.fixture(scope="class")
     def db(self,
            base_server: Server,
-           event_loop: asyncio.AbstractEventLoop
+           class_loop: asyncio.AbstractEventLoop
            ) -> Iterator[MoonrakerDatabase]:
         db: MoonrakerDatabase
         db = base_server.load_component(base_server.config, "database")
         yield db
-        event_loop.run_until_complete(db.close())
+        class_loop.run_until_complete(db.close())
 
     def test_initial_state(self, db: MoonrakerDatabase):
         mrdb = db.get_item("moonraker").result()
@@ -191,13 +191,13 @@ class TestCoreServerLoaded:
     @pytest.fixture(scope="class")
     def db(self,
            base_server: Server,
-           event_loop: asyncio.AbstractEventLoop
+           class_loop: asyncio.AbstractEventLoop
            ) -> Iterator[MoonrakerDatabase]:
         base_server.load_components()
         db: MoonrakerDatabase
         db = base_server.lookup_component("database")
         yield db
-        event_loop.run_until_complete(
+        class_loop.run_until_complete(
             base_server._stop_server("terminate"))
 
     def test_core_state(self, db: MoonrakerDatabase):
@@ -932,9 +932,9 @@ class WrapperTest(BaseTest):
         parse = not request.cls.__name__.endswith("NoParse")
         return db.wrap_namespace("planets", parse_keys=parse)
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="class")
 class WrapperTestThreaded:
-    @pytest_asyncio.fixture(scope="class")
+    @pytest_asyncio.fixture(scope="class", loop_scope="class")
     async def wrapped(self,
                       request: pytest.FixtureRequest,
                       base_server: Server
@@ -1231,7 +1231,7 @@ def endpoint_result(req_args: Dict[str, Any], expected: Any) -> Dict[str, Any]:
         "value": expected
     }
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="class")
 class EndpointTest:
     @pytest_asyncio.fixture(scope="class", autouse=True)
     async def server(self, base_server: Server) -> AsyncIterator[Server]:

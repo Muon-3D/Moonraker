@@ -51,7 +51,7 @@ def test_config_and_log_warnings(path_args: Dict[str, pathlib.Path]):
     assert server.warnings == expected
 
 @pytest.mark.run_paths(moonraker_conf="unparsed_server.conf")
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="class")
 async def test_unparsed_config_items(full_server: Server):
     expected_warnings = [
         "Unparsed config section [machine unparsed] detected.",
@@ -65,16 +65,16 @@ async def test_unparsed_config_items(full_server: Server):
     assert warn_cnt == 2
 
 @pytest.mark.run_paths(moonraker_log="moonraker.log")
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="class")
 async def test_file_logger(base_server: Server,
                            path_args: Dict[str, pathlib.Path]):
     log_path = path_args.get("moonraker.log", None)
     assert log_path is not None and log_path.exists()
 
 def test_signal_handler(base_server: Server,
-                        event_loop: asyncio.AbstractEventLoop):
+                        class_loop: asyncio.AbstractEventLoop):
     base_server._handle_term_signal()
-    event_loop.run_forever()
+    class_loop.run_forever()
     assert base_server.exit_reason == "terminate"
 
 class TestInstantiation:
@@ -130,7 +130,7 @@ class TestInstantiation:
         app = base_server.moonraker_app
         assert "/server/info" in app.api_cache
 
-    @pytest.mark.asyncio
+    @pytest.mark.asyncio(loop_scope="class")
     async def test_notification(self, base_server: Server):
         base_server.register_notification("test:test_event")
         fut = base_server.event_loop.create_future()
@@ -186,7 +186,7 @@ class TestLoadComponent:
         ]
 
 class TestCoreServer:
-    @pytest_asyncio.fixture(scope="class")
+    @pytest_asyncio.fixture(scope="class", loop_scope="class")
     async def core_server(self, base_server: Server) -> AsyncIterator[Server]:
         base_server.load_components()
         yield base_server
@@ -262,7 +262,7 @@ class TestServerInit:
         assert cfg.is_file()
 
 class TestServerStart:
-    @pytest_asyncio.fixture(scope="class")
+    @pytest_asyncio.fixture(scope="class", loop_scope="class")
     async def server(self, full_server: Server) -> Server:
         await full_server.start_server(connect_to_klippy=False)
         return full_server
@@ -279,7 +279,7 @@ class TestServerStart:
 
 @pytest.mark.run_paths(moonraker_conf="base_server_ssl.conf")
 class TestSecureServerStart:
-    @pytest_asyncio.fixture(scope="class")
+    @pytest_asyncio.fixture(scope="class", loop_scope="class")
     async def server(self, full_server: Server) -> Server:
         await full_server.start_server(connect_to_klippy=False)
         return full_server
@@ -294,13 +294,13 @@ class TestSecureServerStart:
             app.secure_server is not None
         )
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="class")
 async def test_component_init_error(base_server: Server):
     base_server.register_component("testcomp", MockComponent(err_init=True))
     await base_server.server_init(False)
     assert "testcomp" in base_server.failed_components
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="class")
 async def test_component_exit_error(base_server: Server,
                                     caplog: pytest.LogCaptureFixture):
     base_server.register_component("testcomp", MockComponent(err_exit=True))
@@ -308,7 +308,7 @@ async def test_component_exit_error(base_server: Server,
     expected = "Error executing 'on_exit()' for component: testcomp"
     assert expected in caplog.messages
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="class")
 async def test_component_close_error(base_server: Server,
                                      caplog: pytest.LogCaptureFixture):
     base_server.register_component("testcomp", MockComponent(err_close=True))
@@ -328,7 +328,7 @@ def test_register_async_event(base_server: Server):
     base_server.register_event_handler("test:my_test", test_func)
     assert base_server.events["test:my_test"] == [test_func]
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="class")
 async def test_send_event(full_server: Server):
     evtloop = full_server.get_event_loop()
     fut = evtloop.create_future()
@@ -340,7 +340,7 @@ async def test_send_event(full_server: Server):
     result = await fut
     assert result == "test"
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="class")
 async def test_send_async_event(full_server: Server):
     evtloop = full_server.get_event_loop()
     fut = evtloop.create_future()
@@ -352,14 +352,14 @@ async def test_send_async_event(full_server: Server):
     result = await fut
     assert result == "test"
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="class")
 async def test_register_remote_method_running(full_server: Server):
     await full_server.start_server(connect_to_klippy=False)
     with pytest.raises(ServerError):
         full_server.register_remote_method(
             "moonraker_test", lambda: None)
 
-@pytest.mark.usefixtures("event_loop")
+@pytest.mark.usefixtures("class_loop")
 def test_main(path_args: Dict[str, pathlib.Path],
               monkeypatch: pytest.MonkeyPatch,
               caplog: pytest.LogCaptureFixture):
@@ -398,7 +398,7 @@ def test_main_config_error(path_args: Dict[str, pathlib.Path],
 
 @pytest.mark.run_paths(moonraker_conf="invalid_config.conf",
                        moonraker_bkp=".moonraker.conf.bkp")
-@pytest.mark.usefixtures("event_loop")
+@pytest.mark.usefixtures("class_loop")
 def test_main_restore_config(path_args: Dict[str, pathlib.Path],
                              monkeypatch: pytest.MonkeyPatch,
                              caplog: pytest.LogCaptureFixture):
@@ -420,12 +420,12 @@ def test_main_restore_config(path_args: Dict[str, pathlib.Path],
     )
 
 class TestEndpoints:
-    @pytest_asyncio.fixture(scope="class")
+    @pytest_asyncio.fixture(scope="class", loop_scope="class")
     async def server(self, full_server: Server):
         await full_server.start_server()
         yield full_server
 
-    @pytest.mark.asyncio
+    @pytest.mark.asyncio(loop_scope="class")
     async def test_http_server_info(self,
                                     server: Server,
                                     http_client: HttpClient):
@@ -446,7 +446,7 @@ class TestEndpoints:
         }
         assert ret["result"] == expected
 
-    @pytest.mark.asyncio
+    @pytest.mark.asyncio(loop_scope="class")
     async def test_http_server_config(self,
                                       server: Server,
                                       http_client: HttpClient):
@@ -454,7 +454,7 @@ class TestEndpoints:
         ret = await http_client.get("/server/config")
         assert ret["result"]["config"] == cfg
 
-    @pytest.mark.asyncio
+    @pytest.mark.asyncio(loop_scope="class")
     async def test_websocket_server_info(self,
                                          server: Server,
                                          websocket_client: WebsocketClient):
@@ -475,7 +475,7 @@ class TestEndpoints:
         }
         assert ret == expected
 
-    @pytest.mark.asyncio
+    @pytest.mark.asyncio(loop_scope="class")
     async def test_websocket_server_config(self,
                                            server: Server,
                                            websocket_client: WebsocketClient):
@@ -485,7 +485,7 @@ class TestEndpoints:
 
 def test_server_restart(base_server: Server,
                         http_client: HttpClient,
-                        event_loop: asyncio.AbstractEventLoop):
+                        class_loop: asyncio.AbstractEventLoop):
     result = {}
 
     async def do_restart():
@@ -493,14 +493,14 @@ def test_server_restart(base_server: Server,
         await base_server.start_server()
         ret = await http_client.post("/server/restart")
         result.update(ret)
-    event_loop.create_task(do_restart())
-    event_loop.run_forever()
+    class_loop.create_task(do_restart())
+    class_loop.run_forever()
     assert result["result"] == "ok" and base_server.exit_reason == "restart"
 
 @pytest.mark.no_ws_connect
 def test_websocket_restart(base_server: Server,
                            websocket_client: WebsocketClient,
-                           event_loop: asyncio.AbstractEventLoop):
+                           class_loop: asyncio.AbstractEventLoop):
     result = {}
 
     async def do_restart():
@@ -509,8 +509,8 @@ def test_websocket_restart(base_server: Server,
         await websocket_client.connect()
         ret = await websocket_client.request("server.restart")
         result["result"] = ret
-    event_loop.create_task(do_restart())
-    event_loop.run_forever()
+    class_loop.create_task(do_restart())
+    class_loop.run_forever()
     assert result["result"] == "ok" and base_server.exit_reason == "restart"
 
 

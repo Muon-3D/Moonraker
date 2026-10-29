@@ -64,7 +64,9 @@ import dataclasses
 import ipaddress
 import posixpath
 import re
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, Union
+from typing import (
+    Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple, Union
+)
 
 from . import muon_floor
 from .utils.exceptions import ServerError
@@ -966,7 +968,28 @@ async def prepare_file_operation(web_request: Any, args: Mapping[str, Any]) -> N
         await _files.prepare_operation(web_request.get_endpoint(), args, principal)
 
 
+#: KAN-429: filters other components register for one notification name.
+#: Each takes (data, connection) and returns what that connection is sent,
+#: or None to send it nothing. They run whether or not muon_access is loaded:
+#: muon_setup's withholds the link code from a remote connection, which has
+#: nothing to do with the access table.
+NotificationFilter = Callable[[Any, Any], Any]
+_notification_filters: Dict[str, NotificationFilter] = {}
+
+
+def register_notification_filter(name: str, func: NotificationFilter) -> None:
+    """Run `func` on notification `name` for every connection. One filter
+    per name; registering again replaces it, so a component that is built
+    twice (a restart, a test) does not stack copies."""
+    _notification_filters[name] = func
+
+
 def filter_notification(name: str, data: Any, connection: Any) -> Any:
+    extra = _notification_filters.get(name)
+    if extra is not None:
+        data = extra(data, connection)
+        if data is None:
+            return None
     current = _state
     if (
         current is not None
