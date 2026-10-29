@@ -478,10 +478,25 @@ def _status_line_reason(status_code: int, message: str) -> str:
             return line
     return tornado.httputil.responses.get(status_code, "Unknown")
 
+def _error_message(
+    req_hdlr: tornado.web.RequestHandler, exc_info: Any
+) -> str:
+    # MUON (KAN-113): the message comes from the HTTPError that carried it,
+    # not from _reason. Since Tornado 6.5.3, send_error's set_status replaces
+    # a reason it will not put on a status line (CR or LF, "<", ...) with
+    # "Unknown" before write_error runs, so _reason no longer holds a macro's
+    # multi-line error, and the JSON body lost it with the status line. On
+    # earlier Tornado both are the same string.
+    if exc_info is not None:
+        exc = exc_info[1]
+        if isinstance(exc, tornado.web.HTTPError) and exc.reason:
+            return exc.reason
+    return req_hdlr._reason
+
 def _write_json_error(
     req_hdlr: tornado.web.RequestHandler, status_code: int, **kwargs
 ) -> None:
-    message: str = req_hdlr._reason
+    message = _error_message(req_hdlr, kwargs.get('exc_info'))
     err: Dict[str, Any] = {'code': status_code, 'message': message}
     if 'exc_info' in kwargs:
         err['traceback'] = "\n".join(

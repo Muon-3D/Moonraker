@@ -89,6 +89,16 @@ class MacroRefusalResponseTests(AsyncHTTPTestCase):
         self.assertEqual(response.reason, "refused")
         self.assertEqual(json.loads(response.body)["error"]["message"], message)
 
+    def test_markup_in_a_refusal_keeps_its_body(self) -> None:
+        # KAN-113: Tornado 6.5.3 and later put "Unknown" on the status line
+        # for a reason holding "<"; earlier releases keep it. Either way the
+        # JSON body must carry the message whole.
+        message = "Refused: <redacted> is not a file"
+        response = self._refuse(message)
+        self.assertEqual(response.code, 400)
+        self.assertIn(response.reason, (message, "Unknown"))
+        self.assertEqual(json.loads(response.body)["error"]["message"], message)
+
     def test_short_refusal_is_unchanged(self) -> None:
         message = "Fan fault not cleared: heatsink is still at 27.0C (15C or more)."
         response = self._refuse(message)
