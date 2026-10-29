@@ -133,6 +133,16 @@ force_logins: true
 # Fluidd moves to the new name only after printers admit it, which needs this
 # entry baked into an image first.
 #
+# `https://slicer.muon3d.com` is the hosted Muon3D Slicer (KAN-541). It sends a
+# sliced plate to an M1 on the same network by the printer's `.local` name, and
+# reads the printer's state the same way, so it needs this entry for both the
+# HTTP API and the websocket. Unlike the lines around it, it admits https only:
+# the slicer cannot run over plain HTTP (it needs cross-origin isolation, which
+# a browser grants only to a secure page), and an `http://` page using that name
+# is one any network in the path can serve by answering DNS for it. The slicer
+# prints and never starts an account link, so muon_link's CONSOLE_ORIGINS
+# deliberately does not list it.
+#
 # The two localhost entries are not wildcards and are not reachable from the
 # network -- a page can only be served from them by a process already on the
 # device -- so they stay: :100 is the panel's own vhost, :5173 the MuonUI dev
@@ -141,6 +151,7 @@ cors_domains:
     *://*.local
     *://control.muon3d.com
     *://app.muon3d.com
+    https://slicer.muon3d.com
     *://localhost:100 #Access for MuonUI Local Service
     *://localhost:5173 #Acces for MuonUI Dev Server
 trusted_clients:
