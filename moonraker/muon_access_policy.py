@@ -29,8 +29,9 @@
 #   * a paired client through the gateway: the one-shot token muon_gateway
 #     minted carries the principal, its level, its role and whether its path is
 #     on the home network. A token from a muon-link that sends none of those is
-#     the gateway as it was before this component: admin and Operator, so that
-#     muon-link's own policy stays the only limit, exactly as today.
+#     the least there is (KAN-877): a signed-out guest with a Viewer's role,
+#     off the home network and unidentified. It used to be admin and Operator;
+#     muon-link must now name the principal for every session it forwards.
 #   * a browser on the LAN or the hotspot signed in with the printer password
 #     (Moonraker#32): a signed-out guest with Operator (access-model 6). The
 #     password works only from home (ACC-16), so the same login arriving
@@ -443,8 +444,14 @@ def _gateway_principal(user: Any) -> Principal:
     )
     home = getattr(user, "access_home", False) is True
     if level_name is None and role is None:
-        # A muon-link that sends no principal: the gateway as it was.
-        return Principal("gateway", name, ADMIN, OPERATOR, home, True)
+        # KAN-877: a muon-link that sends no principal is nobody in
+        # particular, so it fails closed to the least there is: a signed-out
+        # guest with a Viewer's role, off the home network, unidentified,
+        # whatever else the token carries. It never held an identity, so it
+        # is never given admin by omission.
+        return Principal(
+            "gateway", name, SIGNED_OUT_GUEST, VIEWER, False, False
+        )
     level = PRINCIPAL_LEVELS.get(level_name or "", SIGNED_OUT_GUEST)
     if role not in ROLES:
         role = VIEWER

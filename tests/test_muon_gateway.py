@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 from typing import Any, List, Tuple
 
+from moonraker import muon_access_policy
 from moonraker.components import muon_gateway
 from moonraker.components.muon_gateway import (
     MuonGateway, parse_request, parse_token_request,
@@ -246,6 +247,35 @@ class TokenHandlerTests(unittest.IsolatedAsyncioTestCase):
             b'{"client":"ab12","transport":"wifi"}\n')
         self.assertEqual(answer, {"error": "malformed"})
         self.assertEqual(server.authorization.issued, [])
+
+    async def test_a_network_request_naming_its_principal_keeps_it(self) -> None:
+        # KAN-877: the line muon-link has to send for a network session once
+        # a principal-less token stops meaning admin. Moonraker already reads
+        # it on the sentinel; this pins that, so the muon-link half only has
+        # to start sending it.
+        answer, server = await self._ask(
+            b'{"client":"ab12","principal":"device:abcd",'
+            b'"level":"admin","role":"operator"}\n')
+        self.assertIn("token", answer)
+        ((ip, user),) = server.authorization.issued
+        self.assertEqual(ip, SENTINEL)
+        p = muon_access_policy.resolve_principal(None, ip, user, "open")
+        assert p is not None
+        self.assertEqual((p.kind, p.level, p.role, p.identified),
+                         ("gateway", muon_access_policy.ADMIN, "operator", True))
+
+    async def test_a_network_request_naming_nobody_is_the_least_there_is(
+        self,
+    ) -> None:
+        # The line muon-link sends today for a network session (KAN-877).
+        answer, server = await self._ask(b'{"client":"ab12"}\n')
+        self.assertIn("token", answer)
+        ((ip, user),) = server.authorization.issued
+        p = muon_access_policy.resolve_principal(None, ip, user, "open")
+        assert p is not None
+        self.assertEqual(
+            (p.level, p.role, p.home, p.identified),
+            (muon_access_policy.SIGNED_OUT_GUEST, "viewer", False, False))
 
     async def test_another_uid_gets_no_bluetooth_token_either(self) -> None:
         answer, server = await self._ask(
