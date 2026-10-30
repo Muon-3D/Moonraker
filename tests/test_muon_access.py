@@ -64,6 +64,7 @@ STANDARD = {
     "print": "signed_in_guest",
     "files": "signed_in_guest",
     "motion": "member",
+    "heat": "member",
     "files_others": "admin",
     "console": "admin",
     "wifi": "member",
@@ -75,7 +76,8 @@ STANDARD = {
 }
 RELAXED = dict(
     STANDARD, print="signed_out_guest", files="signed_out_guest",
-    motion="signed_out_guest", files_others="member", console="member",
+    motion="signed_out_guest", heat="signed_out_guest",
+    files_others="member", console="member",
     wifi="signed_out_guest", rename="signed_in_guest",
 )
 STRICT = dict(
@@ -95,6 +97,7 @@ SAMPLES: Dict[str, Tuple[str, RequestType, Dict[str, Any]]] = {
     "files": ("/server/files/copy", RequestType.POST,
               {"source": "gcodes/a.gcode", "dest": "gcodes/b.gcode"}),
     "motion": ("gcode/script", RequestType.POST, {"script": "G28\nG1 X10 F600"}),
+    "heat": ("gcode/script", RequestType.POST, {"script": "M104 S200"}),
     "files_others": ("/server/files/delete_file", RequestType.DELETE,
                      {"path": "gcodes/a.gcode"}),
     "console": ("gcode/script", RequestType.POST,
@@ -589,6 +592,64 @@ class TestHomeOnly:
             assert refused(row, SENTINEL, admin_away) is None, row
         # printer.cfg stays home only (parity table)
         assert refused("config", SENTINEL, admin_away) is not None
+
+
+class TestTheHeatRow:
+    """KAN-878: heat is its own row, at motion's levels, so that a caller can
+    later be capped on heating apart from moving."""
+
+    def test_heater_targets_are_heat_and_moves_are_motion(self):
+        for script in ("M104 S200", "M109 S200", "M140 S60", "M190 S60",
+                       "SET_HEATER_TEMPERATURE HEATER=extruder TARGET=200",
+                       "TEMPERATURE_WAIT SENSOR=extruder MINIMUM=190"):
+            assert [a.name for a in policy.gcode_actions(script)] == [
+                "heat"], script
+        for script in ("G28", "G1 X10", "M106 S255", "TURN_OFF_HEATERS",
+                       "LOAD_FILAMENT"):
+            assert [a.name for a in policy.gcode_actions(script)] == [
+                "motion"], script
+
+    def test_a_script_that_moves_and_heats_needs_both_rows(self):
+        names = [a.name for a in policy.gcode_actions("G28\nM104 S200")]
+        assert names == ["motion", "heat"]
+
+    def test_heat_needs_what_motion_needs_on_every_printer(self):
+        # The split changes nothing by itself: same level, every preset,
+        # owner and entry.
+        for owner in policy.OWNERS:
+            for entry in policy.ENTRIES:
+                for preset in (None,) + policy.PRESETS:
+                    s = state(owner=owner, entry=entry, preset=preset)
+                    assert policy.required_level(
+                        policy.ACTIONS["heat"], s
+                    ) == policy.required_level(
+                        policy.ACTIONS["motion"], s
+                    ), (owner, entry, preset)
+
+    def test_a_motion_override_made_before_the_split_still_covers_heat(self):
+        s = state(owner=policy.OWNER_ORGANISATION,
+                  overrides={"motion": policy.ADMIN})
+        assert policy.effective_table(s)["heat"] == "admin"
+
+    def test_heat_can_be_set_apart_from_motion(self):
+        s = state(owner=policy.OWNER_ORGANISATION,
+                  overrides=policy.parse_overrides(
+                      {"motion": "signed_out_guest", "heat": "admin"}))
+        table = policy.effective_table(s)
+        assert (table["motion"], table["heat"]) == ("signed_out_guest", "admin")
+
+    def test_a_heat_override_leaves_motion_alone(self):
+        s = state(owner=policy.OWNER_ORGANISATION,
+                  overrides={"heat": policy.ADMIN})
+        assert policy.effective_table(s)["motion"] == "member"
+
+    def test_heat_capped_apart_from_motion_refuses_only_heat(self):
+        policy.set_state(state(
+            owner=policy.OWNER_ORGANISATION,
+            overrides={"motion": policy.MEMBER, "heat": policy.ADMIN}))
+        member = gateway("member", "operator")
+        assert refused("motion", SENTINEL, member) is None
+        assert refused("heat", SENTINEL, member) is not None
 
 
 class TestClassification:
