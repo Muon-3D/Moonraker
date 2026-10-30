@@ -66,9 +66,14 @@ def minted(fields: Dict[str, Any]) -> GatewayUser:
 
 
 OWNER_AWAY = minted({"principal": "device:owner-phone", "level": "admin",
-                     "role": "operator", "home": False})
+                     "role": "operator", "home": False, "owner": True})
 OWNER_AT_HOME = minted({"principal": "device:owner-laptop", "level": "admin",
-                        "role": "operator", "home": True})
+                        "role": "operator", "home": True, "owner": True})
+# A paired Operator: since muon-link#KAN-877 the same level and role as the
+# owner, without the owner flag.
+PAIRED_OPERATOR = minted({"principal": "device:friend-laptop",
+                          "level": "admin", "role": "operator",
+                          "home": False})
 MEMBER = minted({"principal": "acct:member", "level": "member",
                  "role": "operator", "home": False})
 # app.muon3d.com: a console grant, Operator, never the admin level (NET-11)
@@ -305,6 +310,7 @@ def test_a_lan_session_signed_in_as_the_owner_is_the_owner():
 
 @pytest.mark.parametrize("who, ip, user", [
     ("a member", SENTINEL, MEMBER),
+    ("a paired Operator at the admin level", SENTINEL, PAIRED_OPERATOR),
     ("app.muon3d.com's Operator session", SENTINEL, CONSOLE_OPERATOR),
     ("an Open guest", SENTINEL, OPEN_GUEST),
     ("an admin device with the Viewer role", SENTINEL, ADMIN_VIEWER),
@@ -344,7 +350,8 @@ def test_a_gateway_that_names_no_principal_is_not_the_owner():
 def test_a_gateway_user_carrying_a_bogus_principal_names_no_principal():
     user = GatewayUser("muon-link:ab12", "", source="muon_gateway",
                        principal="bad\r\nX-Injected: 1",
-                       access_level="admin", access_role="operator")
+                       access_level="admin", access_role="operator",
+                       access_owner=True)
 
     headers = aux_api_proxy.owner_headers(SENTINEL, user)
 
@@ -353,7 +360,8 @@ def test_a_gateway_user_carrying_a_bogus_principal_names_no_principal():
 
 def test_only_the_gateways_own_users_count():
     impostor = GatewayUser("muon-link:ab12", "", source="moonraker",
-                           access_level="admin", access_role="operator")
+                           access_level="admin", access_role="operator",
+                           access_owner=True)
 
     assert aux_api_proxy.owner_headers(SENTINEL, impostor) == {}
     assert aux_api_proxy.owner_headers(SENTINEL, None) == {}

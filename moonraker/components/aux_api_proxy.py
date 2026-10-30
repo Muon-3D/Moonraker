@@ -175,9 +175,14 @@ MAX_NAME_LENGTH = 32
 #
 # Who is the owner here: a request through muon-link's gateway (the sentinel
 # address and a token muon_gateway minted) whose token names the admin level
-# explicitly, with the Operator role. Admin is the level of the owner's
-# enrolled devices (ACC-20, ADR 0037), and no grant carries it (NET-11).
-# Nothing else is the owner:
+# explicitly, with the Operator role, and carries muon-link's owner flag.
+# Admin is the level of the owner's enrolled devices (ACC-20, ADR 0037), and
+# no grant carries it (NET-11). Nothing else is the owner:
+#
+#   * NOT an Operator's session. muon-link (KAN-877) names the admin level
+#     and the Operator role for Owner and Operator alike, so only the
+#     owner flag, which muon-link sends for an Owner alone, tells them
+#     apart (muon_gateway, THE PRINCIPAL).
 #
 #   * NOT a token that names no level. muon_access_policy._gateway_principal
 #     reads such a token as admin, so that a muon-link from before the
@@ -243,6 +248,8 @@ def owner_headers(ip_addr: Any, user: Any) -> Dict[str, str]:
     if getattr(user, "access_level", None) != OWNER_LEVEL:
         return {}
     if getattr(user, "access_role", None) != OWNER_ROLE:
+        return {}
+    if getattr(user, "access_owner", False) is not True:
         return {}
     headers = {OWNER_LEVEL_HEADER: OWNER_LEVEL}
     name = getattr(user, "principal", "") or getattr(user, "username", "")

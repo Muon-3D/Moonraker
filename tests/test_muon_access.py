@@ -726,7 +726,15 @@ class TestTheGatewayRequest:
             b'{"client":"ab","principal":"acct:sam","level":"member",'
             b'"role":"viewer","home":true}')
         assert fields == {"access_level": "member", "access_role": "viewer",
-                          "access_home": True, "principal": "acct:sam"}
+                          "access_home": True, "access_owner": False,
+                          "principal": "acct:sam"}
+
+    def test_the_owner_flag(self):
+        # KAN-547: muon-link sends it for an Owner only.
+        fields = parse_principal(
+            b'{"client":"ab","principal":"device:ab","level":"admin",'
+            b'"role":"operator","owner":true}')
+        assert fields["access_owner"] is True
 
     def test_none_is_the_gateway_as_it_was(self):
         assert parse_principal(b'{"client":"ab"}') == {}
@@ -740,6 +748,10 @@ class TestTheGatewayRequest:
         b'{"client":"ab","level":"member","role":"admin"}',
         b'{"client":"ab","level":"member","role":"viewer","home":"yes"}',
         b'{"client":"ab","level":"member","role":"viewer","principal":"a b"}',
+        b'{"client":"ab","owner":true}',
+        b'{"client":"ab","level":"admin","role":"operator","owner":"yes"}',
+        b'{"client":"ab","level":"member","role":"operator","owner":true}',
+        b'{"client":"ab","level":"admin","role":"viewer","owner":true}',
     ])
     def test_a_partial_or_wrong_principal_is_refused(self, body: bytes):
         with pytest.raises(ValueError):
