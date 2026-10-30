@@ -11,6 +11,8 @@
 #   * psk -- the Wi-Fi PSK that POST /server/muon/setup/network carries
 #     (07 S2), which the field list above does not cover.
 #   * reentry_token -- the token that lets a phone back into setup.
+#   * credentials, access_code -- what muon_bridge is handed for another
+#     printer: a Bambu access code, a PrusaLink user name and password.
 #
 # Matched by field name, case-insensitively, at any depth.
 
@@ -20,8 +22,10 @@ import json
 from typing import Any, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-SENSITIVE_FIELDS = frozenset(
-    ("signer_name", "password", "key", "psk", "reentry_token"))
+SENSITIVE_FIELDS = frozenset((
+    "signer_name", "password", "key", "psk", "reentry_token", "credentials",
+    "access_code",
+))
 REDACTED = "<redacted>"
 
 
