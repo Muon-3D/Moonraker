@@ -250,11 +250,18 @@ class TestConfirmOnThePrinter:
                     who=HOME) == {"status": "refused"}
 
     def test_requests_expire(self, monkeypatch):
+        now = [1000.0]
+        monkeypatch.setattr(muon_access_api.time, "time", lambda: now[0])
         _access, server = printer_for(CASES[4])
         rid = call(server, "request", {"ask": {"kind": "join"}},
                    who=HOME)["requestId"]
-        later = time.time() + muon_access_api.REQUEST_SECONDS + 1
-        monkeypatch.setattr(muon_access_api.time, "time", lambda: later)
+        # The contract promises two minutes.  Do not derive this boundary
+        # from REQUEST_SECONDS: doing so lets a broken production constant
+        # move both the behavior and this test's expectation together.
+        now[0] += 119
+        assert call(server, "request_status", {"request_id": rid},
+                    who=HOME) == {"status": "pending"}
+        now[0] += 2
         assert call(server, "request_status", {"request_id": rid},
                     who=HOME) == {"status": "expired"}
         with pytest.raises(ServerError):
