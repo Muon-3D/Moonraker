@@ -94,13 +94,26 @@ class FakeAux:
         self.calls.append((method, path, copy.deepcopy(body)))
         if self.down:
             raise ServerError(f"HTTP Request Error: {path}", 500)
-        if (method, path) not in self.routes:
+        route = self.routes.get((method, path))
+        if route is None:
+            # Query-string routes (GET /wifi/show?ssid=X, DELETE
+            # /wifi/forget?ssid=X) match on their path prefix.
+            base, _, query = path.partition("?")
+            route = self.routes.get((method, base))
+            if callable(route):
+                result = route(query if body is None else body)
+                if asyncio.iscoroutine(result):
+                    result = await result
+                return result
+        if route is None:
             raise ServerError("Not Found", 404)
-        route = self.routes[(method, path)]
         if isinstance(route, BaseException):
             raise route
         if callable(route):
-            return route(body)
+            result = route(body)
+            if asyncio.iscoroutine(result):
+                result = await result
+            return result
         return copy.deepcopy(route)
 
     async def get(self, path: str) -> Any:
@@ -145,6 +158,142 @@ class FakeAux:
         return await self.get_identity()
 
 
+class JoinScript:
+    """Scripted Aux Wi-Fi behaviour for a join (tests only).
+
+    `device_states` is the sequence GET /wifi/device/status walks through
+    while the connect "runs"; `connect_result` is what POST /wifi/connect
+    answers (a value, or an Exception to raise); `saved` is GET /wifi/saved's
+    profile names; `forgets` records DELETE /wifi/forget?ssid= calls.
+    """
+
+    def __init__(
+        self,
+        *,
+        device_states: Optional[List[str]] = None,
+        connect_result: Any = None,
+        saved: Optional[List[str]] = None,
+        uplink: Any = None,
+    ) -> None:
+        self.device_states = list(device_states or ["activated"])
+        self.connect_result = (
+            {"status": "connecting", "ssid": None} if connect_result is None
+            else connect_result)
+        self.saved = list(saved) if saved is not None else []
+        self.uplink = uplink
+        self.forgets: List[str] = []
+        self.shows: List[str] = []
+        self.disconnects: List[Any] = []
+        self.current_ssid: Optional[str] = None
+        self.device_reads = 0
+        self.connects: List[Any] = []
+
+    def routes(self) -> Dict[Tuple[str, str], Route]:
+        def dev_status(body: Any) -> Dict[str, Any]:
+            i = min(self.device_reads, len(self.device_states) - 1)
+            self.device_reads += 1
+            if self.device_states[i] == "activated" and self.connects:
+                self.current_ssid = self.connects[-1]["ssid"]
+            return {"device": "wlan0", "device_type": "wifi",
+                    "state": self.device_states[i], "connection": None,
+                    "user_disconnected": False}
+
+        def connect(body: Any) -> Any:
+            self.connects.append(copy.deepcopy(body))
+            if isinstance(self.connect_result, BaseException):
+                raise self.connect_result
+            answer = copy.deepcopy(self.connect_result)
+            if isinstance(answer, dict) and answer.get("ssid") is None:
+                answer["ssid"] = body.get("ssid")
+            return answer
+
+        def show(query: Any) -> Any:
+            from urllib.parse import parse_qsl
+            ssid = dict(parse_qsl(str(query))).get("ssid", "")
+            self.shows.append(ssid)
+            if ssid in self.saved:
+                return {"connection.id": ssid}
+            raise ServerError(
+                f"Connection profile '{ssid}' not found", 404)
+
+        def forget(query: Any) -> Dict[str, Any]:
+            from urllib.parse import parse_qsl
+            ssid = dict(parse_qsl(str(query))).get("ssid", "")
+            self.forgets.append(ssid)
+            return {"forgotten": ssid}
+
+        routes: Dict[Tuple[str, str], Route] = {
+            ("GET", "/wifi/device/status"): dev_status,
+            ("POST", "/wifi/connect"): connect,
+            ("GET", "/wifi/saved"): [
+                {"name": name} for name in self.saved],
+            ("GET", "/wifi/show"): show,
+            ("DELETE", "/wifi/forget"): forget,
+            ("GET", "/wifi/current"): (
+                lambda body: {"ssid": self.current_ssid}
+                if self.current_ssid else None),
+            ("POST", "/wifi/disconnect"): (
+                lambda body: self.disconnects.append(body)
+                or {"status": "disconnected"}),
+        }
+        if self.uplink is not None:
+            routes[("GET", "/wifi/uplink")] = self.uplink
+        return routes
+
+
+class FakeMuonLink:
+    """muon_link's Python API (status/start/cancel/call) for remote tests.
+
+    `phases` is a queue: each status() returns and consumes the head, or the
+    last phase once the queue runs dry. start() answers `connecting`, except
+    while a standing phase (offer/linked) is next — like muon_link turning a
+    409 into the current phase.
+    """
+
+    def __init__(self, phases: Optional[List[Any]] = None) -> None:
+        self.queue: List[Any] = list(phases or [])
+        self.last: Dict[str, Any] = {"phase": "unlinked"}
+        self.starts = 0
+        self.cancels = 0
+        self.status_calls = 0
+        self.down = False
+
+    async def status(self) -> Dict[str, Any]:
+        await asyncio.sleep(0)
+        self.status_calls += 1
+        if self.down:
+            raise ServerError("muon-link is not answering", 503)
+        if self.queue:
+            self.last = self.queue.pop(0)
+        return copy.deepcopy(self.last)
+
+    async def start(self) -> Dict[str, Any]:
+        await asyncio.sleep(0)
+        if self.down:
+            raise ServerError("muon-link is not answering", 503)
+        self.starts += 1
+        # muon_link's 409 translation: a refused start during a standing
+        # phase (offer, or once linked) answers with that phase.
+        peek = self.queue[0] if self.queue else self.last
+        if isinstance(peek, dict) and peek.get("phase") in ("offer", "linked"):
+            if self.queue:
+                self.last = self.queue.pop(0)
+            return copy.deepcopy(self.last)
+        return {"phase": "connecting"}
+
+    async def cancel(self) -> Dict[str, Any]:
+        await asyncio.sleep(0)
+        self.cancels += 1
+        self.queue.clear()
+        self.last = {"phase": "unlinked"}
+        return dict(self.last)
+
+    async def call(self, method: str, path: str) -> Dict[str, Any]:
+        if (method, path) == ("GET", "/link"):
+            return await self.status()
+        raise ServerError(f"{method} {path} is not forwarded", 403)
+
+
 class FakeInternalTransport:
     def __init__(self, methods: Optional[Dict[str, Callable[..., Any]]] = None):
         self.methods = dict(methods or {})
@@ -169,12 +318,19 @@ class FakeInternalTransport:
 class FakeMachine:
     def __init__(self, addresses: Optional[List[str]] = None):
         self.addresses = list(addresses or ["192.168.1.37"])
+        #: eth0's IPv4, or None for "no ethernet address".
+        self.eth0: Optional[str] = None
 
     def get_system_info(self) -> Dict[str, Any]:
-        return {"network": {"wlan0": {"ip_addresses": [
+        network: Dict[str, Any] = {"wlan0": {"ip_addresses": [
             {"family": "ipv4", "address": a, "is_link_local": False}
             for a in self.addresses
-        ]}}}
+        ]}}
+        if self.eth0:
+            network["eth0"] = {"ip_addresses": [
+                {"family": "ipv4", "address": self.eth0,
+                 "is_link_local": False}]}
+        return {"network": network}
 
 
 class FakeServer:
@@ -254,6 +410,8 @@ PANEL_IP = ipaddress.ip_address("127.0.0.1")
 HOTSPOT_IP = ipaddress.ip_address("10.42.0.23")
 LAN_IP = ipaddress.ip_address("192.168.1.50")
 GATEWAY_IP = ipaddress.ip_address("192.0.2.1")
+#: KAN-436: muon-link's address for a connection that started on Bluetooth.
+BLUETOOTH_IP = ipaddress.ip_address("192.0.2.2")
 OTHER_IP = ipaddress.ip_address("203.0.113.9")
 
 
@@ -289,10 +447,18 @@ def request(
     headers: Optional[Dict[str, str]] = GOOD_HEADERS,
     websocket: bool = False,
     method: str = "POST",
+    ble_code: Optional[str] = None,
+    response_sent: Optional[Any] = None,
 ) -> WebRequest:
-    """A WebRequest as Moonraker would build it for this kind of caller."""
+    """A WebRequest as Moonraker would build it for this kind of caller.
+
+    `ble_code` adds the `X-Muon-Ble-Code` header muon-link's gateway sends on
+    a Bluetooth connection (ADR 0032 D7), to whatever kind of caller this is.
+    """
     rtype = RequestType.POST if method == "POST" else RequestType.GET
     transport: Any = None
+    if ble_code is not None:
+        headers = dict(headers or {}, **{"X-Muon-Ble-Code": ble_code})
     http_headers: Optional[Dict[str, str]] = dict(headers) if headers else None
     if kind == "internal":
         return WebRequest(endpoint, dict(args or {}), rtype,
@@ -305,12 +471,13 @@ def request(
         "hotspot": (HOTSPOT_IP, user(["network"])),
         "lan": (LAN_IP, user(["network"])),
         "remote": (GATEWAY_IP, user(["network"], source="muon_gateway")),
+        "bluetooth": (BLUETOOTH_IP, user(["network"], source="muon_gateway")),
         "other": (OTHER_IP, None),
     }[kind]
     if kind == "panel" and headers is GOOD_HEADERS:
         http_headers = {"Host": "localhost", "Content-Type": "application/json"}
     return WebRequest(endpoint, dict(args or {}), rtype, transport, ip, usr,
-                      http_headers)
+                      http_headers, response_sent)
 
 
 # --------------------------------------------------------------------------
@@ -403,6 +570,13 @@ class Harness:
         opts = {"ready_manifest": "/nonexistent/ready.json"}
         opts.update(options or {})
         self.setup = MuonSetup(FakeConfig(self.server, opts))  # type: ignore[arg-type]
+        #: Shorten join + poll timings in tests without touching production
+        #: defaults.
+        self.setup.join_timeout = 2.0
+
+    def with_muon_link(self, link: "FakeMuonLink") -> "Harness":
+        self.server.components["muon_link"] = link
+        return self
 
     async def start(self) -> "Harness":
         await self.setup._startup(poll=False)
@@ -449,7 +623,7 @@ def state_with(**steps: Dict[str, Any]) -> Dict[str, Any]:
 
 
 __all__ = [
-    "FakeAux", "FakeDatabase", "FakeServer", "Harness", "IDENTITY",
-    "REGION_174", "REGION_OPTIONS_174", "fresh_aux", "muon_setup_pkg",
-    "request", "run", "state_with",
+    "FakeAux", "FakeDatabase", "FakeMuonLink", "FakeServer", "Harness",
+    "IDENTITY", "JoinScript", "REGION_174", "REGION_OPTIONS_174",
+    "fresh_aux", "muon_setup_pkg", "request", "run", "state_with",
 ]

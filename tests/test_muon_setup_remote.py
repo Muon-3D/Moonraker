@@ -1,0 +1,554 @@
+"""MR-5: POST /remote {mode}, the link-phase poller, and remote/cancel.
+
+02 §5.9 + §8 test 12. FakeMuonLink stands in for the muon_link component;
+remote.POLL_SECONDS is shortened so the two-second poll runs at test pace.
+"""
+from __future__ import annotations
+
+import asyncio
+from typing import Any, Dict, Optional
+
+import pytest
+
+from moonraker.components.muon_setup import remote
+
+from muon_setup_fakes import (
+    FakeAux, FakeMuonLink, Harness, fresh_aux, run, state_with)
+
+
+def cloud_state() -> Dict[str, Any]:
+    """Cursor on `remote`, network measured internet, everything before it
+    done."""
+    doc = state_with(
+        language={"status": "done", "value": "en"},
+        network={"status": "done", "kind": "wifi", "ssid": "HomeWiFi",
+                 "internet": True},
+        name={"status": "done", "value": "Walnut"},
+        update={"status": "done"},
+    )
+    return doc
+
+
+def clock_aux(synced: bool) -> FakeAux:
+    """An Aux that answers GET /time, so MR-2's clock refresh never falls
+    back to this machine's own timesync flag: `synced` alone decides."""
+    return fresh_aux(**{
+        "GET /time": {"epoch_ms": 1790251200000, "ntp_synced": synced,
+                      "tz": "Europe/London"},
+    })
+
+
+async def remote_harness(
+    link: FakeMuonLink,
+    synced: bool = True,
+    stored: Optional[Dict[str, Any]] = None,
+) -> Harness:
+    h = await Harness(stored=stored or cloud_state(),
+                      aux=clock_aux(synced)).start()
+    h.with_muon_link(link)
+    h.setup._live["clock"]["synced"] = synced
+    return h
+
+
+async def settle(h: Harness, ticks: int = 6) -> None:
+    """Let the (shortened) poller walk the fake's phase list."""
+    for _ in range(ticks):
+        await asyncio.sleep(remote.POLL_SECONDS * 3)
+
+
+@pytest.fixture(autouse=True)
+def fast_poll(monkeypatch: Any):
+    monkeypatch.setattr(remote, "POLL_SECONDS", 0.01)
+
+
+def body(**kw: Any) -> Dict[str, Any]:
+    out: Dict[str, Any] = {"rev": 5}
+    out.update(kw)
+    return out
+
+
+class TestModes:
+    def test_local_finishes_the_step(self):
+        async def go():
+            h = await remote_harness(FakeMuonLink())
+            out = await h.post("/remote", body(mode="local"))
+            assert out["ok"] is True
+            step = h.doc["steps"]["remote"]
+            assert step["status"] == "done" and step["mode"] == "local"
+            assert h.doc["cursor"] == "ready"
+        run(go())
+
+    def test_later_skips_the_step(self):
+        async def go():
+            h = await remote_harness(FakeMuonLink())
+            out = await h.post("/remote", body(mode="later"))
+            assert out["ok"] is True
+            step = h.doc["steps"]["remote"]
+            assert step["status"] == "skipped" and step["mode"] == "later"
+        run(go())
+
+    def test_bad_mode_is_invalid(self):
+        async def go():
+            h = await remote_harness(FakeMuonLink())
+            out = await h.post("/remote", body(mode="self_hosted"))
+            assert out["ok"] is False
+            assert out["error"]["code"] == "invalid_mode"
+        run(go())
+
+    def test_cloud_needs_internet(self):
+        async def go():
+            doc = cloud_state()
+            doc["steps"]["network"]["internet"] = None
+            h = await remote_harness(FakeMuonLink(), stored=doc)
+            out = await h.post("/remote", body(mode="cloud"))
+            assert out["ok"] is False
+            assert out["error"]["code"] == "no_internet"
+        run(go())
+
+    def test_cloud_needs_a_synced_clock(self):
+        async def go():
+            h = await remote_harness(FakeMuonLink(), synced=False)
+            out = await h.post("/remote", body(mode="cloud"))
+            assert out["ok"] is False
+            assert out["error"]["code"] == "clock_unsynced"
+        run(go())
+
+    def test_cloud_without_muon_link_is_unavailable(self):
+        async def go():
+            h = await Harness(stored=cloud_state(),
+                              aux=clock_aux(True)).start()
+            h.setup._live["clock"]["synced"] = True
+            out = await h.post("/remote", body(mode="cloud"))
+            assert out["ok"] is True
+            assert h.doc["steps"]["remote"]["error"]["code"] == (
+                "link_unavailable")
+            assert h.stored()["steps"]["remote"]["mode"] == "cloud"
+            assert h.stored()["steps"]["remote"]["status"] == "pending"
+        run(go())
+
+    @pytest.mark.parametrize("mode,status", [("local", "done"), ("later", "skipped")])
+    def test_completion_card_cloud_without_component_records_pending(self, mode, status):
+        async def go():
+            doc = cloud_state()
+            doc.update(state="complete", cursor="finish")
+            doc["steps"]["remote"].update(mode=mode, status=status)
+            h = await Harness(stored=doc, aux=clock_aux(True)).start()
+            h.setup._live["clock"]["synced"] = True
+            out = await h.post("/remote", body(mode="cloud", rev=h.doc["rev"]))
+            assert out["ok"] is True
+            step = h.stored()["steps"]["remote"]
+            assert step["mode"] == "cloud" and step["status"] == "pending"
+            assert step["error"]["code"] == "link_unavailable"
+            assert h.doc["state"] == "complete" and h.doc["cursor"] == "finish"
+            assert h.setup._remote_poll_task is None
+        run(go())
+
+    @pytest.mark.parametrize("mode,status", [("local", "done"), ("later", "skipped")])
+    @pytest.mark.parametrize("phase", ["code", "offer"])
+    @pytest.mark.parametrize("complete", [False, True])
+    def test_leaving_cloud_cancels_the_daemon_ceremony(self, mode, status, phase, complete):
+        async def go():
+            doc = cloud_state()
+            if complete:
+                doc.update(state="complete", cursor="finish")
+            ceremony = {"phase": phase, "code": "123456", "expires_at": 9999999999}
+            link = FakeMuonLink([ceremony])
+            h = await remote_harness(link, stored=doc)
+            await h.post("/remote", body(mode="cloud", rev=h.doc["rev"]))
+            await settle(h)
+            assert h.doc["steps"]["remote"]["link"]["phase"] == phase
+            out = await h.post("/remote", body(mode=mode, rev=h.doc["rev"]))
+            assert out["ok"] is True
+            assert (await link.status())["phase"] == "unlinked"
+            step = h.stored()["steps"]["remote"]
+            assert step["mode"] == mode and step["status"] == status
+            assert step["link"] is None
+            assert h.setup._remote_poll_task is None
+        run(go())
+
+    @pytest.mark.parametrize("mode", ["local", "later"])
+    def test_mode_change_waits_for_daemon_cancellation(self, mode):
+        async def go():
+            entered, release = asyncio.Event(), asyncio.Event()
+            link = FakeMuonLink()
+            h = await remote_harness(link)
+            await h.post("/remote", body(mode="cloud", rev=h.doc["rev"]))
+            cancel = link.cancel
+
+            async def blocked_cancel():
+                entered.set()
+                await release.wait()
+                return await cancel()
+
+            link.cancel = blocked_cancel
+            changing = asyncio.create_task(h.post(
+                "/remote", body(mode=mode, rev=h.doc["rev"])))
+            try:
+                await asyncio.wait_for(asyncio.shield(changing), 0.1)
+            except asyncio.TimeoutError:
+                pass
+            try:
+                assert entered.is_set()
+                assert not changing.done()
+                assert h.stored()["steps"]["remote"]["mode"] == "cloud"
+            finally:
+                release.set()
+                await changing
+            assert h.stored()["steps"]["remote"]["mode"] == mode
+        run(go())
+
+    @pytest.mark.parametrize("mode", ["local", "later"])
+    def test_failed_daemon_cancellation_does_not_commit_new_mode(self, mode):
+        async def go():
+            link = FakeMuonLink()
+            h = await remote_harness(link)
+            await h.post("/remote", body(mode="cloud", rev=h.doc["rev"]))
+            before = h.stored()
+
+            async def failed_cancel():
+                raise OSError("daemon unavailable")
+
+            link.cancel = failed_cancel
+            out = await h.post("/remote", body(mode=mode, rev=h.doc["rev"]))
+            assert out["ok"] is False
+            assert out["error"]["code"] == "link_unavailable"
+            assert h.stored() == before
+        run(go())
+
+
+class TestLinkFlow:
+    def test_a_code_mirrors_then_linked_finishes(self):
+        """§8 t12: the phase object lands on remote.link unchanged; linked
+        marks done with the account and advances."""
+        async def go():
+            link = FakeMuonLink([
+                {"phase": "connecting"},
+                {"phase": "code", "code": "482913",
+                 "expires_at": 9999999999, "url": "https://x"},
+                {"phase": "linked", "account": "jed@example.com",
+                 "connected": True},
+            ])
+            h = await remote_harness(link)
+            out = await h.post("/remote", body(mode="cloud"))
+            assert out["ok"] is True
+            step = h.doc["steps"]["remote"]
+            assert step["mode"] == "cloud" and step["status"] == "pending"
+            await settle(h)
+            step = h.doc["steps"]["remote"]
+            assert step["status"] == "done"
+            assert step["account"] == "jed@example.com"
+            assert step["link"]["phase"] == "linked"
+            assert h.doc["cursor"] == "ready"
+        run(go())
+
+    def test_an_expired_code_is_renewed(self):
+        """§8 t12: once synced time passes expires_at, start() is called
+        again."""
+        async def go():
+            link = FakeMuonLink([
+                {"phase": "code", "code": "111111", "expires_at": 1},
+                {"phase": "code", "code": "222222", "expires_at": 9999999999},
+            ])
+            h = await remote_harness(link)
+            await h.post("/remote", body(mode="cloud"))
+            await settle(h)
+            assert link.starts >= 2  # the initial start plus the renewal
+            assert h.doc["steps"]["remote"]["link"]["code"] == "222222"
+        run(go())
+
+    def test_start_is_never_called_during_offer(self):
+        """§8 t12: an offer mirrors but is never renewed."""
+        async def go():
+            link = FakeMuonLink([
+                {"phase": "offer", "account": "jed@example.com",
+                 "authority": "Muon3D", "fingerprint": "9f"},
+                {"phase": "offer", "account": "jed@example.com",
+                 "authority": "Muon3D", "fingerprint": "9f"},
+                {"phase": "offer", "account": "jed@example.com",
+                 "authority": "Muon3D", "fingerprint": "9f"},
+            ])
+            h = await remote_harness(link)
+            await h.post("/remote", body(mode="cloud"))
+            starts = link.starts
+            await settle(h)
+            assert link.starts == starts  # no renewal during offer
+            assert h.doc["steps"]["remote"]["link"]["phase"] == "offer"
+            assert h.doc["steps"]["remote"]["status"] == "pending"
+        run(go())
+
+    def test_failed_retries_once_then_link_failed(self):
+        async def go():
+            link = FakeMuonLink([
+                {"phase": "failed", "message": "could not reach"},
+                {"phase": "failed", "message": "could not reach"},
+            ])
+            h = await remote_harness(link)
+            await h.post("/remote", body(mode="cloud"))
+            await settle(h)
+            step = h.doc["steps"]["remote"]
+            assert step["error"]["code"] == "link_failed"
+            assert step["error"]["detail"]["message"] == "could not reach"
+            assert step["status"] == "pending"
+            assert link.starts == 2  # the start plus exactly one retry
+        run(go())
+
+    def test_a_503_is_link_unavailable(self):
+        async def go():
+            link = FakeMuonLink()
+            link.down = True
+            h = await remote_harness(link)
+            out = await h.post("/remote", body(mode="cloud"))
+            assert out["ok"] is True
+            assert h.doc["steps"]["remote"]["error"]["code"] == (
+                "link_unavailable")
+            assert h.doc["steps"]["remote"]["status"] == "pending"
+        run(go())
+
+    def test_phase_unavailable_is_link_unavailable(self):
+        async def go():
+            link = FakeMuonLink([{"phase": "unavailable"}])
+            h = await remote_harness(link)
+            await h.post("/remote", body(mode="cloud"))
+            await settle(h)
+            assert h.doc["steps"]["remote"]["error"]["code"] == (
+                "link_unavailable")
+        run(go())
+
+    def test_already_linked_finishes_at_once(self):
+        """02 §5.9 step 5: a 409 "already linked" becomes done with that
+        account (muon_link turns the 409 into the linked phase)."""
+        async def go():
+            link = FakeMuonLink(
+                [{"phase": "linked", "account": "jed@example.com"}])
+            h = await remote_harness(link)
+            out = await h.post("/remote", body(mode="cloud"))
+            assert out["ok"] is True
+            step = h.doc["steps"]["remote"]
+            assert step["status"] == "done"
+            assert step["account"] == "jed@example.com"
+        run(go())
+
+
+class TestPollerStops:
+    def test_goto_away_stops_the_poll(self):
+        async def go():
+            link = FakeMuonLink([
+                {"phase": "code", "code": "1", "expires_at": 9999999999},
+                {"phase": "code", "code": "1", "expires_at": 9999999999},
+                {"phase": "code", "code": "1", "expires_at": 9999999999},
+            ])
+            h = await remote_harness(link)
+            await h.post("/remote", body(mode="cloud"))
+            await asyncio.sleep(remote.POLL_SECONDS * 3)
+            await h.post("/goto", {"rev": h.doc["rev"], "step": "name"})
+            calls = link.status_calls
+            await asyncio.sleep(remote.POLL_SECONDS * 4)
+            assert link.status_calls == calls  # the poller stopped
+            assert h.doc["cursor"] == "name"
+        run(go())
+
+    def test_cancel_declines_and_clears(self):
+        async def go():
+            link = FakeMuonLink([
+                {"phase": "code", "code": "1", "expires_at": 9999999999},
+            ])
+            h = await remote_harness(link)
+            await h.post("/remote", body(mode="cloud"))
+            out = await h.post("/remote/cancel", {})
+            assert out["ok"] is True
+            assert link.cancels == 1
+            step = h.doc["steps"]["remote"]
+            assert step["mode"] is None and step["link"] is None
+            assert step["status"] == "pending"
+        run(go())
+
+    def test_cancel_is_a_no_op_once_linked(self):
+        async def go():
+            link = FakeMuonLink()
+            doc = cloud_state()
+            doc["steps"]["remote"].update(
+                status="done", mode="cloud",
+                link={"phase": "linked", "account": "a@b.c"},
+                account="a@b.c")
+            h = await remote_harness(link, stored=doc)
+            out = await h.post("/remote/cancel", {})
+            assert out["ok"] is True
+            assert link.cancels == 0
+            assert h.doc["steps"]["remote"]["mode"] == "cloud"
+        run(go())
+
+
+class TestCloudCapability:
+    @pytest.mark.parametrize("status,capable", [
+        ({"phase": "unlinked"}, True),
+        ({"phase": "linked", "account": "a@b.c"}, True),
+        ({"phase": "unavailable"}, False),
+    ])
+    def test_cloud_link_follows_get_link(self, status: Any, capable: bool):
+        """02 §5.9: cloud_link is false on `unavailable` and on a 503."""
+        async def go():
+            link = FakeMuonLink([status, status])
+            h = await remote_harness(link)
+            await h.setup.refresh_live(full=True)
+            assert h.setup._live["capabilities"]["cloud_link"] is capable
+        run(go())
+
+    def test_a_503_means_not_capable(self):
+        async def go():
+            link = FakeMuonLink()
+            link.down = True
+            h = await remote_harness(link)
+            await h.setup.refresh_live(full=True)
+            assert h.setup._live["capabilities"]["cloud_link"] is False
+        run(go())
+
+    def test_no_component_means_not_capable(self):
+        async def go():
+            h = await Harness(stored=cloud_state()).start()
+            await h.setup.refresh_live(full=True)
+            assert h.setup._live["capabilities"]["cloud_link"] is False
+        run(go())
+
+class TestCloudAttemptLifetime:
+    def test_cloud_can_finish_from_the_completion_card(self):
+        async def go():
+            doc = cloud_state()
+            doc.update(state="complete", cursor="finish")
+            doc["steps"]["remote"].update(mode="later", status="skipped")
+            link = FakeMuonLink([
+                {"phase": "connecting"},
+                {"phase": "linked", "account": "owner@example.test"},
+            ])
+            h = await remote_harness(link, stored=doc)
+            out = await h.post("/remote", body(mode="cloud", rev=h.doc["rev"]))
+            assert out["ok"]
+            await settle(h)
+            assert h.doc["steps"]["remote"]["status"] == "done"
+            assert h.doc["steps"]["remote"]["account"] == "owner@example.test"
+            assert h.doc["state"] == "complete" and h.doc["cursor"] == "finish"
+        run(go())
+
+    @pytest.mark.parametrize("mode", ["local", "later"])
+    @pytest.mark.parametrize("result", [
+        {"phase": "linked", "account": "stale@example.test"},
+        {"phase": "offer", "account": "stale@example.test"},
+        {"phase": "unavailable"},
+    ])
+    def test_a_result_in_flight_cannot_overwrite_a_new_mode(self, mode, result):
+        async def go():
+            entered, release = asyncio.Event(), asyncio.Event()
+            link = FakeMuonLink([{"phase": "connecting"}])
+
+            async def blocked_status():
+                entered.set()
+                await release.wait()
+                return result
+            link.status = blocked_status
+            h = await remote_harness(link)
+            await h.post("/remote", body(mode="cloud", rev=h.doc["rev"]))
+            await entered.wait()
+            await h.post("/remote", body(mode=mode, rev=h.doc["rev"]))
+            expected = h.doc["steps"]["remote"].copy()
+            release.set()
+            await settle(h)
+            assert h.doc["steps"]["remote"] == expected
+        run(go())
+
+
+class TestRemoteCancelWriteBoundary:
+    def test_new_cloud_start_waits_for_a_pending_cancel(self):
+        async def go():
+            entered, release = asyncio.Event(), asyncio.Event()
+            link = FakeMuonLink([{"phase": "connecting"}])
+            h = await remote_harness(link)
+            await h.post("/remote", body(mode="cloud", rev=h.doc["rev"]))
+
+            async def blocked_cancel():
+                entered.set()
+                await release.wait()
+                link.cancels += 1
+
+            link.cancel = blocked_cancel
+            cancelling = asyncio.create_task(h.post("/remote/cancel", {}))
+            await entered.wait()
+            starts = link.starts
+            checked = asyncio.Event()
+            wait_resolved = h.setup.wait_resolved
+
+            async def checked_resolution(timeout):
+                result = await wait_resolved(timeout)
+                checked.set()
+                return result
+
+            h.setup.wait_resolved = checked_resolution
+            starting = asyncio.create_task(h.post(
+                "/remote", body(mode="cloud", rev=h.doc["rev"])))
+            await checked.wait()
+            for _ in range(10):
+                await asyncio.sleep(0)
+            escaped = link.starts != starts
+            release.set()
+            await cancelling
+            await starting
+            assert not escaped
+        run(go())
+
+    def test_cancel_waits_for_a_cloud_start_in_flight(self):
+        async def go():
+            entered, release = asyncio.Event(), asyncio.Event()
+            link = FakeMuonLink([{"phase": "connecting"}])
+            h = await remote_harness(link)
+
+            async def blocked_start():
+                entered.set()
+                await release.wait()
+                return {"phase": "connecting"}
+
+            link.start = blocked_start
+            starting = asyncio.create_task(h.post(
+                "/remote", body(mode="cloud", rev=h.doc["rev"])))
+            await entered.wait()
+            checked = asyncio.Event()
+            wait_resolved = h.setup.wait_resolved
+
+            async def checked_resolution(timeout):
+                result = await wait_resolved(timeout)
+                checked.set()
+                return result
+
+            h.setup.wait_resolved = checked_resolution
+            cancelling = asyncio.create_task(h.post("/remote/cancel", {}))
+            await checked.wait()
+            for _ in range(10):
+                await asyncio.sleep(0)
+            escaped = link.cancels != 0
+            release.set()
+            await starting
+            await cancelling
+            assert not escaped
+            assert h.doc["steps"]["remote"]["mode"] is None
+        run(go())
+
+
+class TestRemoteStepReachability:
+    @pytest.mark.parametrize("complete", [False, True])
+    @pytest.mark.parametrize("mode", ["local", "later", "cloud"])
+    def test_required_language_blocks_remote_choices_until_completion(self, mode, complete):
+        async def go():
+            doc = cloud_state()
+            doc["steps"]["language"].update(status="pending", value=None)
+            doc["cursor"] = "language"
+            if complete:
+                doc.update(state="complete", cursor="finish")
+            link = FakeMuonLink([{"phase": "linked", "account": "owner@example.test"}])
+            h = await remote_harness(link, stored=doc)
+            out = await h.post("/remote", body(mode=mode, rev=h.doc["rev"]))
+            if complete:
+                assert out["ok"]
+                assert h.doc["state"] == "complete" and h.doc["cursor"] == "finish"
+                assert h.doc["steps"]["remote"]["mode"] == mode
+            else:
+                assert out["error"]["code"] == "invalid_step"
+                assert h.doc["steps"]["remote"]["status"] == "pending"
+                assert link.starts == 0
+        run(go())
