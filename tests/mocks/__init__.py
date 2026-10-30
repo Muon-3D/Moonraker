@@ -1,10 +1,10 @@
 from __future__ import annotations
 import asyncio
 from utils import ServerError
-from .mock_gpio import MockGpiod
+from .mock_gpio import MockGpiod, MockPeripheryGpio, MockDevPathlib
 
 __all__ = ("MockReader", "MockWriter", "MockComponent", "MockWebsocket",
-           "MockGpiod")
+           "MockGpiod", "MockPeripheryGpio", "MockDevPathlib")
 
 class MockWriter:
     def __init__(self, wait_drain: bool = False) -> None:

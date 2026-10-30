@@ -18,6 +18,7 @@ from ..common import (
 from ..utils import ServerError, parse_ip_address
 from ..utils.real_ip import validate_real_ip_header
 from .. import muon_access_policy
+from .. import muon_floor
 
 # Annotation imports
 from typing import (
@@ -369,6 +370,10 @@ class WebSocket(WebSocketHandler, BaseRemoteConnection):
     # Check Authorized User
     async def prepare(self) -> None:
         validate_real_ip_header(self.request.headers)
+        if not muon_floor.setup_complete():
+            muon_floor.check_bluetooth(
+                "/websocket", None,
+                parse_ip_address(self.request.remote_ip or ""), None)
         max_conns = self.settings["max_websocket_connections"]
         if self.__class__.connection_count >= max_conns:
             raise self.server.error(
@@ -387,6 +392,11 @@ class WebSocket(WebSocketHandler, BaseRemoteConnection):
             else:
                 origin = self.request.headers.get("Sec-Websocket-Origin", None)
             self.cors_allowed = await auth.check_cors(origin)
+        # Authentication distinguishes an enrolled Bluetooth principal from
+        # the setup connection.  Check before upgrade: broadcasts otherwise
+        # disclose the console and Klippy state without an RPC request.
+        muon_floor.check_bluetooth(
+            "/websocket", None, self.ip_addr, self.user_info)
 
     def close_socket(self, code: int, reason: str) -> None:
         self.close(code, reason)
@@ -520,6 +530,10 @@ class BridgeSocket(WebSocketHandler):
     # Check Authorized User
     async def prepare(self) -> None:
         validate_real_ip_header(self.request.headers)
+        if not muon_floor.setup_complete():
+            muon_floor.check_bluetooth(
+                "/klippysocket", None,
+                parse_ip_address(self.request.remote_ip or ""), None)
         max_conns = self.settings["max_websocket_connections"]
         if WebSocket.connection_count >= max_conns:
             raise self.server.error(
@@ -533,6 +547,8 @@ class BridgeSocket(WebSocketHandler):
             else:
                 origin = self.request.headers.get("Sec-Websocket-Origin", None)
             self.cors_allowed = await auth.check_cors(origin)
+        muon_floor.check_bluetooth(
+            "/klippysocket", None, self.ip_addr, self.current_user)
         kconn: Klippy = self.server.lookup_component("klippy_connection")
         try:
             reader, writer = await kconn.open_klippy_connection()

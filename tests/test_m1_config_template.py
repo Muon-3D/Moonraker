@@ -77,6 +77,22 @@ def test_m1_image_trusts_the_lan_it_is_on_over_ipv6():
             assert net.is_private or net.is_link_local or net.is_loopback, entry
 
 
+def test_neither_of_muon_links_addresses_is_a_trusted_client():
+    """GATE-2(g) and ADR 0032 D4 rule 3: muon-link forwards a paired session
+    as 192.0.2.1 and a Bluetooth connection as 192.0.2.2. Neither may be
+    trusted by address; each needs muon_gateway's token, bound to it."""
+    config = configparser.ConfigParser(interpolation=None)
+    config.read(TEMPLATE, encoding="utf-8")
+
+    trusted = config.get("authorization", "trusted_clients").split()
+    for address in ("192.0.2.1", "192.0.2.2"):
+        addr = ipaddress.ip_address(address)
+        for entry in trusted:
+            if "." in entry:
+                assert addr not in ipaddress.ip_network(entry, strict=False), (
+                    address, entry)
+
+
 def test_m1_image_serves_the_toolpath_for_the_live_model():
     """B9-MR-1: without the section the component never loads, gcode_preprocessor
     makes no toolpath at upload, and /server/muon/toolpath is a 404."""
