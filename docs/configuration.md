@@ -2870,6 +2870,11 @@ mdns_hostname:
 #   The instance will be available at:
 #       http://{mdns_hostname}.local:{port}/
 #   The default is the operating system's configured hostname.
+advertised_port:
+#   MUON (KAN-475). The port the service records name, when clients reach
+#   Moonraker through a reverse proxy rather than on [server] port -- for
+#   example nginx on 80 in front of a Moonraker bound to 127.0.0.1:7125.
+#   The default is the [server] port.
 enable_ssdp:
 #   Enables discovery over UPnP/SSDP in ad.  The default is False
 ```

@@ -20,18 +20,20 @@ from moonraker.components import application
 from moonraker.utils import redact
 
 NAME = "Ada Lovelace"
+PSK = "setup-psk-98765"
 SECRETS = {
     "signer_name": NAME,
     "password": "correct horse",
     "key": "hotspot-key-123",
     "reentry_token": "tok-456",
+    "psk": PSK,
 }
 
 
 class TestTheHelper:
     def test_the_fields(self):
         assert redact.SENSITIVE_FIELDS == {
-            "signer_name", "password", "key", "reentry_token"}
+            "signer_name", "password", "key", "psk", "reentry_token"}
 
     def test_every_field_at_any_depth_and_case(self):
         value = {
@@ -109,6 +111,17 @@ class TestTheHttpHandler:
             {"result": {"waiver": {"signer_name": NAME}}},
         )
         assert NAME not in caplog.text
+
+    @pytest.mark.parametrize("hint", ["int", "float", "json"])
+    def test_query_conversion_errors_do_not_log_credentials(self, caplog, hint):
+        caplog.set_level(logging.DEBUG)
+        credential = "test-only-reentry-credential"
+        result = application.DynamicRequestHandler._convert_type(
+            self._Handler(), credential, hint
+        )
+        assert result == credential
+        assert credential not in caplog.text
+        assert hint in caplog.text
 
 
 class TestJsonRpc:

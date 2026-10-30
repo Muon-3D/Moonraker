@@ -64,7 +64,7 @@
 from __future__ import annotations
 
 import ipaddress
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from .utils.exceptions import ServerError
 
@@ -366,16 +366,60 @@ def check_floor(
 #     identity SEC-8 names. Neither half is enough alone: the address without
 #     the token is any request muon-link forwards, and the token is bound to
 #     the sentinel by ``_check_oneshot_token``, so it cannot arrive from
-#     anywhere else.
-#   * NOT a LAN or hotspot browser. ``trusted_clients`` authenticates it as
-#     ``_TRUSTED_USER_`` purely because of where it is, which is exactly what
-#     Level 1 exists to stop counting.
+#     anywhere else. A Bluetooth connection arrives with ``192.0.2.2``
+#     instead (KAN-436) and is treated the same way. Before setup is complete
+#     muon-link admits an unknown phone over Bluetooth (ADR 0032 D4 rule 2),
+#     so if the level is Protected while setup is not complete, that phone has
+#     an identity here. ADR 0032 asks for exactly this ("remote at all
+#     times"); it is recorded so that nobody reads the token as proof of
+#     pairing in that window. In that window ``check_bluetooth`` below holds
+#     every request from that address to the setup routes, so the identity
+#     opens nothing else.
+#   * a browser signed in with the panel's login (PANEL_LOGIN_USER below). It
+#     holds a JWT for the password the owner set at the panel.
+#   * NOT a LAN or hotspot browser that only arrived. ``trusted_clients``
+#     authenticates it as ``_TRUSTED_USER_`` purely because of where it is,
+#     which is exactly what Level 1 exists to stop counting.
 #
-# No Moonraker user is created, at either level. ``authenticate_request`` puts
-# the ``force_logins`` gate before ``_check_trusted_connection``, so a second
-# row in ``self.users`` would 401 the panel on everything with no way back
-# (MuonOS #87). The level lives in ``components/muon_protection.py``.
+# The level creates no Moonraker user. The connection password does: one user,
+# PANEL_LOGIN_USER, which the panel creates, re-keys and removes through
+# ``components/muon_protection.py``. While it exists every network caller must
+# sign in, as ``force_logins`` (on in the M1 config) would make them anyway.
+# ``force_logins`` used to make the panel sign in too,
+# because ``authenticate_request`` puts that gate before
+# ``_check_trusted_connection`` and the panel has no way to (MuonOS #87).
+# ``login_required`` below exempts a caller on the device, so it no longer can.
 # ---------------------------------------------------------------------------
+
+#: The one login the panel manages. Fluidd's sign-in page takes this name and
+#: the password set at the panel.
+PANEL_LOGIN_USER = "admin"
+PANEL_LOGIN_GROUP = "muon_panel_login"
+
+
+def is_panel_login(user: Any) -> bool:
+    """Only the panel credential writer stamps this persisted provenance."""
+    return (
+        user is not None
+        and getattr(user, "username", None) == PANEL_LOGIN_USER
+        and getattr(user, "source", None) == "moonraker"
+        and PANEL_LOGIN_GROUP in getattr(user, "groups", [])
+    )
+
+
+def login_required(
+    force_logins: bool, user_count: int, ip_addr: Optional[Any]
+) -> bool:
+    """Must this caller sign in? ``force_logins`` upstream, minus the panel.
+
+    ``user_count`` includes ``_API_KEY_USER_``, which always exists, so a
+    second user is what switches it on. A caller on the device never has to:
+    it is the panel, and the panel is where the password is set and cleared.
+    """
+    if not force_logins or user_count <= 1:
+        return False
+    return not local_address(ip_addr)
+
 
 #: Level 0. The shipped default (SEC-1): the LAN and the hotspot drive the
 #: printer with no sign-in.
@@ -414,8 +458,24 @@ PROTECTED_EXCLUSIONS = ("/server/aux/dev_mode",)
 #: ``components/muon_gateway.py`` binds its tokens to the same value; a test
 #: asserts the two agree.
 GATEWAY_SENTINEL = ipaddress.ip_address("192.0.2.1")
+#: KAN-436, ADR 0032 D4 rule 3: what muon-link stamps instead when the
+#: connection started on its Bluetooth transport. Also TEST-NET-1, and also
+#: outside ``trusted_clients``. This module treats it exactly as it treats
+#: ``GATEWAY_SENTINEL``, at all times (ADR 0032 D7 "Caller class"): a network
+#: caller the floor refuses, and an identity at Level 1 only together with a
+#: ``muon_gateway`` user. The wider rights a Bluetooth phone gets during setup
+#: are ``muon_setup``'s alone, and stay inside ``/server/muon/setup``: until
+#: setup is complete ``check_bluetooth`` refuses this address everything but
+#: BLUETOOTH_SETUP_PREFIXES.
+BLUETOOTH_SENTINEL = ipaddress.ip_address("192.0.2.2")
+#: Both of muon-link's addresses. ``components/muon_gateway.py`` binds a token
+#: to one of them; a test asserts the two modules agree.
+GATEWAY_ADDRESSES = frozenset({GATEWAY_SENTINEL, BLUETOOTH_SENTINEL})
 #: ``UserInfo.source`` for a user ``muon_gateway`` authenticated.
 GATEWAY_USER_SOURCE = "muon_gateway"
+_ENROLLED_LEVELS = frozenset(
+    {"signed_out_guest", "signed_in_guest", "member", "admin"})
+_ENROLLED_ROLES = frozenset({"operator", "viewer"})
 
 # Open here, so a Moonraker with no [muon_protection] section keeps upstream
 # behaviour. The component raises this to Protected as soon as it loads, and
@@ -463,7 +523,7 @@ def _is_gateway_address(ip_addr: Optional[Any]) -> bool:
     if ip_addr is None:
         return False
     try:
-        return ipaddress.ip_address(str(ip_addr)) == GATEWAY_SENTINEL
+        return ipaddress.ip_address(str(ip_addr)) in GATEWAY_ADDRESSES
     except ValueError:
         return False
 
@@ -475,12 +535,14 @@ def has_identity(
 ) -> bool:
     """Does this caller carry an identity SEC-8 Level 1 accepts?
 
-    See the block comment above for the three that do. Fail-closed: an absent
+    See the block comment above for the four that do. Fail-closed: an absent
     address, an absent user, or a user from any other source is no identity.
     """
     if _is_internal(transport):
         return True
     if local_address(ip_addr):
+        return True
+    if is_panel_login(user):
         return True
     return (
         _is_gateway_address(ip_addr)
@@ -507,5 +569,116 @@ def check_protection(
         f"'{endpoint}' is protected on this printer. The owner turned on "
         "network protection, which can only be turned off at the printer's "
         "panel. A paired device can still reach it.",
+        403,
+    )
+
+
+# ---------------------------------------------------------------------------
+# KAN-436: a phone setting the printer up over Bluetooth reaches the setup
+# routes and nothing else.
+#
+# While first-run setup is not complete, muon-link admits an UNKNOWN phone
+# over Bluetooth (ADR 0032 D4 rule 2) and forwards it as ``192.0.2.2`` with a
+# ``muon_gateway`` token, which ``has_identity`` above counts. muon-link's own
+# gateway policy holds that session to ``muon_setup`` and ``muon_link``
+# (``policy::BLUETOOTH_SETUP_RULES`` in muon-link-device) and never gives it a
+# websocket. This is the same rule on this side, so that a fault in muon-link
+# alone hands a stranger in radio range nothing more: until setup is complete,
+# a request from ``192.0.2.2`` -- with a token or without, over HTTP, the
+# websocket's JSON-RPC, the file handlers, and the websocket upgrade itself --
+# is refused unless its endpoint is under BLUETOOTH_SETUP_PREFIXES.
+#
+# Once setup is complete muon-link closes those connections and admits over
+# Bluetooth only clients it has paired, under its ordinary policy, so
+# ``192.0.2.2`` is then a paired session that happened to start on Bluetooth.
+# ``muon_access`` still never counts it as on the printer's home network.
+#
+# "Complete" is what ``muon_setup`` says (``set_setup_complete_source``).
+# Until it has said -- at start, with no [muon_setup], while its migration
+# check cannot decide, or if asking it fails -- setup counts as NOT complete
+# here, which is the narrower side of this rule. (``muon_setup``'s own
+# ``is_complete`` leans the other way while it does not know, because for its
+# access table "complete" is the narrower side.)
+# ---------------------------------------------------------------------------
+
+#: What a Bluetooth phone reaches while setup is not complete: the same two
+#: surfaces as muon-link's BLUETOOTH_SETUP_RULES, matched on a path-segment
+#: boundary like the other prefix lists here.
+BLUETOOTH_SETUP_PREFIXES = ("/server/muon/setup", "/server/muon/link")
+
+_setup_complete_source: Optional[Callable[[], bool]] = None
+
+
+def set_setup_complete_source(source: Optional[Callable[[], bool]]) -> None:
+    """Where ``setup_complete`` asks. Only muon_setup calls this; None (its
+    close) goes back to "not complete"."""
+    global _setup_complete_source
+    _setup_complete_source = source
+
+
+def setup_complete() -> bool:
+    """Has muon_setup said setup is complete? False until it has, and when
+    asking it fails."""
+    source = _setup_complete_source
+    if source is None:
+        return False
+    try:
+        return source() is True
+    except Exception:
+        return False
+
+
+def is_bluetooth_address(ip_addr: Optional[Any]) -> bool:
+    if ip_addr is None:
+        return False
+    try:
+        return ipaddress.ip_address(str(ip_addr)) == BLUETOOTH_SENTINEL
+    except ValueError:
+        return False
+
+
+def is_bluetooth_setup_endpoint(endpoint: str) -> bool:
+    return _matches(endpoint, BLUETOOTH_SETUP_PREFIXES)
+
+
+def bluetooth_setup_caller(
+    transport: Optional[Any] = None, ip_addr: Optional[Any] = None,
+    user: Optional[Any] = None,
+) -> bool:
+    """Is this caller held to the Bluetooth setup routes?
+
+    After setup, only a gateway token carrying an explicit enrolled principal
+    may leave those routes.  A token without principal fields is also what the
+    out-of-box connection carries, so treating that legacy token as an admin
+    creates a control window while muon-link is closing the setup connection.
+    """
+    enrolled = (
+        user is not None
+        and getattr(user, "source", None) == GATEWAY_USER_SOURCE
+        and getattr(user, "access_level", None) in _ENROLLED_LEVELS
+        and getattr(user, "access_role", None) in _ENROLLED_ROLES
+    )
+    return (
+        not _is_internal(transport)
+        and is_bluetooth_address(ip_addr)
+        and (not setup_complete() or not enrolled)
+    )
+
+
+def check_bluetooth(
+    endpoint: str,
+    transport: Optional[Any] = None,
+    ip_addr: Optional[Any] = None,
+    user: Optional[Any] = None,
+) -> None:
+    """Hold an unenrolled Bluetooth caller to the setup routes."""
+    if not bluetooth_setup_caller(transport, ip_addr, user):
+        return
+    if is_bluetooth_setup_endpoint(endpoint):
+        return
+    raise ServerError(
+        f"'{endpoint}' is not available over Bluetooth while this printer is "
+        "being set up. A phone setting it up over Bluetooth reaches the setup "
+        "routes only.",
         403,
     )

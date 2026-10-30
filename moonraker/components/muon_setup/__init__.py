@@ -36,8 +36,11 @@ from typing import (
 )
 from urllib.parse import urlencode
 
-from . import caller, clock, language, manifest, model, name, ready, region, update
+from . import (
+    caller, clock, language, manifest, model, name, network, ready, region,
+    remote, update)
 from .model import DONE, FINISH, HIDDEN, PENDING, SKIPPED
+from ... import muon_access_policy, muon_floor
 from ...utils.exceptions import ServerError
 
 if TYPE_CHECKING:
@@ -87,7 +90,14 @@ _LANGUAGE_RE = re.compile(r"^[a-z]{2,3}(-[A-Z][a-z]{3})?(-[A-Z]{2})?$")
 _CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 #: 02 §5.11. `app` is the Muon3D phone app (KAN-399), on the hotspot or LAN.
-DRIVER_KINDS = ("panel", "phone", "web", "app")
+#: `bluetooth` is a phone on muon-link's Bluetooth transport (KAN-436, ADR 0032
+#: D4): a Bluetooth caller's claim is stored as `bluetooth` whatever non-panel
+#: kind it names, and no other caller may claim it.
+DRIVER_KINDS = ("panel", "phone", "web", "app", "bluetooth")
+
+#: ADR 0032 D7 "State": `nearby` is cleared this long after the last
+#: Bluetooth request that carried a well-formed code.
+NEARBY_TTL = 20.0
 
 #: A migration signal that cannot say yet (01 §7), as distinct from "no".
 UNSURE = "unsure"
@@ -198,6 +208,10 @@ class MuonSetup:
         self.database = self.server.lookup_component("database")
         self.database.register_local_namespace(NAMESPACE, forbidden=True)
         self.server.register_notification("muon_setup:muon_setup_changed")
+        # KAN-429: a remote connection is sent the state without the link
+        # code and url, as _handle_get answers a remote read.
+        muon_access_policy.register_notification_filter(
+            caller.CHANGED_NOTIFICATION, caller.filter_changed_notification)
 
         #: The stored document. None until the migration check has decided
         #: what this printer is (see _startup).
@@ -207,6 +221,11 @@ class MuonSetup:
         self.read_only_version: Optional[Any] = None
         self._resolved = asyncio.Event()
         self._lock = asyncio.Lock()
+        self._reset_lock = asyncio.Lock()
+        self._internal_lock = asyncio.Lock()
+        self._region_missing = False
+        self._region_state_missing = False
+        self._region_options_missing = False
         #: `marker_written` / `marker_by`: the marker's POST reached Aux, and
         #: with which `by`. `marker_clear_pending`: a reset's DELETE has not
         #: yet. `tz_source`: who set the time zone (02 §6 `clock`).
@@ -234,9 +253,26 @@ class MuonSetup:
         self._tasks: Set[asyncio.Task] = set()
         self._lapse_timer: Optional[asyncio.TimerHandle] = None
         self._poll_task: Optional[asyncio.Task] = None
+        #: remote.py's link-phase poller (MR-5), while the remote step
+        #: waits on muon-link.
+        self._remote_poll_task: Optional[asyncio.Task] = None
+        self._remote_generation = 0
+        #: network.py's in-flight Aux /wifi/connect, and the cleanup that
+        #: waits it out before forgetting a partial profile.
+        self._join_connect: Optional[asyncio.Task] = None
+        self._join_requested: Optional[asyncio.Event] = None
+        self._join_cleanup: Optional[asyncio.Task] = None
         self._stations_route = True
         self._clock_from_phone = False
         self._closed = False
+        #: KAN-436: the code from the latest Bluetooth request that carried
+        #: one, and when it came (`nearby_clock`, injectable for tests).
+        self._nearby: Optional[Dict[str, Any]] = None
+        self._nearby_timer: Optional[asyncio.TimerHandle] = None
+        self.nearby_clock: Callable[[], float] = time.monotonic
+        # KAN-436: muon_floor holds a phone on Bluetooth to the setup routes
+        # until setup is complete, and asks this component when it is.
+        muon_floor.set_setup_complete_source(self.complete_for_floor)
 
         #: Hooks for the step packages. `hide_when_current[step](doc)` decides
         #: whether a step is hidden at the moment it becomes current (01 §2);
@@ -260,8 +296,11 @@ class MuonSetup:
         reg("/server/muon/setup/reset", ["POST"], self._handle_reset)
         reg("/server/muon/setup/network/cancel", ["POST"],
             self._handle_network_cancel)
+        reg("/server/muon/setup/remote/cancel", ["POST"],
+            lambda webreq: remote.handle_cancel(self, webreq))
         # The steps' own endpoints, one module each.
-        for step_module in (language, clock, name, update, ready):
+        for step_module in (language, clock, name, update, ready, network,
+                            remote):
             step_module.register(self)
 
     # ------------------------------------------------------------------
@@ -280,7 +319,13 @@ class MuonSetup:
         if isinstance(internal, dict):
             self._internal.update(internal)
         if isinstance(stored, dict):
+            await network.prepare_boot_cleanup(self, stored)
             self._load(stored)
+            network.resume_cleanup(self)
+            # Discovery may already be registered after a slow database load.
+            # An unchanged document still supplies its initial name/status.
+            self.server.send_event(
+                "muon_setup:muon_setup_changed", self.public_state())
         else:
             await self._migrate()
         if poll:
@@ -476,8 +521,12 @@ class MuonSetup:
 
     async def close(self) -> None:
         self._closed = True
+        if muon_floor._setup_complete_source == self.complete_for_floor:
+            muon_floor.set_setup_complete_source(None)
         if self._lapse_timer is not None:
             self._lapse_timer.cancel()
+        if self._nearby_timer is not None:
+            self._nearby_timer.cancel()
         tasks = list(self._tasks)
         if self._op_task is not None:
             tasks.append(self._op_task)
@@ -556,6 +605,8 @@ class MuonSetup:
             doc["cursor"] = FINISH
         public = copy.deepcopy(doc)
         public["driver"] = model.driver_public(doc.get("driver"), self.driver_lease)
+        public["nearby"] = (
+            None if public["state"] == "complete" else self._nearby_public())
         live = self._live
         if live["printer"] is not None:
             public["printer"] = copy.deepcopy(live["printer"])
@@ -573,9 +624,9 @@ class MuonSetup:
         public["region"] = copy.deepcopy(live["region"])
         public["capabilities"] = dict(live["capabilities"])
         # Key order as in 02 §6, for anyone reading a dump.
-        order = ("version", "rev", "state", "cursor", "driver", "op", "printer",
-                 "hotspot", "clock", "region", "capabilities", "card_dismissed",
-                 "steps")
+        order = ("version", "rev", "state", "cursor", "driver", "nearby", "op",
+                 "printer", "hotspot", "clock", "region", "capabilities",
+                 "card_dismissed", "steps")
         return {k: public[k] for k in order if k in public}
 
     def _notify(self) -> None:
@@ -589,8 +640,9 @@ class MuonSetup:
         await self.database.insert_item(NAMESPACE, STATE_KEY, stored)
 
     async def _persist_internal(self) -> None:
-        await self.database.insert_item(
-            NAMESPACE, INTERNAL_KEY, dict(self._internal))
+        async with self._internal_lock:
+            await self.database.insert_item(
+                NAMESPACE, INTERNAL_KEY, dict(self._internal))
 
     async def _persist_quietly(self) -> None:
         async with self._lock:
@@ -620,13 +672,49 @@ class MuonSetup:
     def allowed_hosts(self) -> Set[str]:
         return caller.printer_hosts(self.server)
 
+    def is_complete(self) -> bool:
+        """Whether setup counts as complete for a caller's rights. True until
+        the migration check has decided, and for a read-only newer state, so
+        a `bluetooth` caller gets the narrower rights while nobody knows."""
+        return (
+            self.doc is None or self.read_only_version is not None
+            or self.doc["state"] == "complete"
+        )
+
+    def complete_for_floor(self) -> bool:
+        """For muon_floor.check_bluetooth: complete once the state says so,
+        a newer build's read-only state included. Unlike is_complete, "not
+        known yet" is NOT complete: there the narrower side is the other one,
+        a Bluetooth phone held to the setup routes."""
+        return self.doc is not None and self.doc["state"] == "complete"
+
+    def classify(self, webreq: WebRequest) -> str:
+        """The caller's kind (02 §3). A `bluetooth` caller's code also
+        refreshes `nearby` here, so every muon_setup request counts: the
+        state read, the options, the driver claim and every write, over
+        HTTP or the websocket."""
+        kind = caller.caller_kind(webreq)
+        if kind == caller.BLUETOOTH:
+            code = caller.ble_code(webreq)
+            if code is not None:
+                self._note_nearby(code)
+        return kind
+
+    def authorise(self, webreq: WebRequest, allowed: FrozenSet[str]) -> str:
+        """Classify and authorise a read or a write. Returns the kind."""
+        kind = self.classify(webreq)
+        caller.require(kind, allowed, self.is_complete())
+        return kind
+
     def begin(
         self, webreq: WebRequest, allowed: FrozenSet[str] = caller.WRITE
     ) -> str:
         """Classify, authorise and hygiene-check a write. Returns the kind."""
-        kind = caller.caller_kind(webreq)
-        caller.require(kind, allowed)
-        caller.check_hygiene(webreq, self.allowed_hosts())
+        kind = self.authorise(webreq, allowed)
+        # KAN-436: a `bluetooth` caller cannot choose its Host (see
+        # caller.check_hygiene); every other class keeps the Host rule.
+        caller.check_hygiene(webreq, self.allowed_hosts(),
+                             host_exempt=kind == caller.BLUETOOTH)
         return kind
 
     async def wait_resolved(self, timeout: Optional[float] = None) -> bool:
@@ -677,8 +765,11 @@ class MuonSetup:
             return self.envelope(model.error(
                 "aux_unavailable", "setup state is not ready yet"))
         started_op: Optional[Tuple[str, OpRunner]] = None
-        async with self._lock:
+        async with self._reset_lock, self._lock:
             doc = self.doc
+            # A `bluetooth` caller's rights depend on `state`, which may have
+            # become `complete` while this write waited for the lock.
+            caller.require(kind, allowed, self.is_complete())
             if not protection_exempt:
                 caller.refuse_if_protected(kind, doc["state"])
             if doc["state"] == "complete" and not after_complete:
@@ -837,12 +928,16 @@ class MuonSetup:
     # ------------------------------------------------------------------
 
     async def _handle_get(self, webreq: WebRequest) -> Dict[str, Any]:
-        caller.require(caller.caller_kind(webreq), caller.READ_STATE)
+        kind = self.authorise(webreq, caller.READ_STATE)
         await self.wait_resolved(STARTUP_WAIT)
-        return self.public_state()
+        state = self.public_state()
+        if caller.withholds_link_secrets(kind, self.is_complete()):
+            # KAN-429: a remote read gets remote.link without code and url.
+            state = caller.without_link_secrets(state)
+        return state
 
     async def _handle_options(self, webreq: WebRequest) -> Dict[str, Any]:
-        caller.require(caller.caller_kind(webreq), caller.READ)
+        self.authorise(webreq, caller.READ)
         options: Dict[str, Any] = {
             "languages": [
                 {"code": code, "endonym": ENDONYMS.get(code, code)}
@@ -876,10 +971,18 @@ class MuonSetup:
         surface = args.get("kind")
         client_id = args.get("client_id")
         if surface not in DRIVER_KINDS:
-            raise ServerError("muon_setup: 'kind' must be panel, phone or web", 400)
-        if (surface == "panel") != (kind in caller.PANEL_ONLY):
+            raise ServerError(
+                "muon_setup: 'kind' must be one of " + ", ".join(DRIVER_KINDS),
+                400)
+        if (surface == "panel") != (kind in caller.PANEL_ONLY) or (
+            surface == "bluetooth" and kind != caller.BLUETOOTH
+        ):
             raise ServerError(
                 f"muon_setup: a {kind} caller cannot drive as {surface}", 403)
+        if kind == caller.BLUETOOTH:
+            # ADR 0032 D4 rule 4: the transport decides, not the body. The
+            # panel says "a phone over Bluetooth" only for one that is.
+            surface = "bluetooth"
         if not (isinstance(client_id, str) and _CLIENT_ID_RE.match(client_id)):
             raise ServerError("muon_setup: 'client_id' is not a valid id", 400)
         if self.read_only_version is not None or not await self.wait_resolved(
@@ -888,6 +991,7 @@ class MuonSetup:
             return self.envelope(model.error(
                 "aux_unavailable", "setup state is not ready yet"))
         async with self._lock:
+            caller.require(kind, caller.WRITE, self.is_complete())
             doc = self.doc
             now = time.time()
             driver = doc.get("driver")
@@ -908,6 +1012,55 @@ class MuonSetup:
                 self._notify()
             self._arm_lapse_timer()
         return self.envelope()
+
+    # ------------------------------------------------------------------
+    # `nearby`: a phone connecting over Bluetooth (ADR 0032 D7 "State")
+    # ------------------------------------------------------------------
+
+    def _nearby_public(self) -> Optional[Dict[str, Any]]:
+        record = self._nearby
+        if record is None or self.nearby_clock() - record["seen"] >= NEARBY_TTL:
+            return None
+        return {"code": record["code"]}
+
+    def _note_nearby(self, code: str) -> None:
+        """A `bluetooth` request carried `code`. Announce it if `nearby`
+        changes; a repeat of the same code only moves the 20 s on, and is
+        not announced (like a driver renewal)."""
+        if self.is_complete():
+            return
+        before = self._nearby_public()
+        self._nearby = {"code": code, "seen": self.nearby_clock()}
+        self._arm_nearby_timer(NEARBY_TTL)
+        if self._nearby_public() != before:
+            self._notify()
+
+    def _arm_nearby_timer(self, delay: float) -> None:
+        if self._nearby_timer is not None:
+            self._nearby_timer.cancel()
+        loop = asyncio.get_event_loop()
+        self._nearby_timer = loop.call_later(delay, self._on_nearby_timer)
+
+    def _on_nearby_timer(self) -> None:
+        """Clear `nearby` once NEARBY_TTL has passed since the last code, and
+        announce it: nothing else would tell the panel the phone has gone."""
+        self._nearby_timer = None
+        record = self._nearby
+        if record is None or self._closed:
+            return
+        remaining = record["seen"] + NEARBY_TTL - self.nearby_clock()
+        if remaining > 0:
+            self._arm_nearby_timer(remaining)
+            return
+        self._nearby = None
+        if not self.is_complete():
+            self._notify()
+
+    def _clear_nearby(self) -> None:
+        self._nearby = None
+        if self._nearby_timer is not None:
+            self._nearby_timer.cancel()
+            self._nearby_timer = None
 
     def _arm_lapse_timer(self) -> None:
         # Tell the panel when a phone's claim lapses, since renewals are not
@@ -1005,18 +1158,27 @@ class MuonSetup:
                     step["status"] = SKIPPED
             doc["state"] = "complete"
             doc["cursor"] = FINISH
-            self._spawn(self._on_complete())
+            self._spawn(self._on_complete(webreq))
             return None
         return await self.write(webreq, handler, after_complete=True)
 
-    async def _on_complete(self) -> None:
-        """02 §5.11: the marker, then `muon_setup:complete`, then the hotspot
-        auto-off, in that order. Runs once the change is saved and announced:
-        write() holds the lock until it has committed."""
+    async def _on_complete(self, webreq: WebRequest) -> None:
+        """After the response: marker, complete event, then hotspot auto-off.
+
+        The BLE gateway enrols the setup peer only after a successful finish
+        response. Waiting prevents the marker from making Moonraker treat the
+        still-unenrolled peer as an ordinary client first. ``write()`` still
+        supplies the lock barrier for the committed state.
+        """
         async with self._lock:
             pass
+        await webreq.wait_for_response_sent()
         if self.doc is None or self.doc["state"] != "complete":
             return
+        # ADR 0032 D7: `nearby` is null once setup is complete. The state
+        # already says so; this drops the code itself, so a reset does not
+        # bring back one from before it.
+        self._clear_nearby()
         self._internal["marker_by"] = "muon_setup"
         if await self._marker_once() == "retry":
             self._start_marker_sync()
@@ -1128,11 +1290,18 @@ class MuonSetup:
         if not await self.wait_resolved(STARTUP_WAIT) or self.doc is None:
             return self.envelope(model.error(
                 "aux_unavailable", "setup state is not ready yet"))
-        # Not through write(), so the Level 1 check is made here: at Level 1
-        # the LAN may not stop a join the panel started.
-        caller.refuse_if_protected(kind, self.doc["state"])
-        await self.cancel_op(("region_apply", "join"))
-        return self.envelope()
+        async with self._reset_lock:
+            # Not through write(), so the Level 1 check is made here: at Level 1
+            # the LAN may not stop a join the panel started.
+            caller.refuse_if_protected(kind, self.doc["state"])
+            ssid, forget = network.cancel_cleanup_info(self)
+            if ssid is not None and forget and network.cleanup_possible(self, ssid):
+                await network.remember_cleanup(self, ssid)
+            await self.cancel_op(("region_apply", "join"))
+            # 02 §5.6a: the partial profile goes too (only when the join made
+            # it -- an owner's saved profile is never deleted).
+            await network.cancel_cleanup(self, ssid, forget)
+            return self.envelope()
 
     async def _handle_reset(self, webreq: WebRequest) -> Dict[str, Any]:
         """Development and support only (02 §5.11, 07 S11). Floored, and
@@ -1142,37 +1311,52 @@ class MuonSetup:
         the new one."""
         self.begin(webreq, caller.RESET)
         await self.wait_resolved(STARTUP_WAIT)
-        if self._marker_task is not None and not self._marker_task.done():
-            self._marker_task.cancel()
-        if self._op_task is not None and not self._op_task.done():
-            self._op_task.cancel()
-            try:
-                await asyncio.wait_for(asyncio.shield(self._op_task), 15.)
-            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
-                pass
-        async with self._lock:
-            old_rev = self.doc["rev"] if self.doc is not None else 0
-            if self.read_only_version is not None:
-                stored = await self.database.get_item(NAMESPACE, STATE_KEY, None)
-                if isinstance(stored, dict) and isinstance(stored.get("rev"), int):
-                    old_rev = max(old_rev, stored["rev"])
-            for key in (STATE_KEY, INTERNAL_KEY):
+        async with self._reset_lock:
+            ssid, forget = network.cancel_cleanup_info(self)
+            connect = self._join_connect
+            if ssid is not None and forget and network.cleanup_possible(self, ssid):
+                await network.remember_cleanup(self, ssid)
+            if self._marker_task is not None and not self._marker_task.done():
+                self._marker_task.cancel()
+            if self._op_task is not None and not self._op_task.done():
+                self._op_task.cancel()
                 try:
-                    await self.database.delete_item(NAMESPACE, key)
-                except Exception:
+                    await asyncio.wait_for(asyncio.shield(self._op_task), 15.)
+                except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
                     pass
-            self.read_only_version = None
-            self._internal = {
-                "marker_written": False, "tz_source": None,
-                "marker_clear_pending": True,
-            }
-            doc = model.new_document(manifest.item_ids(self.manifest))
-            doc["rev"] = old_rev + 1
-            self.doc = doc
-            await self._persist()
-            await self._persist_internal()
-            self._resolved.set()
-            self._notify()
+            # Finish pending join work before replacing the document. New profiles
+            # are cleaned up; owner profiles remain intact and are only awaited.
+            await network.cancel_cleanup(self, ssid, forget)
+            network.resume_cleanup(self)
+            if self._join_cleanup is not None:
+                await asyncio.shield(self._join_cleanup)
+            if connect is not None:
+                await network._connect_result(connect)
+            if self._internal.get("join_cleanup_ssid") is not None:
+                raise ServerError("join profile cleanup has not finished", 409)
+            async with self._lock:
+                old_rev = self.doc["rev"] if self.doc is not None else 0
+                if self.read_only_version is not None:
+                    stored = await self.database.get_item(NAMESPACE, STATE_KEY, None)
+                    if isinstance(stored, dict) and isinstance(stored.get("rev"), int):
+                        old_rev = max(old_rev, stored["rev"])
+                for key in (STATE_KEY, INTERNAL_KEY):
+                    try:
+                        await self.database.delete_item(NAMESPACE, key)
+                    except Exception:
+                        pass
+                self.read_only_version = None
+                self._internal = {
+                    "marker_written": False, "tz_source": None,
+                    "marker_clear_pending": True,
+                }
+                doc = model.new_document(manifest.item_ids(self.manifest))
+                doc["rev"] = old_rev + 1
+                self.doc = doc
+                await self._persist()
+                await self._persist_internal()
+                self._resolved.set()
+                self._notify()
         # OS-7's DELETE /setup/complete, so the hotspot's H1 rule sees a new
         # printer again. Retried every 30 s while Aux is down, for as long as
         # the state stays short of `complete`.
@@ -1293,22 +1477,42 @@ class MuonSetup:
         self._live["hotspot"]["ssid"] = identity.get("ssid")
 
     async def _refresh_region(self) -> None:
+        state: Any = None
+        options: Any = None
         try:
             state = await self.aux("GET", "/region")
+        except AuxMissing:
+            self._region_state_missing = True
+        except (AuxUnavailable, AuxRefused):
+            pass  # Preserve prior evidence until this endpoint answers.
+        else:
+            # Even a malformed successful reply proves the route exists.
+            self._region_state_missing = False
+        try:
             options = await self.aux("GET", "/region/options")
         except AuxMissing:
-            self._live["region"] = None
-            return
+            self._region_options_missing = True
         except (AuxUnavailable, AuxRefused):
-            return
-        if isinstance(state, dict) and isinstance(options, dict):
-            # Aux GET /region verbatim, plus the derived market (02 §6).
+            pass
+        else:
+            self._region_options_missing = False
+        self._region_missing = (
+            self._region_state_missing and self._region_options_missing)
+        if self._region_missing:
+            self._live["region"] = None
+        elif isinstance(state, dict) and isinstance(options, dict):
             self._live["region"] = region.state_region(state, options)
+        elif isinstance(state, dict):
+            # A partial capability must not imply an unrestricted market.
+            self._live["region"] = dict(state, market="unknown")
+        elif self._region_state_missing or self._region_options_missing:
+            self._live["region"] = None
 
     def _refresh_capabilities(self) -> None:
         caps = self._live["capabilities"]
         caps["ethernet"] = os.path.exists("/sys/class/net/eth0")
-        caps["cloud_link"] = self.server.lookup_component("muon_link", None) is not None
+        # cloud_link follows GET /server/muon/link (02 §5.9); remote.py's
+        # live refresher keeps it current.
 
 
 def load_component(config: ConfigHelper) -> MuonSetup:

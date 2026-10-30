@@ -5,6 +5,7 @@
 # This file may be distributed under the terms of the GNU GPLv3 license
 
 from __future__ import annotations
+import asyncio
 import os
 import mimetypes
 import logging
@@ -26,6 +27,7 @@ from tornado.log import access_log
 from ..utils import ServerError, source_info, parse_ip_address, redact
 from ..utils.real_ip import validate_real_ip_header
 from .. import muon_access_policy
+from .. import muon_floor
 from ..common import (
     JsonRPC,
     WebRequest,
@@ -462,6 +464,47 @@ class MoonrakerApp:
         self.template_cache[asset_name] = asset_tmpl
         return asset_tmpl
 
+def _status_line_reason(status_code: int, message: str) -> str:
+    # The reason phrase goes on the status line, so it must be one line.
+    # Klipper ends a macro's error with the newline that
+    # traceback.format_exception_only() leaves, and Tornado refuses a status
+    # line holding CR or LF only *after* it has committed to the body's
+    # Content-Length. Its fallback finish() then raised HTTPOutputError and
+    # the client got an empty reply instead of the refusal (KAN-991). The
+    # full message still goes in the JSON body.
+    for line in message.splitlines():
+        line = line.strip()
+        if line:
+            return line
+    return tornado.httputil.responses.get(status_code, "Unknown")
+
+def _error_message(
+    req_hdlr: tornado.web.RequestHandler, exc_info: Any
+) -> str:
+    # MUON (KAN-113): the message comes from the HTTPError that carried it,
+    # not from _reason. Since Tornado 6.5.3, send_error's set_status replaces
+    # a reason it will not put on a status line (CR or LF, "<", ...) with
+    # "Unknown" before write_error runs, so _reason no longer holds a macro's
+    # multi-line error, and the JSON body lost it with the status line. On
+    # earlier Tornado both are the same string.
+    if exc_info is not None:
+        exc = exc_info[1]
+        if isinstance(exc, tornado.web.HTTPError) and exc.reason:
+            return exc.reason
+    return req_hdlr._reason
+
+def _write_json_error(
+    req_hdlr: tornado.web.RequestHandler, status_code: int, **kwargs
+) -> None:
+    message = _error_message(req_hdlr, kwargs.get('exc_info'))
+    err: Dict[str, Any] = {'code': status_code, 'message': message}
+    if 'exc_info' in kwargs:
+        err['traceback'] = "\n".join(
+            traceback.format_exception(*kwargs['exc_info']))
+    req_hdlr.set_status(status_code, _status_line_reason(status_code, message))
+    req_hdlr.set_header("Content-Type", "application/json; charset=UTF-8")
+    req_hdlr.finish(jsonw.dumps({'error': err}))
+
 def _set_cors_headers(req_hdlr: tornado.web.RequestHandler) -> None:
     request = req_hdlr.request
     origin: Optional[str] = request.headers.get("Origin")
@@ -532,12 +575,7 @@ class AuthorizedRequestHandler(tornado.web.RequestHandler):
         return conn
 
     def write_error(self, status_code: int, **kwargs) -> None:
-        err = {'code': status_code, 'message': self._reason}
-        if 'exc_info' in kwargs:
-            err['traceback'] = "\n".join(
-                traceback.format_exception(*kwargs['exc_info']))
-        self.set_header("Content-Type", "application/json; charset=UTF-8")
-        self.finish(jsonw.dumps({'error': err}))
+        _write_json_error(self, status_code, **kwargs)
 
 # Due to the way Python treats multiple inheritance its best
 # to create a separate authorized handler for serving files
@@ -575,12 +613,7 @@ class AuthorizedFileHandler(tornado.web.StaticFileHandler):
             super(AuthorizedFileHandler, self).options()
 
     def write_error(self, status_code: int, **kwargs) -> None:
-        err = {'code': status_code, 'message': self._reason}
-        if 'exc_info' in kwargs:
-            err['traceback'] = "\n".join(
-                traceback.format_exception(*kwargs['exc_info']))
-        self.set_header("Content-Type", "application/json; charset=UTF-8")
-        self.finish(jsonw.dumps({'error': err}))
+        _write_json_error(self, status_code, **kwargs)
 
     def _check_need_auth(self) -> bool:
         if self.request.method != "GET":
@@ -603,6 +636,12 @@ class DynamicRequestHandler(AuthorizedRequestHandler):
         self.wrap_result = wrap_result
         self.content_type = content_type
         self.auth_required = api_definition.auth_required
+        self._response_sent: Optional[asyncio.Future] = None
+
+    def on_finish(self) -> None:
+        """Release work which must happen only after the HTTP response."""
+        if self._response_sent is not None and not self._response_sent.done():
+            self._response_sent.set_result(None)
 
     # Converts query string values with type hints
     def _convert_type(self, value: str, hint: str) -> Any:
@@ -616,9 +655,10 @@ class DynamicRequestHandler(AuthorizedRequestHandler):
         func = type_funcs[hint]
         try:
             converted = func(value)
-        except Exception:
-            logging.exception("Argument conversion error: Hint: "
-                              f"{hint}, Arg: {value}")
+        except Exception as error:
+            # Values and conversion exception messages may carry credentials.
+            logging.error("Argument conversion error: Hint: %s, Error: %s",
+                          hint, type(error).__name__)
             return value
         return converted
 
@@ -705,11 +745,12 @@ class DynamicRequestHandler(AuthorizedRequestHandler):
         self._log_debug(f"HTTP Request::{req}", args)
         try:
             ip = parse_ip_address(self.request.remote_ip or "")
+            self._response_sent = asyncio.get_running_loop().create_future()
             # MUON, KAN-203: pass the headers on, so a component can apply
             # its own CSRF and DNS-rebinding checks (WebRequest.get_http_headers)
             result = await self.api_defintion.request(
                 args, req_type, transport, ip, self.current_user,
-                self.request.headers
+                self.request.headers, self._response_sent
             )
         except ServerError as e:
             if self.server.is_verbose_enabled():
@@ -748,6 +789,11 @@ class RPCHandler(AuthorizedRequestHandler, APITransport):
     def screen_rpc_request(
         self, api_def: APIDefinition, req_type: RequestType, args: Dict[str, Any]
     ) -> None:
+        auth: AuthComp = self.server.lookup_component("authorization", None)
+        if auth is not None and not auth.panel_password_allows(
+            self.current_user, self.ip_addr
+        ):
+            self.current_user = None
         if self.current_user is None and api_def.auth_required:
             raise self.server.error("Unauthorized", 401)
         if api_def.endpoint == "objects/subscribe":
@@ -960,11 +1006,13 @@ def _check_file_access(
     request_type: RequestType,
     args: Dict[str, Any],
 ) -> None:
-    """The level table for the file handlers that bypass APIDefinition."""
+    """The level table for the file handlers that bypass APIDefinition, and
+    the Bluetooth setup rule (KAN-436), which they would bypass too."""
+    ip_addr = parse_ip_address(request.remote_ip or "")
     try:
+        muon_floor.check_bluetooth(endpoint, None, ip_addr, user)
         muon_access_policy.check_access(
-            endpoint, request_type, args, None,
-            parse_ip_address(request.remote_ip or ""), user,
+            endpoint, request_type, args, None, ip_addr, user,
         )
     except ServerError as e:
         raise tornado.web.HTTPError(e.status_code, reason=str(e)) from e
@@ -1133,12 +1181,7 @@ class AuthorizedErrorHandler(AuthorizedRequestHandler):
         pass
 
     def write_error(self, status_code: int, **kwargs) -> None:
-        err = {'code': status_code, 'message': self._reason}
-        if 'exc_info' in kwargs:
-            err['traceback'] = "\n".join(
-                traceback.format_exception(*kwargs['exc_info']))
-        self.set_header("Content-Type", "application/json; charset=UTF-8")
-        self.finish(jsonw.dumps({'error': err}))
+        _write_json_error(self, status_code, **kwargs)
 
 class RedirectHandler(AuthorizedRequestHandler):
     def initialize(self) -> None:

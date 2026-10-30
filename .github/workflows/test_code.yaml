@@ -1,10 +1,34 @@
 # CI for code style and application tests
 
 name: test-code
-on: [push, pull_request]
+# MUON (KAN-708): upstream is `on: [push, pull_request]`, which builds every
+# commit on a branch with an open pull request twice. As in Muon3D_Klipper's
+# build-test.yaml (KAN-337): `push` only on the default branch, every other
+# branch through `pull_request`, and a newer commit on the same pull request
+# cancels the run it supersedes.
+#
+# runs-on is the bigbox pool (`vars.LINUX_RUNS_ON`, else the `muon-ci`
+# labels): Muon runs no CI on GitHub-hosted runners (Jack, 28 Oct). This
+# repository is public, so the job runs only for a push here or a pull request
+# from a branch of this repository; a fork's pull request gets no job. That
+# `if` is not the security boundary, because a fork's pull request runs the
+# workflow file from its own branch: the repository's "Require approval for
+# all external contributors" setting is, and it must be on before bigbox
+# serves this repository. d01f23d reverted the first switch (440ef7f) because
+# neither was in place.
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+concurrency:
+  group: test-code-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   lint-python-code:
-    runs-on: ubuntu-22.04
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ fromJSON(vars.LINUX_RUNS_ON || '["self-hosted","muon-ci"]') }}
     steps:
       - uses: actions/checkout@v3
       - uses: weibullguy/python-lint-plus@v1.12.0

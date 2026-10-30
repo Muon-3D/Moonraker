@@ -18,6 +18,7 @@ from ..common import (
 from ..utils import ServerError, parse_ip_address
 from ..utils.real_ip import validate_real_ip_header
 from .. import muon_access_policy
+from .. import muon_floor
 
 # Annotation imports
 from typing import (
@@ -33,6 +34,7 @@ from typing import (
 )
 
 if TYPE_CHECKING:
+    from ..common import UserInfo
     from ..server import Server
     from .klippy_connection import KlippyConnection as Klippy
     from ..confighelper import ConfigHelper
@@ -173,6 +175,11 @@ class WebsocketManager:
         return ret
 
     def add_client(self, sc: BaseRemoteConnection) -> None:
+        auth: AuthComp = self.server.lookup_component("authorization", None)
+        if auth is not None and not auth.panel_password_allows(
+            sc.user_info, sc.authentication_ip
+        ):
+            self._close_password_client(sc)
         self.clients[sc.uid] = sc
         self.server.send_event("websockets:client_added", sc)
         logging.debug(f"New Websocket Added: {sc.uid}")
@@ -185,8 +192,45 @@ class WebsocketManager:
         self._check_closed_event()
 
     def add_bridge_connection(self, bc: BridgeSocket) -> None:
+        auth: AuthComp = self.server.lookup_component("authorization", None)
+        if auth is not None and not auth.panel_password_allows(
+            bc.current_user, bc.ip_addr
+        ):
+            self._close_password_bridge(bc)
+            return
         self.bridge_connections[bc.uid] = bc
         logging.debug(f"New Bridge Connection Added: {bc.uid}")
+
+    @staticmethod
+    def _close_password_bridge(bc: BridgeSocket) -> None:
+        bc.is_closed = True
+        bc.klippy_write_buf.clear()
+        if bc.klippy_writer is not None:
+            bc.klippy_writer.close()
+            bc.klippy_writer = None
+        bc.close_socket(1008, "Panel password changed")
+
+    def _close_password_client(self, sc: BaseRemoteConnection) -> None:
+        if sc.user_info is not None:
+            sc.on_user_logout(sc.user_info.username)
+        kconn: Optional[Klippy] = self.server.lookup_component(
+            "klippy_connection", None)
+        if kconn is not None:
+            kconn.remove_subscription(sc)
+        sc.close_socket(1008, "Panel password changed")
+
+    def invalidate_panel_password_sessions(self) -> None:
+        auth: AuthComp = self.server.lookup_component("authorization", None)
+        if auth is None:
+            return
+        for sc in list(self.clients.values()):
+            if sc.user_info is not None and not auth.panel_password_allows(
+                sc.user_info, sc.authentication_ip
+            ):
+                self._close_password_client(sc)
+        for bc in list(self.bridge_connections.values()):
+            if not auth.panel_password_allows(bc.current_user, bc.ip_addr):
+                self._close_password_bridge(bc)
 
     def remove_bridge_connection(self, bc: BridgeSocket) -> None:
         old_bc = self.bridge_connections.pop(bc.uid, None)
@@ -326,6 +370,10 @@ class WebSocket(WebSocketHandler, BaseRemoteConnection):
     # Check Authorized User
     async def prepare(self) -> None:
         validate_real_ip_header(self.request.headers)
+        if not muon_floor.setup_complete():
+            muon_floor.check_bluetooth(
+                "/websocket", None,
+                parse_ip_address(self.request.remote_ip or ""), None)
         max_conns = self.settings["max_websocket_connections"]
         if self.__class__.connection_count >= max_conns:
             raise self.server.error(
@@ -344,11 +392,18 @@ class WebSocket(WebSocketHandler, BaseRemoteConnection):
             else:
                 origin = self.request.headers.get("Sec-Websocket-Origin", None)
             self.cors_allowed = await auth.check_cors(origin)
+        # Authentication distinguishes an enrolled Bluetooth principal from
+        # the setup connection.  Check before upgrade: broadcasts otherwise
+        # disclose the console and Klippy state without an RPC request.
+        muon_floor.check_bluetooth(
+            "/websocket", None, self.ip_addr, self.user_info)
 
     def close_socket(self, code: int, reason: str) -> None:
         self.close(code, reason)
 
 class BridgeSocket(WebSocketHandler):
+    current_user: Optional[UserInfo]
+
     def initialize(self) -> None:
         self.server: Server = self.settings['server']
         self.wsm: WebsocketManager = self.server.lookup_component("websockets")
@@ -475,6 +530,10 @@ class BridgeSocket(WebSocketHandler):
     # Check Authorized User
     async def prepare(self) -> None:
         validate_real_ip_header(self.request.headers)
+        if not muon_floor.setup_complete():
+            muon_floor.check_bluetooth(
+                "/klippysocket", None,
+                parse_ip_address(self.request.remote_ip or ""), None)
         max_conns = self.settings["max_websocket_connections"]
         if WebSocket.connection_count >= max_conns:
             raise self.server.error(
@@ -488,6 +547,8 @@ class BridgeSocket(WebSocketHandler):
             else:
                 origin = self.request.headers.get("Sec-Websocket-Origin", None)
             self.cors_allowed = await auth.check_cors(origin)
+        muon_floor.check_bluetooth(
+            "/klippysocket", None, self.ip_addr, self.current_user)
         kconn: Klippy = self.server.lookup_component("klippy_connection")
         try:
             reader, writer = await kconn.open_klippy_connection()
