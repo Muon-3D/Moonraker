@@ -4,7 +4,7 @@ import asyncio
 import pathlib
 from typing import TYPE_CHECKING, Dict
 from moonraker.server import ServerError
-from moonraker.klippy_connection import KlippyRequest
+from moonraker.components.klippy_connection import KlippyRequest
 from mocks import MockReader, MockWriter
 
 if TYPE_CHECKING:
@@ -12,7 +12,7 @@ if TYPE_CHECKING:
     from conftest import KlippyProcess
 
 @pytest.mark.usefixtures("klippy")
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="class")
 async def test_klippy_startup(full_server: Server):
     evtloop = full_server.get_event_loop()
     futs = [evtloop.create_future() for _ in range(3)]
@@ -30,7 +30,7 @@ async def test_klippy_startup(full_server: Server):
         full_server.klippy_connection.is_connected()
     )
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="class")
 async def test_gcode_response(ready_server: Server,
                               klippy: KlippyProcess):
     evtloop = ready_server.get_event_loop()
@@ -44,7 +44,7 @@ async def test_gcode_response(ready_server: Server,
     await asyncio.wait_for(fut, 1.)
     assert "Moonraker Test" in fut.result()
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="class")
 async def test_klippy_shutdown(ready_server: Server, klippy: KlippyProcess):
     evtloop = ready_server.get_event_loop()
     fut = evtloop.create_future()
@@ -57,7 +57,7 @@ async def test_klippy_shutdown(ready_server: Server, klippy: KlippyProcess):
     await asyncio.wait_for(fut, 2.)
     assert fut.result() == "shutdown"
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="class")
 async def test_klippy_reconnect(ready_server: Server, klippy: KlippyProcess):
     evtloop = ready_server.get_event_loop()
     futs = [evtloop.create_future() for _ in range(2)]
@@ -72,14 +72,14 @@ async def test_klippy_reconnect(ready_server: Server, klippy: KlippyProcess):
     assert ret == ["disconnect", "ready"]
 
 @pytest.mark.run_paths(klippy_uds="fake_uds")
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="class")
 async def test_no_klippy_connection_error(full_server: Server):
     await full_server.start_server()
     with pytest.raises(ServerError):
         kapis = full_server.klippy_connection.klippy_apis
         await kapis.run_gcode("M115")
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="class")
 async def test_status_update(ready_server: Server, klippy: KlippyProcess):
     evtloop = ready_server.get_event_loop()
     fut = evtloop.create_future()
@@ -96,19 +96,19 @@ async def test_status_update(ready_server: Server, klippy: KlippyProcess):
     assert isinstance(fut.result(), dict)
 
 @pytest.mark.run_paths(printer_cfg="error_printer.cfg")
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="class")
 async def test_klippy_error(ready_server: Server):
     kconn = ready_server.klippy_connection
     assert kconn.state == "error"
 
 @pytest.mark.run_paths(printer_cfg="missing_reqs.cfg")
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="class")
 async def test_missing_reqs(ready_server: Server):
     mreqs = sorted(ready_server.klippy_connection.missing_requirements)
     expected = ["display_status", "pause_resume", "virtual_sdcard"]
     assert mreqs == expected
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="class")
 async def test_connection_close(full_server: Server):
     await full_server.start_server()
     # Test multiple close attempts, the second to enter
@@ -119,7 +119,7 @@ async def test_connection_close(full_server: Server):
     kconn = full_server.klippy_connection
     assert kconn.connection_task.cancelled()
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="class")
 async def test_init_error(base_server: Server):
     base_server.server_running = True
     kconn = base_server.klippy_connection
@@ -134,13 +134,13 @@ def test_connect_fail(base_server: Server):
     ret = base_server.klippy_connection.connect()
     assert ret.result() is False
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="class")
 async def test_wait_connect_fail(base_server: Server):
     ret = await base_server.klippy_connection.wait_connected()
     assert ret is False
 
 @pytest.mark.run_paths(klippy_uds="fake_uds")
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="class")
 async def test_no_uds(base_server: Server):
     attempts = [1, 2, 3]
 
@@ -152,7 +152,7 @@ async def test_no_uds(base_server: Server):
     assert ret is False
 
 @pytest.mark.run_paths(klippy_uds="fake_uds")
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="class")
 async def test_no_uds_access(base_server: Server,
                              path_args: Dict[str, pathlib.Path]):
     attempts = [1, 2, 3]
@@ -167,14 +167,14 @@ async def test_no_uds_access(base_server: Server,
     ret = await base_server.klippy_connection._do_connect()
     assert ret is False
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="class")
 async def test_write_not_connected(base_server: Server):
     req = KlippyRequest("", {})
     kconn = base_server.klippy_connection
     await kconn._write_request(req)
     assert isinstance(req.response, ServerError)
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="class")
 async def test_write_error(base_server: Server):
     req = KlippyRequest("", {})
     kconn = base_server.klippy_connection
@@ -182,7 +182,7 @@ async def test_write_error(base_server: Server):
     await kconn._write_request(req)
     assert isinstance(req.response, ServerError)
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="class")
 async def test_write_cancelled(base_server: Server):
     req = KlippyRequest("", {})
     kconn = base_server.klippy_connection
@@ -192,7 +192,7 @@ async def test_write_cancelled(base_server: Server):
     with pytest.raises(asyncio.CancelledError):
         await task
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="class")
 async def test_read_error(base_server: Server,
                           caplog: pytest.LogCaptureFixture):
     mock_reader = MockReader("raise_error")
@@ -200,7 +200,7 @@ async def test_read_error(base_server: Server,
     await kconn._read_stream(mock_reader)
     assert "Klippy Stream Read Error" == caplog.messages[-1]
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="class")
 async def test_read_cancelled(base_server: Server):
     mock_reader = MockReader("wait")
     kconn = base_server.klippy_connection
@@ -210,7 +210,7 @@ async def test_read_cancelled(base_server: Server):
     with pytest.raises(asyncio.CancelledError):
         await task
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="class")
 async def test_read_decode_error(base_server: Server,
                                  caplog: pytest.LogCaptureFixture):
     mock_reader = MockReader()
@@ -242,7 +242,7 @@ def test_process_invalid_request(base_server: Server):
     assert isinstance(req.response, ServerError)
 
 # TODO: This can probably go in a class with test apis
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="class")
 async def test_call_remote_method(base_server: Server,
                                   klippy: KlippyProcess):
     fut = base_server.get_event_loop().create_future()

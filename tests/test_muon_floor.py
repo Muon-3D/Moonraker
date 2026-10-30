@@ -666,3 +666,75 @@ class TestTheLevelSetter:
         with pytest.raises(ValueError):
             muon_floor.set_protection_level(bad)
         assert muon_floor.protection_level() == muon_floor.LEVEL_OPEN
+
+
+# ---------------------------------------------------------------------------
+# KAN-436, ADR 0032 D4: muon-link's Bluetooth address, 192.0.2.2.
+#
+# `muon_setup` gives it the hotspot's rights during setup. This module must not
+# follow: it treats 192.0.2.2 exactly as it treats 192.0.2.1, at all times.
+# `muon_floor` takes no setup state as input, so "at all times" is structural;
+# what these tests pin is "exactly as 192.0.2.1".
+# ---------------------------------------------------------------------------
+
+BLUETOOTH = ipaddress.ip_address("192.0.2.2")
+FLOOR_REFUSAL = "is not available over the network"
+
+
+class TestBluetoothIsRemote:
+    @pytest.mark.parametrize("endpoint", list(FLOOR_PREFIXES))
+    def test_the_floor_refuses_it_as_it_refuses_the_sentinel(self, endpoint):
+        for addr in (SENTINEL, BLUETOOTH):
+            with pytest.raises(ServerError) as excinfo:
+                check_floor(endpoint, HTTP, addr)
+            assert excinfo.value.status_code == 403
+            assert FLOOR_REFUSAL in str(excinfo.value)
+
+    def test_it_is_a_network_caller(self):
+        assert not local_address(BLUETOOTH)
+        assert role_for_address(BLUETOOTH) == NETWORK_ROLE
+
+    def test_it_has_an_identity_only_with_a_gateway_token(self):
+        """As the sentinel: the address alone is any request muon-link
+        forwards, and the token is what says the gateway admitted it."""
+        assert muon_floor.has_identity(HTTP, BLUETOOTH, GATEWAY_USER)
+        assert not muon_floor.has_identity(HTTP, BLUETOOTH, TRUSTED_USER)
+        assert not muon_floor.has_identity(HTTP, BLUETOOTH, None)
+
+    @pytest.mark.parametrize("user", [GATEWAY_USER, TRUSTED_USER, None])
+    @pytest.mark.parametrize("level", [muon_floor.LEVEL_OPEN,
+                                       muon_floor.LEVEL_PROTECTED])
+    @pytest.mark.parametrize("endpoint", [
+        WIFI, UPGRADE, LINK_START, "/server/aux/dev_mode",
+        "/printer/print/start", "/server/muon/setup/skip",
+    ])
+    def test_level_one_treats_it_exactly_as_the_sentinel(
+        self, endpoint, level, user
+    ):
+        muon_floor.set_protection_level(level)
+
+        def outcome(addr):
+            try:
+                check_protection(endpoint, HTTP, addr, user)
+            except ServerError as exc:
+                return (exc.status_code, str(exc))
+            return None
+
+        assert outcome(BLUETOOTH) == outcome(SENTINEL)
+
+    def test_level_one_refuses_it_without_a_token_with_the_protected_message(
+        self, protected
+    ):
+        with pytest.raises(ServerError) as excinfo:
+            check_protection(WIFI, HTTP, BLUETOOTH, TRUSTED_USER)
+        assert excinfo.value.status_code == 403
+        assert "is protected on this printer" in str(excinfo.value)
+
+    def test_the_address_is_the_one_the_gateway_binds_bluetooth_tokens_to(self):
+        from moonraker.components import muon_gateway
+        from moonraker.components.muon_setup import caller
+
+        assert str(muon_floor.BLUETOOTH_SENTINEL) == "192.0.2.2"
+        assert muon_floor.BLUETOOTH_SENTINEL == muon_gateway.BLUETOOTH_SENTINEL
+        assert muon_floor.BLUETOOTH_SENTINEL == caller.BLUETOOTH_SENTINEL
+        assert muon_floor.GATEWAY_ADDRESSES == {SENTINEL, BLUETOOTH}

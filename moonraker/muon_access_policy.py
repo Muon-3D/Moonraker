@@ -38,6 +38,20 @@
 #   * any other caller on the LAN or the hotspot, while the entry is Open: a
 #     signed-out guest with Operator, "anyone at home" (ACC-7). While the entry
 #     is Protected it is not admitted (ACC-5).
+#   * KAN-436, ADR 0032 D4: a phone setting the printer up over Bluetooth,
+#     which muon-link forwards as 192.0.2.2 with the gateway's token while
+#     setup is not complete. It may be a stranger in radio range, so it gets
+#     the least there is: the principal `bluetooth`, a signed-out guest, never
+#     on the home network, never identified, never trusted, and allowed
+#     exactly the setup routes (muon_floor.BLUETOOTH_SETUP_PREFIXES, which
+#     muon_setup and muon_link police per caller themselves) and nothing in
+#     the table besides, whatever the token carries. muon_floor.check_bluetooth
+#     already refuses the rest before this module; this holds it again, and
+#     keeps the capability list and the file and notification filters honest.
+#     Once setup is complete, 192.0.2.2 is a paired client whose connection
+#     started on Bluetooth (muon-link admits no stranger then): it is decided
+#     as a paired client through the gateway, except that it is never on the
+#     home network, whatever its token says.
 #
 # Nobody else is admitted: a request from the gateway's address without the
 # gateway's token, or with no address at all (MQTT), is refused everything.
@@ -50,7 +64,9 @@ import dataclasses
 import ipaddress
 import posixpath
 import re
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, Union
+from typing import (
+    Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple, Union
+)
 
 from . import muon_floor
 from .utils.exceptions import ServerError
@@ -138,6 +154,10 @@ class Action:
     #: Reachable by a caller on the home network that is not admitted: a
     #: new device asking the panel to let it in (ACC-6) is not, yet.
     home_unadmitted: bool = False
+    #: The row this one was split from. Until it has an override of its own
+    #: it follows that row's, so a setting made before the split still
+    #: covers everything it covered (KAN-878).
+    inherits: Optional[str] = None
 
     def level_for(self, preset: str) -> int:
         return {RELAXED: self.relaxed, STANDARD: self.standard,
@@ -155,8 +175,14 @@ _ROWS = (
     _A("print", SIGNED_OUT_GUEST, SIGNED_IN_GUEST, MEMBER),
     # Upload and delete own files
     _A("files", SIGNED_OUT_GUEST, SIGNED_IN_GUEST, MEMBER),
-    # Move, home, heat, load filament, macros
+    # Move, home, load filament, macros
     _A("motion", SIGNED_OUT_GUEST, MEMBER, MEMBER),
+    # Set a heater's target (KAN-878). Split from motion, at the same
+    # levels, so that a caller can be capped on heating apart from moving:
+    # the remote access plan's agents may move or heat only on a click, and
+    # Gate 3 has to be able to tell the two apart. Turning heaters off stays
+    # in motion, and macros that heat (LOAD_FILAMENT) are motion too.
+    _A("heat", SIGNED_OUT_GUEST, MEMBER, MEMBER, inherits="motion"),
     # Delete or reprint others' files
     _A("files_others", MEMBER, ADMIN, ADMIN),
     # Raw G-code console
@@ -325,6 +351,15 @@ def effective_preset(state: AccessState) -> str:
     return state.preset or default_preset(state.owner, state.entry)
 
 
+def _override(action: Action, state: AccessState) -> Optional[int]:
+    """The row's own override, else the one of the row it was split from."""
+    if action.name in state.overrides:
+        return state.overrides[action.name]
+    if action.inherits is not None:
+        return state.overrides.get(action.inherits)
+    return None
+
+
 def required_level(action: Action, state: AccessState) -> int:
     """The lowest level that may do this action on this printer now.
 
@@ -351,9 +386,9 @@ def required_level(action: Action, state: AccessState) -> int:
     if action.fixed:
         base = action.standard
     else:
-        base = state.overrides.get(
-            action.name, action.level_for(effective_preset(state))
-        )
+        override = _override(action, state)
+        base = (override if override is not None
+                else action.level_for(effective_preset(state)))
     if state.owner in (OWNER_NONE, OWNER_UNKNOWN):
         # (OWNER_UNKNOWN only for a delegated row, handled above otherwise)
         if action.name in ("protection", "bridge"):
@@ -382,7 +417,7 @@ def overridable(action_name: str) -> bool:
 
 @dataclasses.dataclass(frozen=True)
 class Principal:
-    #: panel, internal, gateway, password or home
+    #: panel, internal, gateway, password, home or bluetooth
     kind: str
     name: str
     level: int
@@ -424,6 +459,38 @@ def _gateway_principal(user: Any) -> Principal:
     return Principal("gateway", name, level, role, home, True)
 
 
+#: KAN-436: the principal of a phone setting the printer up over Bluetooth.
+BLUETOOTH = "bluetooth"
+#: The rows of the table a Bluetooth setup principal may do: muon_setup's and
+#: the link's, both delegated to the component behind them. What it may reach
+#: is decided by endpoint (muon_floor.BLUETOOTH_SETUP_PREFIXES); these are
+#: only what the capability list reports.
+BLUETOOTH_ACTIONS = frozenset(("setup", "owner"))
+BLUETOOTH_REASON = (
+    "a phone setting this printer up over Bluetooth reaches the setup routes "
+    "only"
+)
+#: The one notification a Bluetooth setup principal is sent, were it ever to
+#: hold a websocket (muon_floor refuses it one): muon_setup's own.
+BLUETOOTH_NOTIFICATIONS = frozenset(("muon_setup_changed",))
+
+
+def _bluetooth_principal(
+    transport: Optional[Any], ip_addr: Optional[Any], user: Any
+) -> Principal:
+    """192.0.2.2 with the gateway's token. Before setup is complete, the
+    Bluetooth setup principal: the lowest level, a Viewer's role, not home,
+    not identified, whatever the token names. After, the paired client the
+    token names, never on the home network."""
+    if muon_floor.bluetooth_setup_caller(transport, ip_addr, user):
+        name = str(getattr(user, "username", "") or "")
+        return Principal(
+            BLUETOOTH, f"bluetooth:{name}", SIGNED_OUT_GUEST, VIEWER, False,
+            False,
+        )
+    return dataclasses.replace(_gateway_principal(user), home=False)
+
+
 def _is_password_user(user: Any) -> bool:
     return muon_floor.is_panel_login(user)
 
@@ -447,6 +514,8 @@ def resolve_principal(
             user is not None
             and getattr(user, "source", None) == muon_floor.GATEWAY_USER_SOURCE
         ):
+            if muon_floor.is_bluetooth_address(ip_addr):
+                return _bluetooth_principal(transport, ip_addr, user)
             return _gateway_principal(user)
         # From away with no token: nobody is admitted anonymously (SEC-1).
         return None
@@ -543,11 +612,15 @@ GCODE_PRINT = frozenset((
     "PAUSE", "RESUME", "CANCEL_PRINT", "CLEAR_PAUSE", "SDCARD_PRINT_FILE",
     "SDCARD_RESET_FILE", "M24", "M25",
 ))
+#: Commands that give a heater a target, or wait on one (KAN-878).
+GCODE_HEAT = frozenset((
+    "M104", "M109", "M140", "M190", "SET_HEATER_TEMPERATURE",
+    "TEMPERATURE_WAIT",
+))
 GCODE_MOTION = frozenset((
     "G0", "G1", "G2", "G3", "G4", "G10", "G11", "G28", "G90", "G91",
-    "M18", "M82", "M83", "M84", "M104", "M106", "M107", "M109", "M117",
-    "M140", "M190", "M220", "M221", "M400",
-    "SET_HEATER_TEMPERATURE", "TEMPERATURE_WAIT", "TURN_OFF_HEATERS",
+    "M18", "M82", "M83", "M84", "M106", "M107", "M117",
+    "M220", "M221", "M400", "TURN_OFF_HEATERS",
     "SET_FAN_SPEED", "SAVE_GCODE_STATE", "RESTORE_GCODE_STATE",
     "BED_MESH_CALIBRATE", "BED_MESH_CLEAR", "BED_MESH_PROFILE",
     # The M1's own operator macros (core/M1/macros in Muon3D_Klipper)
@@ -587,6 +660,8 @@ def gcode_actions(script: Any) -> Tuple[Action, ...]:
             name = "emergency_stop"
         elif command in GCODE_PRINT:
             name = "print"
+        elif command in GCODE_HEAT:
+            name = "heat"
         elif command in GCODE_MOTION:
             name = "motion"
         else:
@@ -736,6 +811,12 @@ def decide_action(
         return Decision(False, action.name, reason)
     if principal.level >= PANEL:
         return Decision(True, action.name)
+    if principal.kind == BLUETOOTH:
+        # Before the role, the level or any setting: no preset or override
+        # gives a phone being set up over Bluetooth more (KAN-436).
+        if action.name in BLUETOOTH_ACTIONS:
+            return Decision(True, action.name)
+        return Decision(False, action.name, BLUETOOTH_REASON)
     if principal.role == VIEWER and not (action.read or action.viewer_allowed):
         return Decision(False, action.name, "a Viewer can only watch")
     if action.delegated:
@@ -816,6 +897,13 @@ def check_access(
         transport, ip_addr, user, current.entry, current.home
     )
     actions = classify(endpoint, request_type, args)
+    if principal is not None and principal.kind == BLUETOOTH:
+        # KAN-436: the setup routes, by endpoint, and nothing else. Their
+        # reads classify as "read", which the table could refuse under a
+        # strict preset; muon_setup and muon_link decide their own callers.
+        if muon_floor.is_bluetooth_setup_endpoint(endpoint):
+            return
+        raise refusal(Decision(False, actions[0].name, BLUETOOTH_REASON))
     if principal is None and at_home_unadmitted(actions, ip_addr, current):
         return
     if _files is not None and principal is not None:
@@ -889,7 +977,38 @@ async def prepare_file_operation(web_request: Any, args: Mapping[str, Any]) -> N
         await _files.prepare_operation(web_request.get_endpoint(), args, principal)
 
 
+#: KAN-429: filters other components register for one notification name.
+#: Each takes (data, connection) and returns what that connection is sent,
+#: or None to send it nothing. They run whether or not muon_access is loaded:
+#: muon_setup's withholds the link code from a remote connection, which has
+#: nothing to do with the access table.
+NotificationFilter = Callable[[Any, Any], Any]
+_notification_filters: Dict[str, NotificationFilter] = {}
+
+
+def register_notification_filter(name: str, func: NotificationFilter) -> None:
+    """Run `func` on notification `name` for every connection. One filter
+    per name; registering again replaces it, so a component that is built
+    twice (a restart, a test) does not stack copies."""
+    _notification_filters[name] = func
+
+
 def filter_notification(name: str, data: Any, connection: Any) -> Any:
+    extra = _notification_filters.get(name)
+    if extra is not None:
+        data = extra(data, connection)
+        if data is None:
+            return None
+    current = _state
+    if (
+        current is not None
+        and muon_floor.bluetooth_setup_caller(
+            connection, connection.ip_addr, connection.user_info)
+        and name not in BLUETOOTH_NOTIFICATIONS
+    ):
+        # KAN-436: muon_floor refuses a Bluetooth phone a websocket while
+        # setup is open; were one ever open, it hears muon_setup and no more.
+        return None
     if _files is None or name not in ("filelist_changed", "history_changed"):
         return data
     principal = _file_principal(connection, connection.ip_addr, connection.user_info)

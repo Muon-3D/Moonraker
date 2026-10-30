@@ -625,6 +625,15 @@ KINDS = ["panel", "hotspot", "lan", "remote", "other"]
 ACCESS = [
     ("", "GET", None, {"panel", "hotspot", "lan", "remote"}),
     ("/options", "GET", None, {"panel", "hotspot", "lan"}),
+    ("/networks", "GET", {"rescan": False}, {"panel", "hotspot", "lan"}),
+    ("/network", "POST",
+     {"rev": 5, "kind": "wifi", "ssid": "HomeWiFi", "security": "wpa2",
+      "psk": "test-psk-12345"}, {"panel", "hotspot", "lan"}),
+    ("/region", "POST", {"rev": 5, "country": "DE"},
+     {"panel", "hotspot", "lan"}),
+    ("/remote", "POST", {"rev": 5, "mode": "local"},
+     {"panel", "hotspot", "lan"}),
+    ("/remote/cancel", "POST", {}, {"panel", "hotspot", "lan"}),
     ("/driver", "POST", {"rev": 5, "kind": "web", "client_id": "c"},
      {"hotspot", "lan"}),
     ("/goto", "POST", {"rev": 5, "step": "language"},
@@ -707,8 +716,13 @@ PROTECTED_WRITES = [
     ("/name", {"rev": 5, "name": "Workshop"}, WRITERS),
     ("/timezone", {"rev": 5, "tz": "Europe/London"}, WRITERS),
     ("/update", {"rev": 5, "action": "later"}, WRITERS),
+    ("/network", {"rev": 5, "kind": "wifi", "ssid": "HomeWiFi",
+                  "security": "wpa2", "psk": "test-psk-12345"}, WRITERS),
+    ("/region", {"rev": 5, "country": "DE"}, WRITERS),
+    ("/remote", {"rev": 5, "mode": "local"}, WRITERS),
     ("/ready", {"rev": 5, "item": "load_filament", "action": "skip"}, WRITERS),
     ("/network/cancel", {}, WRITERS),
+    ("/remote/cancel", {}, WRITERS),
     ("/clock", {"epoch_ms": CLOCK_NOW_MS}, {"hotspot", "internal"}),
 ]
 
@@ -1093,6 +1107,25 @@ class TestFinish:
         # The deadline is the OS's, read back from GET /wifi/ap/stations.
         assert h.setup.public_state()["hotspot"]["auto_off_at"] == 1790252700.0
 
+    def test_finish_does_not_write_marker_before_http_response_is_sent(self):
+        """The BLE gateway enrols the caller only after the finish response."""
+        async def go() -> Any:
+            h = await Harness(stored=self._stored()).start()
+            response_sent = asyncio.Event()
+            webreq = request(
+                "bluetooth", "/server/muon/setup/finish", {"rev": 5},
+                response_sent=response_sent.wait(),
+            )
+            await h.server.endpoints["/server/muon/setup/finish"][1](webreq)
+            await asyncio.sleep(0)
+            assert h.aux.posted("/setup/complete") == []
+            response_sent.set()
+            await h.setup.drain()
+            return h
+
+        h = run(go())
+        assert h.aux.posted("/setup/complete") == [{"by": "muon_setup"}]
+
     def test_keep_by_default_keeps_a_real_name(self):
         """finish answers a pending name with "Keep", which must keep the
         name, not store null (02 §5.7)."""
@@ -1419,9 +1452,9 @@ class TestLiveFields:
         async def go():
             return (await Harness().start()).setup.public_state()
         assert list(run(go())) == [
-            "version", "rev", "state", "cursor", "driver", "op", "printer",
-            "hotspot", "clock", "region", "capabilities", "card_dismissed",
-            "steps"]
+            "version", "rev", "state", "cursor", "driver", "nearby", "op",
+            "printer", "hotspot", "clock", "region", "capabilities",
+            "card_dismissed", "steps"]
 
 
 class TestOptions:

@@ -8,6 +8,8 @@
 #   * signer_name -- who signed the developer-mode waiver (MuonOS#353, POST
 #     /server/aux/dev_mode). A person's name, kept on the device only.
 #   * password, key -- the Wi-Fi password and the hotspot key.
+#   * psk -- the Wi-Fi PSK that POST /server/muon/setup/network carries
+#     (07 S2), which the field list above does not cover.
 #   * reentry_token -- the token that lets a phone back into setup.
 #   * credentials, access_code -- what muon_bridge is handed for another
 #     printer: a Bambu access code, a PrusaLink user name and password.
@@ -21,7 +23,7 @@ from typing import Any, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 SENSITIVE_FIELDS = frozenset((
-    "signer_name", "password", "key", "reentry_token", "credentials",
+    "signer_name", "password", "key", "psk", "reentry_token", "credentials",
     "access_code",
 ))
 REDACTED = "<redacted>"
