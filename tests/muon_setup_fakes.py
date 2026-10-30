@@ -410,6 +410,8 @@ PANEL_IP = ipaddress.ip_address("127.0.0.1")
 HOTSPOT_IP = ipaddress.ip_address("10.42.0.23")
 LAN_IP = ipaddress.ip_address("192.168.1.50")
 GATEWAY_IP = ipaddress.ip_address("192.0.2.1")
+#: KAN-436: muon-link's address for a connection that started on Bluetooth.
+BLUETOOTH_IP = ipaddress.ip_address("192.0.2.2")
 OTHER_IP = ipaddress.ip_address("203.0.113.9")
 
 
@@ -445,10 +447,18 @@ def request(
     headers: Optional[Dict[str, str]] = GOOD_HEADERS,
     websocket: bool = False,
     method: str = "POST",
+    ble_code: Optional[str] = None,
+    response_sent: Optional[Any] = None,
 ) -> WebRequest:
-    """A WebRequest as Moonraker would build it for this kind of caller."""
+    """A WebRequest as Moonraker would build it for this kind of caller.
+
+    `ble_code` adds the `X-Muon-Ble-Code` header muon-link's gateway sends on
+    a Bluetooth connection (ADR 0032 D7), to whatever kind of caller this is.
+    """
     rtype = RequestType.POST if method == "POST" else RequestType.GET
     transport: Any = None
+    if ble_code is not None:
+        headers = dict(headers or {}, **{"X-Muon-Ble-Code": ble_code})
     http_headers: Optional[Dict[str, str]] = dict(headers) if headers else None
     if kind == "internal":
         return WebRequest(endpoint, dict(args or {}), rtype,
@@ -461,12 +471,13 @@ def request(
         "hotspot": (HOTSPOT_IP, user(["network"])),
         "lan": (LAN_IP, user(["network"])),
         "remote": (GATEWAY_IP, user(["network"], source="muon_gateway")),
+        "bluetooth": (BLUETOOTH_IP, user(["network"], source="muon_gateway")),
         "other": (OTHER_IP, None),
     }[kind]
     if kind == "panel" and headers is GOOD_HEADERS:
         http_headers = {"Host": "localhost", "Content-Type": "application/json"}
     return WebRequest(endpoint, dict(args or {}), rtype, transport, ip, usr,
-                      http_headers)
+                      http_headers, response_sent)
 
 
 # --------------------------------------------------------------------------

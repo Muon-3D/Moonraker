@@ -12,7 +12,8 @@ import pytest
 
 from moonraker.components.muon_setup import remote
 
-from muon_setup_fakes import FakeMuonLink, Harness, run, state_with
+from muon_setup_fakes import (
+    FakeAux, FakeMuonLink, Harness, fresh_aux, run, state_with)
 
 
 def cloud_state() -> Dict[str, Any]:
@@ -28,15 +29,24 @@ def cloud_state() -> Dict[str, Any]:
     return doc
 
 
+def clock_aux(synced: bool) -> FakeAux:
+    """An Aux that answers GET /time, so MR-2's clock refresh never falls
+    back to this machine's own timesync flag: `synced` alone decides."""
+    return fresh_aux(**{
+        "GET /time": {"epoch_ms": 1790251200000, "ntp_synced": synced,
+                      "tz": "Europe/London"},
+    })
+
+
 async def remote_harness(
     link: FakeMuonLink,
     synced: bool = True,
     stored: Optional[Dict[str, Any]] = None,
 ) -> Harness:
-    h = await Harness(stored=stored or cloud_state()).start()
+    h = await Harness(stored=stored or cloud_state(),
+                      aux=clock_aux(synced)).start()
     h.with_muon_link(link)
-    if synced:
-        h.setup._live["clock"]["synced"] = True
+    h.setup._live["clock"]["synced"] = synced
     return h
 
 
@@ -105,7 +115,8 @@ class TestModes:
 
     def test_cloud_without_muon_link_is_unavailable(self):
         async def go():
-            h = await Harness(stored=cloud_state()).start()
+            h = await Harness(stored=cloud_state(),
+                              aux=clock_aux(True)).start()
             h.setup._live["clock"]["synced"] = True
             out = await h.post("/remote", body(mode="cloud"))
             assert out["ok"] is True
@@ -121,7 +132,7 @@ class TestModes:
             doc = cloud_state()
             doc.update(state="complete", cursor="finish")
             doc["steps"]["remote"].update(mode=mode, status=status)
-            h = await Harness(stored=doc).start()
+            h = await Harness(stored=doc, aux=clock_aux(True)).start()
             h.setup._live["clock"]["synced"] = True
             out = await h.post("/remote", body(mode="cloud", rev=h.doc["rev"]))
             assert out["ok"] is True

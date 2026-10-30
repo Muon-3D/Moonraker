@@ -191,3 +191,52 @@ class MockLineEvent:
             self.type = self.RISING_EDGE
         else:
             self.type = self.FALLING_EDGE
+
+
+class MockPeripheryGpio:
+    """periphery.GPIO as moonraker.components.gpio calls it (KAN-570).
+
+    Records what it was asked for and remembers the written value, without
+    touching a character device."""
+
+    def __init__(self, path: str, line: int, direction: str,
+                 edge: str = "none", bias: str = "default",
+                 inverted: bool = False, label: str = "") -> None:
+        self.path = path
+        self.line = line
+        self.direction = direction
+        self.edge = edge
+        self.bias = bias
+        self.inverted = inverted
+        self.label = label
+        self.value = direction == "high"
+        self.closed = False
+
+    def write(self, value: bool) -> None:
+        self.value = value
+
+    def read(self) -> bool:
+        return self.value
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _MockDevPath:
+    def __init__(self, *parts: str) -> None:
+        self.parts = parts
+
+    def joinpath(self, *parts: str) -> "_MockDevPath":
+        return _MockDevPath(*(self.parts + parts))
+
+    def exists(self) -> bool:
+        return self.parts == ("/dev", "gpiochip0")
+
+    def __str__(self) -> str:
+        return "/".join(self.parts)
+
+
+class MockDevPathlib:
+    """Enough of pathlib for the gpio component's chip check: only
+    /dev/gpiochip0 exists."""
+    Path = _MockDevPath
