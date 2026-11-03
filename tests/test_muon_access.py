@@ -675,6 +675,43 @@ class TestClassification:
             "/server/files/upload", RequestType.POST, {"root": "config"})]
         assert names == ["config"]
 
+    @pytest.mark.parametrize("path", [
+        "diagnostics/muon-diag-x.tar.gz", "/diagnostics/muon-diag-x.tar.gz",
+        "//diagnostics/muon-diag-x.tar.gz", "Diagnostics/muon-diag-x.tar.gz",
+    ])
+    def test_a_diagnostics_download_is_system(self, path: str):
+        """KAN-378: a bundle holds this boot's journal."""
+        names = [a.name for a in policy.classify(
+            "/server/files/download", RequestType.GET, {"path": path})]
+        assert names == ["system"]
+
+    def test_other_downloads_and_the_listing_stay_reads(self):
+        for args in ({"path": "gcodes/a.gcode"}, {"path": "logs/klippy.log"}):
+            names = [a.name for a in policy.classify(
+                "/server/files/download", RequestType.GET, args)]
+            assert names == ["read"], args
+        names = [a.name for a in policy.classify(
+            "/server/files/list", RequestType.GET, {"root": "diagnostics"})]
+        assert names == ["read"]
+
+    @pytest.mark.parametrize("user,allowed", [
+        (gateway("admin", "operator", home=False), True),
+        (gateway("admin", "viewer"), False),
+        (gateway("member", "operator"), False),
+    ])
+    def test_who_may_download_a_bundle(self, user: Any, allowed: bool):
+        """The owner from away (Iroh) may; a Viewer or a member may not."""
+        policy.set_state(state(entry="open", owner="account", preset="standard"))
+        args = {"path": "diagnostics/muon-diag-x.tar.gz"}
+        try:
+            policy.check_access("/server/files/download", RequestType.GET,
+                                args, None, SENTINEL, user)
+        except ServerError as err:
+            assert err.status_code == 403
+            assert not allowed, str(err)
+        else:
+            assert allowed
+
     def test_delegated_rows_are_left_to_their_own_checks(self):
         policy.set_state(state(entry="open", owner="account", preset="strict"))
         api = _api("/server/muon/setup/name")

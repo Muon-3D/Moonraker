@@ -730,6 +730,14 @@ def classify(
     if endpoint == "/server/muon/access/request_status":
         # A GET, but reachable before the caller is admitted
         return (ACTIONS["access_request"],)
+    if endpoint == "/server/files/download" and any(
+        root.lower() == "diagnostics" for root in _file_roots(args)
+    ):
+        # KAN-378: a bundle holds this boot's journal, so downloading one is
+        # an admin's, as backups are. Not home_only: the owner fetching it
+        # over Iroh, away from the printer, is the case it exists for.
+        # Listing stays a read; muon-link shows the names too.
+        return (ACTIONS["system"],)
     if method == "GET":
         return (READ,)
     if endpoint == "/api/printer/command":

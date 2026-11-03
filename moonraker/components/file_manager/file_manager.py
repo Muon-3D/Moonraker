@@ -183,6 +183,15 @@ class FileManager:
 
         config.get('log_path', None, deprecate=True)
         self.register_data_folder("logs")
+        # MUON, KAN-378. Diagnostic bundles, read-only, so a paired owner can
+        # fetch one through the muon-link gateway when the printer's Wi-Fi is
+        # the fault. MuonOS creates the folder 2770 for aux_api; making it here
+        # as moonraker would get the owner and mode wrong, so a missing folder
+        # is left unregistered until aux_api has made it. The LAN vhost denies
+        # the root and muon_access_policy classifies its downloads as `system`.
+        diag_path = self.datapath.joinpath("diagnostics")
+        if diag_path.is_dir():
+            self.register_directory("diagnostics", str(diag_path))
         gc_path = self.register_data_folder("gcodes", full_access=True)
         if gc_path.is_dir():
             prune: bool = True
