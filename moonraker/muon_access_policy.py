@@ -555,6 +555,10 @@ WRITE_ACTIONS: Tuple[Tuple[str, str], ...] = (
     # answer, and anything new under the prefix: the protection row
     ("/server/muon/access", "protection"),
     ("/server/muon/identity/name", "rename"),
+    # KAN-547: asking for a developer-mode change and completing it. Aux
+    # decides who may ask (the owner, on a linked printer) and the panel
+    # confirms, so this is the delegated row, not "system".
+    ("/server/muon/dev_mode", "dev_mode"),
     ("/server/aux/dev_mode", "dev_mode"),
     ("/server/aux/wifi/ap", "hotspot"),
     ("/server/aux/wifi", "wifi"),

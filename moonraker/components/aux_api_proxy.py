@@ -11,11 +11,12 @@ import re
 import contextlib
 import unicodedata
 from pathlib import Path
-from typing import Dict, Any, Callable, Optional
+from typing import Dict, Any, Callable, Optional, Tuple
 from urllib.parse import unquote, urlencode
 
 from tornado.httpclient import HTTPClientError
 
+from .. import muon_floor
 from ..utils import ServerError
 from ..utils import redact
 
@@ -163,6 +164,142 @@ FRIENDLY_NAME_KEY = "friendly_name"
 MAX_NAME_LENGTH = 32
 
 # ──────────────────────────────────────────────────────────────────────────
+# KAN-547: a developer-mode request, and who it is from.
+#
+# Jack's rule (2026-10-09, "no exceptions" 2026-10-14): every developer-mode
+# change, on and off, is confirmed at the printer's panel. A printer nobody
+# owns takes a request from anyone; a linked printer only from its owning
+# account, from anywhere. The Aux API enforces that (dev_mode_owner, MuonOS
+# #378). What it cannot do is tell who is asking: it never sees a client.
+# Moonraker can, so this route is the one place that vouches for the owner.
+#
+# Who is the owner here: a request through muon-link's gateway (the sentinel
+# address and a token muon_gateway minted) whose token names the admin level
+# explicitly, with the Operator role, and carries muon-link's owner flag.
+# Admin is the level of the owner's enrolled devices (ACC-20, ADR 0037), and
+# no grant carries it (NET-11). Nothing else is the owner:
+#
+#   * NOT an Operator's session. muon-link (KAN-877) names the admin level
+#     and the Operator role for Owner and Operator alike, so only the
+#     owner flag, which muon-link sends for an Owner alone, tells them
+#     apart (muon_gateway, THE PRINCIPAL).
+#
+#   * NOT a token that names no level. muon_access_policy._gateway_principal
+#     reads such a token as admin, so that a muon-link from before the
+#     principal existed keeps working; here that default would make every
+#     remote session the owner, app.muon3d.com's Operator sessions included.
+#     Only the level the token states counts.
+#   * NOT the panel or anything else on loopback. On a linked printer the
+#     panel confirms the owner's request and cannot make one, and any process
+#     on the device is loopback too.
+#   * NOT a LAN browser, signed in with the printer password or not. The
+#     password is the printer's, not the account's.
+#
+# Everyone may still use the route: on a printer nobody owns, Aux takes their
+# request; on a linked one, Aux answers owner_required and names the account.
+# The decision stays in one place, and this route only adds what is true.
+#
+# The headers cannot be forged through the rest of this component. Every
+# other call out builds its upstream headers from scratch and forwards none
+# of the caller's (_make_static_handler, _handle_dynamic_proxy, get/post).
+DEV_MODE_REQUEST_ENDPOINT = "/server/muon/dev_mode/request"
+OWNER_LEVEL_HEADER = "X-Muon-Access-Level"
+OWNER_PRINCIPAL_HEADER = "X-Muon-Principal"
+#: muon_access_policy's name for the owner's level (ACC-7, ACC-9).
+OWNER_LEVEL = "admin"
+#: Only an Operator changes anything; a Viewer watches (ACC-11).
+OWNER_ROLE = "operator"
+# As muon_gateway checks a principal, and as Aux re-checks the header.
+_PRINCIPAL_RE = re.compile(r"^[A-Za-z0-9._:@+-]{1,128}$")
+# Aux mints challenge ids with secrets.token_urlsafe(24): 32 URL-safe
+# characters. A path segment, so nothing that could start another one.
+_CHALLENGE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
+# The redeem's optional fields, and their types. Nothing else is forwarded.
+_REDEEM_FIELDS = {
+    "waiver_acknowledged": bool,
+    "waiver_version": str,
+    "signer_name": str,
+    "reentry_token": str,
+}
+# Open and poll are quick. A redeem backs up and clones the developer tree and
+# restarts Klipper, which Aux waits up to 60 s for.
+DEV_MODE_OPEN_TIMEOUT = 8.
+DEV_MODE_REDEEM_TIMEOUT = 120.
+# muon-link's LinkPhase, as Aux's dev_mode_owner reads it: `linked` names the
+# owner, every other known phase is a printer nobody owns, and a phase this
+# code does not know is no answer.
+LINKED_PHASE = "linked"
+UNOWNED_PHASES = frozenset(
+    ("unavailable", "unlinked", "connecting", "code", "offer", "failed"))
+
+
+def owner_headers(ip_addr: Any, user: Any) -> Dict[str, str]:
+    """The headers that tell Aux a request is the owner's, or {}.
+
+    See the block above for who that is. Reads the token's own fields and
+    never muon_access_policy.resolve_principal, whose default for a token that
+    names nothing is admin.
+    """
+    if not muon_floor._is_gateway_address(ip_addr):
+        return {}
+    if user is None or getattr(
+            user, "source", None) != muon_floor.GATEWAY_USER_SOURCE:
+        return {}
+    if getattr(user, "access_level", None) != OWNER_LEVEL:
+        return {}
+    if getattr(user, "access_role", None) != OWNER_ROLE:
+        return {}
+    if getattr(user, "access_owner", False) is not True:
+        return {}
+    headers = {OWNER_LEVEL_HEADER: OWNER_LEVEL}
+    name = getattr(user, "principal", "") or getattr(user, "username", "")
+    if isinstance(name, str) and _PRINCIPAL_RE.match(name):
+        headers[OWNER_PRINCIPAL_HEADER] = name
+    return headers
+
+
+def _boolean_arg(value: Any, name: str) -> bool:
+    """A JSON boolean, or "true"/"false" from a query string."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.lower() in ("true", "false"):
+        return value.lower() == "true"
+    raise ServerError(f"'{name}' must be true or false", 400)
+
+
+def _has_json_detail(resp: Any) -> bool:
+    try:
+        payload = resp.json()
+    except Exception:
+        return False
+    return isinstance(payload, dict) and "detail" in payload
+
+
+def _dev_mode_refusal(resp: Any) -> Tuple[str, str]:
+    """(code, message) for a developer-mode answer Aux refused.
+
+    Aux's own refusals are {"detail": {"error": <code>, "message": <why>}}
+    (owner_required, owner_unknown, no_change, waiver_required,
+    waiver_out_of_date). The rest carry a string detail, so their code is
+    named from the status.
+    """
+    try:
+        payload = resp.json()
+    except Exception:
+        payload = None
+    detail = payload.get("detail") if isinstance(payload, dict) else None
+    if isinstance(detail, dict) and isinstance(detail.get("error"), str):
+        message = detail.get("message")
+        return detail["error"], (
+            message.strip() if isinstance(message, str) else detail["error"])
+    message = _aux_error_message(resp) or "The printer refused the request."
+    code = {
+        404: "challenge_not_found",
+        428: "confirmation_required",
+        429: "throttled",
+        503: "unavailable",
+    }.get(resp.status_code, "refused")
+    return code, message
 
 
 class AuxAutoProxy:
@@ -249,6 +386,15 @@ class AuxAutoProxy:
             "/server/muon/dev_mode",
             ["GET"],
             self._dev_mode_status_handler
+        )
+        # KAN-547: ask for a developer-mode change, follow the answer at the
+        # panel, and complete it. The one route that can say a request is
+        # the owner's; see owner_headers. muon-link admits it, and no other
+        # Aux route (/server/aux/ stays closed to every remote session).
+        self.server.register_endpoint(
+            DEV_MODE_REQUEST_ENDPOINT,
+            ["GET", "POST"],
+            self._dev_mode_request_handler
         )
 
         # MUON, ID-2/ID-3/ID-4: this printer's name.
@@ -596,6 +742,197 @@ class AuxAutoProxy:
         # path and this endpoint is readable from the LAN; DEV-4 needs the
         # banner, not the path. The panel reads the full state over loopback.
         return {"enabled": bool(state.get("enabled", False))}
+
+    # ---------- KAN-547: a developer-mode request -----------------------
+    async def _dev_mode_request_handler(self, webreq):
+        """Ask for a developer-mode change, poll it, or complete it.
+
+        GET
+            Who may ask, for a client deciding whether to offer the switch:
+            {"as_owner", "owner": {"linked", "account"}, "may_ask",
+            "waiver"}. Advisory; Aux decides when asked.
+        POST {"enabled": bool}
+            Opens a challenge for that direction (Aux POST /dev_mode/consent).
+            The printer's panel asks the person there. For turning on, the
+            answer carries the waiver the redeem has to acknowledge.
+        GET {"challenge_id": str}
+            Whether the person at the printer has answered (Aux GET
+            /dev_mode/consent/{id}). Read-only.
+        POST {"enabled": bool, "challenge_id": str, ...}
+            Completes it once confirmed (Aux POST /dev_mode). For turning on,
+            also waiver_acknowledged and waiver_version, or a reentry_token;
+            signer_name is optional.
+
+        A refusal is a ServerError whose message starts with the Aux code,
+        "dev-mode:<code>: <why>", so a client can branch without parsing the
+        sentence: owner_required, owner_unknown, no_change, waiver_required,
+        waiver_out_of_date, confirmation_required, challenge_not_found,
+        throttled, unavailable.
+        """
+        args = webreq.get_args()
+        owner = owner_headers(
+            webreq.get_ip_address(), webreq.get_current_user())
+        if webreq.get_action() == "GET":
+            challenge_id = self._challenge_id_arg(args.get("challenge_id"))
+            if challenge_id is None:
+                return await self._dev_mode_request_probe(owner)
+            state = await self._dev_mode_call(
+                "GET", f"/dev_mode/consent/{challenge_id}", None, {},
+                DEV_MODE_OPEN_TIMEOUT)
+            return {
+                key: state.get(key) for key in (
+                    "challenge_id", "confirmed", "refused", "expires_at",
+                    "enabled")
+            }
+        if "enabled" not in args:
+            raise self.server.error("'enabled' is required", 400)
+        enabled = _boolean_arg(args.get("enabled"), "enabled")
+        challenge_id = self._challenge_id_arg(args.get("challenge_id"))
+        if challenge_id is None:
+            return await self._open_dev_mode_request(enabled, owner)
+        body: Dict[str, Any] = {
+            "enabled": enabled, "challenge_id": challenge_id}
+        for name, kind in _REDEEM_FIELDS.items():
+            value = args.get(name)
+            if value is None:
+                continue
+            if kind is bool:
+                value = _boolean_arg(value, name)
+            elif not isinstance(value, kind):
+                raise self.server.error(f"'{name}' must be a string", 400)
+            body[name] = value
+        status = await self._dev_mode_call(
+            "POST", "/dev_mode", body, owner, DEV_MODE_REDEEM_TIMEOUT)
+        # Not core_cfg: a filesystem path, as for GET /server/muon/dev_mode.
+        # The re-entry token is the one chance to read it (KAN-466); it goes
+        # to the caller that completed the change and is never logged.
+        answer: Dict[str, Any] = {
+            "enabled": bool(status.get("enabled", False)),
+            "released": bool(status.get("released", False)),
+        }
+        if isinstance(status.get("reentry_token"), str):
+            answer["reentry_token"] = status["reentry_token"]
+        return answer
+
+    async def _dev_mode_request_probe(
+        self, owner: Dict[str, str]
+    ) -> Dict[str, Any]:
+        """What a client needs to decide whether to offer the switch.
+
+        `owner` is the link as muon-link reports it: linked or not, and the
+        account, never the link code (APP-38). Aux reads the same answer when
+        it decides, and names the account in owner_required anyway, so this
+        says nothing a request would not. `may_ask` follows #378's rule: the
+        owner, or anyone while nobody owns the printer; an unknown link is
+        the owner's alone. `waiver` is what turning on will ask to
+        acknowledge, or null if Aux could not say.
+        """
+        link = await self._link_owner()
+        try:
+            found = await self._dev_mode_call(
+                "GET", "/dev_mode/waiver", None, {}, DEV_MODE_OPEN_TIMEOUT)
+            waiver: Optional[Dict[str, Any]] = {
+                "version": found.get("version"), "text": found.get("text")}
+        except ServerError:
+            waiver = None
+        return {
+            "as_owner": bool(owner),
+            "owner": link,
+            "may_ask": bool(owner) or link["linked"] is False,
+            "waiver": waiver,
+        }
+
+    async def _link_owner(self) -> Dict[str, Any]:
+        """{"linked": True | False | None, "account": str | None}."""
+        unknown: Dict[str, Any] = {"linked": None, "account": None}
+        link = self.server.lookup_component("muon_link", None)
+        if link is None:
+            return unknown
+        try:
+            status = await link.status()
+        except Exception:
+            return unknown
+        phase = status.get("phase") if isinstance(status, dict) else None
+        if phase == LINKED_PHASE:
+            account = status.get("account")
+            return {"linked": True,
+                    "account": account if isinstance(account, str)
+                    and account else None}
+        if phase in UNOWNED_PHASES:
+            return {"linked": False, "account": None}
+        return unknown
+
+    def _challenge_id_arg(self, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if not isinstance(value, str) or not _CHALLENGE_ID_RE.match(value):
+            raise self.server.error("'challenge_id' is not a challenge id", 400)
+        return value
+
+    async def _open_dev_mode_request(
+        self, enabled: bool, owner: Dict[str, str]
+    ) -> Dict[str, Any]:
+        waiver: Optional[Dict[str, Any]] = None
+        if enabled:
+            # Before the challenge, so a printer that cannot say what is
+            # being agreed to puts nothing on its panel. A remote session has
+            # no other way to read it: /server/aux/ is closed to it.
+            found = await self._dev_mode_call(
+                "GET", "/dev_mode/waiver", None, {}, DEV_MODE_OPEN_TIMEOUT)
+            waiver = {"version": found.get("version"),
+                      "text": found.get("text")}
+        challenge = await self._dev_mode_call(
+            "POST", "/dev_mode/consent", {"enabled": enabled}, owner,
+            DEV_MODE_OPEN_TIMEOUT)
+        self.log.info(
+            "Developer mode %s requested%s; waiting at the printer",
+            "on" if enabled else "off", " by the owner" if owner else "")
+        answer = {
+            key: challenge.get(key) for key in (
+                "challenge_id", "expires_at", "expires_in_seconds",
+                "instruction", "enabled")
+        }
+        answer["as_owner"] = bool(owner)
+        if waiver is not None:
+            answer["waiver"] = waiver
+        return answer
+
+    async def _dev_mode_call(
+        self, method: str, path: str, body: Optional[Dict[str, Any]],
+        owner: Dict[str, str], timeout: float,
+    ) -> Dict[str, Any]:
+        headers: Dict[str, Any] = dict(owner)
+        raw_body: Optional[str] = None
+        if body is not None:
+            raw_body = json.dumps(body)
+            headers["Content-Type"] = "application/json"
+        resp = await self.http_client.request(
+            method=method,
+            url=f"{FASTAPI_ROOT}{path}",
+            body=raw_body,
+            headers=self._auth_headers(headers),
+            connect_timeout=3.,
+            request_timeout=timeout,
+        )
+        status = resp.status_code
+        # http_client answers a refused connection or a timeout with a 500 (or
+        # 599) and no body: Aux did not answer, which a client should retry.
+        # A 500 that Aux really sent carries its JSON detail and keeps it.
+        if status == 599 or (status >= 500 and not _has_json_detail(resp)):
+            raise self.server.error(
+                "dev-mode:unavailable: The printer's Aux API is not "
+                "answering yet.", 503)
+        if status >= 400:
+            code, message = _dev_mode_refusal(resp)
+            raise self.server.error(f"dev-mode:{code}: {message}", status)
+        try:
+            answer = resp.json()
+        except Exception:
+            answer = None
+        if not isinstance(answer, dict):
+            raise self.server.error(
+                "Aux returned an unreadable developer-mode answer", 502)
+        return answer
 
 
     # ===== Internal aux-api helpers for other Moonraker components =====

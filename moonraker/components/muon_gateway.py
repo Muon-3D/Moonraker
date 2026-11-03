@@ -61,7 +61,13 @@
 # `principal` names the person or device (default: the client), and `home`
 # says the session's path is on the printer's own network (default: false, so
 # a home-only action is refused unless muon-link vouches for the path). The
-# user the token carries holds them, and a request is decided on them. A
+# user the token carries holds them, and a request is decided on them.
+#
+# `"owner": true` (KAN-547) says the session is the printer owner's own.
+# Owner and Operator share the admin level and the Operator role, so the
+# level cannot say which one asked; aux_api_proxy tells the Aux API a
+# developer-mode request is the owner's only with this flag. It needs the
+# admin level and the Operator role, and is false when absent. A
 # request without them is the gateway as it was: muon-link's policy is the
 # only limit, and `muon_access` treats it as admin with Operator.
 
@@ -120,6 +126,7 @@ class GatewayUser(UserInfo):
     access_level: Optional[str] = None
     access_role: Optional[str] = None
     access_home: bool = False
+    access_owner: bool = False
 
 
 IPAddress = Union[ipaddress.IPv4Address, ipaddress.IPv6Address]
@@ -178,9 +185,11 @@ def parse_principal(line: bytes) -> Dict[str, Any]:
     role = request.get("role")
     principal = request.get("principal")
     home = request.get("home", False)
+    owner = request.get("owner", False)
     if level is None and role is None:
-        if principal is not None or "home" in request:
-            raise ValueError("principal and home need a level and a role")
+        if principal is not None or "home" in request or "owner" in request:
+            raise ValueError(
+                "principal, home and owner need a level and a role")
         return {}
     if level not in muon_access_policy.PRINCIPAL_LEVELS:
         raise ValueError(
@@ -194,8 +203,13 @@ def parse_principal(line: bytes) -> Dict[str, Any]:
         raise ValueError("principal must be 1-128 of [A-Za-z0-9._:@+-]")
     if not isinstance(home, bool):
         raise ValueError("home must be true or false")
+    if not isinstance(owner, bool):
+        raise ValueError("owner must be true or false")
+    if owner and (level != "admin" or role != "operator"):
+        raise ValueError("owner needs the admin level and the operator role")
     fields: Dict[str, Any] = {
         "access_level": level, "access_role": role, "access_home": home,
+        "access_owner": owner,
     }
     if principal is not None:
         fields["principal"] = principal
