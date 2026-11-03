@@ -63,6 +63,12 @@ class MockComponent:
             raise ServerError("test")
 
 class MockWebsocket:
+    # WebsocketManager.notify_clients() reads these before it queues a message
+    uid = 1
+    need_auth = False
+    ip_addr = None
+    user_info = None
+
     def __init__(self, fut: asyncio.Future) -> None:
         self.future = fut
 
