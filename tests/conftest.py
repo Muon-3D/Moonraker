@@ -84,7 +84,11 @@ def session_args(ssl_certs: Dict[str, pathlib.Path]
     pcfg_asset = ASSETS.joinpath(f"klipper/base_printer.cfg")
     with tempfile.TemporaryDirectory(prefix="moonraker-test") as tmpdir:
         tmp_path = pathlib.Path(tmpdir)
-        secrets_dest = tmp_path.joinpath("secrets.ini")
+        # The [secrets] section's `secrets_path` option is deprecated.  The
+        # component reads <data_path>/moonraker.secrets, and the config
+        # files no longer name any of the data folders (they are the
+        # defaults under data_path), so a fixture config stays warning-free.
+        secrets_dest = tmp_path.joinpath("moonraker.secrets")
         shutil.copy(secrets_asset, secrets_dest)
         cfg_path = tmp_path.joinpath("config")
         cfg_path.mkdir()
@@ -121,12 +125,22 @@ def session_args(ssl_certs: Dict[str, pathlib.Path]
 def klippy_session(session_args: Dict[str, pathlib.Path],
                    pytestconfig: pytest.Config) -> Iterator[KlippyProcess]:
     pytestconfig.stash[need_klippy_restart] = False
-    kpath = pytestconfig.getoption('klipper_path', "~/klipper")
-    kexec = pytestconfig.getoption('klipper_exec', None)
+    # The options are registered with a default of None, so the default passed
+    # to getoption() never applies.
+    kpath = pytestconfig.getoption('klipper_path') or "~/klipper"
+    kexec = pytestconfig.getoption('klipper_exec')
     if kexec is None:
         kexec = sys.executable
     exec = pathlib.Path(kexec).expanduser()
     klipper_path = pathlib.Path(kpath).expanduser()
+    if not klipper_path.joinpath("klippy/klippy.py").is_file():
+        pytest.fail(
+            f"No Klipper checkout at '{klipper_path}'.  The tests that talk "
+            "to Klippy need one: pass --klipper-path <dir> (default "
+            "~/klipper), and install its requirements "
+            "(scripts/klippy-requirements.txt) in the same environment.",
+            pytrace=False
+        )
     base_cmd = f"{exec} {klipper_path}/klippy/klippy.py "
     kproc = KlippyProcess(base_cmd, session_args)
     kproc.start()
@@ -149,7 +163,7 @@ def path_args(request: pytest.FixtureRequest,
     path_marker = request.node.get_closest_marker("run_paths")
     paths: Dict[str, Any] = {
         "moonraker_conf": "base_server.conf",
-        "secrets": "secrets.ini",
+        "secrets": None,
         "printer_cfg": "base_printer.cfg",
         "klippy_uds": None,
     }
@@ -175,11 +189,9 @@ def path_args(request: pytest.FixtureRequest,
         session_args["pcfg_asset"] = pcfg_asset
         interpolate_config(pcfg_asset, pcfg_dest, session_args)
         pytestconfig.stash[need_klippy_restart] = True
-    if paths["secrets"] != session_args["secrets_path"].name:
+    if paths["secrets"] is not None:
         secrets_asset = ASSETS.joinpath(f"moonraker/{paths['secrets']}")
-        secrets_dest = tmp_path.joinpath(paths['secrets'])
-        shutil.copy(secrets_asset, secrets_dest)
-        session_args["secrets_path"] = secrets_dest
+        shutil.copy(secrets_asset, session_args["secrets_path"])
     if "moonraker_log" in paths:
         log_path = session_args["log_path"]
         session_args['moonraker.log'] = log_path.joinpath(
