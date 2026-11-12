@@ -59,6 +59,10 @@ INIT_TIME = .25
 LOG_ATTEMPT_INTERVAL = int(2. / INIT_TIME + .5)
 MAX_LOG_ATTEMPTS = 10 * LOG_ATTEMPT_INTERVAL
 UNIX_BUFFER_LIMIT = 20 * 1024 * 1024
+# How often a request with no timeout re-checks itself, and the least time
+# between two "pending" log lines for the same Klippy method (KAN-2243).
+PENDING_CHECK_INTERVAL = 60.
+PENDING_LOG_INTERVAL = 60.
 SVC_INFO_KEY = "klippy_connection.service_info"
 SRC_PATH_KEY = "klippy_connection.path"
 PY_EXEC_KEY = "klippy_connection.executable"
@@ -817,21 +821,58 @@ class KlippyRequest:
         self.params = params
         self._fut = asyncio.get_running_loop().create_future()
 
+    # Requests with no timeout that are waiting on Klippy, per method, and
+    # when each method last logged. A Klippy that is connected but not
+    # answering (sloe, 2026-11-11: frozen for 13 h) lets a polled method such
+    # as 'info' pile up by the thousand. Each request used to log on its own
+    # every 60 s: 242,000 lines an hour and a 223 MB moonraker.log. Now one
+    # line per method per interval says how many are waiting (KAN-2243).
+    _pending_counts: Dict[str, int] = {}
+    _pending_last_log: Dict[str, float] = {}
+
     async def wait(self, timeout: Optional[float] = None) -> Any:
         start_time = time.time()
-        to = timeout or 60.
-        while True:
-            try:
-                return await asyncio.wait_for(asyncio.shield(self._fut), to)
-            except asyncio.TimeoutError:
-                if timeout is not None:
-                    self._fut.cancel()
-                    raise ServerError("Klippy request timed out", 500) from None
-                pending_time = time.time() - start_time
-                logging.info(
-                    f"Request '{self.rpc_method}' pending: "
-                    f"{pending_time:.2f} seconds"
-                )
+        to = timeout or PENDING_CHECK_INTERVAL
+        cls = KlippyRequest
+        method = self.rpc_method
+        counted = timeout is None
+        if counted:
+            cls._pending_counts[method] = cls._pending_counts.get(method, 0) + 1
+        try:
+            while True:
+                try:
+                    return await asyncio.wait_for(
+                        asyncio.shield(self._fut), to
+                    )
+                except asyncio.TimeoutError:
+                    if timeout is not None:
+                        self._fut.cancel()
+                        raise ServerError(
+                            "Klippy request timed out", 500
+                        ) from None
+                    now = time.monotonic()
+                    last = cls._pending_last_log.get(method)
+                    if last is not None and now - last < PENDING_LOG_INTERVAL:
+                        continue
+                    cls._pending_last_log[method] = now
+                    pending_time = time.time() - start_time
+                    count = cls._pending_counts.get(method, 1)
+                    others = (
+                        f" ({count} '{method}' requests waiting)"
+                        if count > 1 else ""
+                    )
+                    logging.info(
+                        f"Request '{method}' pending: "
+                        f"{pending_time:.2f} seconds{others}"
+                    )
+        finally:
+            if counted:
+                left = cls._pending_counts.get(method, 1) - 1
+                if left > 0:
+                    cls._pending_counts[method] = left
+                else:
+                    cls._pending_counts.pop(method, None)
+                    cls._pending_last_log.pop(method, None)
 
     def set_exception(self, exc: Exception) -> None:
         if not self._fut.done():
