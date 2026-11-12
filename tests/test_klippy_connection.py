@@ -172,7 +172,8 @@ async def test_write_not_connected(base_server: Server):
     req = KlippyRequest("", {})
     kconn = base_server.klippy_connection
     await kconn._write_request(req)
-    assert isinstance(req.response, ServerError)
+    with pytest.raises(ServerError):
+        await req.wait(1.)
 
 @pytest.mark.asyncio(loop_scope="class")
 async def test_write_error(base_server: Server):
@@ -180,7 +181,8 @@ async def test_write_error(base_server: Server):
     kconn = base_server.klippy_connection
     kconn.writer = MockWriter()
     await kconn._write_request(req)
-    assert isinstance(req.response, ServerError)
+    with pytest.raises(ServerError):
+        await req.wait(1.)
 
 @pytest.mark.asyncio(loop_scope="class")
 async def test_write_cancelled(base_server: Server):
@@ -233,13 +235,16 @@ def test_process_unknown_request(base_server: Server,
     expected = f"No request matching request ID: 4543, response: {cmd}"
     assert expected == caplog.messages[-1]
 
-def test_process_invalid_request(base_server: Server):
+@pytest.mark.asyncio(loop_scope="class")
+async def test_process_invalid_request(base_server: Server):
+    # KlippyRequest creates its future on the running loop
     req = KlippyRequest("", {})
     kconn = base_server.klippy_connection
     kconn.pending_requests[req.id] = req
     cmd = {"id": req.id}
     kconn._process_command(cmd)
-    assert isinstance(req.response, ServerError)
+    with pytest.raises(ServerError):
+        await req.wait(1.)
 
 # TODO: This can probably go in a class with test apis
 @pytest.mark.asyncio(loop_scope="class")

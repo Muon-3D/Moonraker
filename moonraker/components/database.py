@@ -428,7 +428,7 @@ class MoonrakerDatabase:
         self, namespace: str, key: Union[List[str], str]
     ) -> Future[bool]:
         return self.db_provider.execute_db_function(
-            self.db_provider.namespace_contains, namespace
+            self.db_provider.namespace_contains, namespace, key
         )
 
     # SQL direct query methods
@@ -993,7 +993,7 @@ class SqliteProvider(Thread):
     ) -> None:
         def generate_params():
             for key, val in values.items():
-                yield (namespace, key, val)
+                yield (namespace, key, encode_record(val))
         with conn:
             conn.execute(
                 f"DELETE FROM {NAMESPACE_TABLE} WHERE namespace = ?", (namespace,)
@@ -1046,7 +1046,7 @@ class SqliteProvider(Thread):
                 cur = conn.execute(
                     f"SELECT key FROM {NAMESPACE_TABLE} "
                     "WHERE namespace = ? and key = ?",
-                    (namespace, key)
+                    (namespace, key_list[0])
                 )
                 return cur.fetchone() is not None
             record = self._get_record(conn, namespace, key_list[0])

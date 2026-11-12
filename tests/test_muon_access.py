@@ -138,7 +138,13 @@ def state(**kwargs: Any) -> policy.AccessState:
 
 @pytest.fixture(autouse=True)
 def _reset():
+    # APIDefinition.create() answers from a class-wide cache, so _api() would
+    # hand back the real handler for any endpoint a Server built earlier in the
+    # session (and never closed) had registered.  Start each test from an empty
+    # cache, and leave it empty so these stubs reach nobody else.
+    APIDefinition.reset_cache()
     yield
+    APIDefinition.reset_cache()
     policy.set_state(None)
     muon_floor.set_protection_level(muon_floor.LEVEL_OPEN)
 
