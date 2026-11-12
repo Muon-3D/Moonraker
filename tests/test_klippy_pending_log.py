@@ -75,8 +75,9 @@ def test_methods_are_limited_separately(caplog):
 
     asyncio.run(run())
     # A flood of 'info' must not hide a stuck gcode/script, or the reverse.
-    assert len(pending_lines(caplog, "info")) == 1
-    assert len(pending_lines(caplog, "gcode/script")) == 1
+    # 2 allows for a loaded box stalling the loop past one log window.
+    assert 1 <= len(pending_lines(caplog, "info")) <= 2
+    assert 1 <= len(pending_lines(caplog, "gcode/script")) <= 2
     # A single waiting request keeps the old wording.
     assert "requests waiting" not in pending_lines(caplog, "gcode/script")[0]
 

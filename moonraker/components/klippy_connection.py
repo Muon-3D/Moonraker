@@ -852,7 +852,13 @@ class KlippyRequest:
                         ) from None
                     now = time.monotonic()
                     last = cls._pending_last_log.get(method)
-                    if last is not None and now - last < PENDING_LOG_INTERVAL:
+                    # 0.9: this check runs on the same 60 s cadence as the
+                    # limit, and a timer that fires a hair early must not
+                    # push a lone request's next line out to 120 s.
+                    if (
+                        last is not None and
+                        now - last < PENDING_LOG_INTERVAL * .9
+                    ):
                         continue
                     cls._pending_last_log[method] = now
                     pending_time = time.time() - start_time
