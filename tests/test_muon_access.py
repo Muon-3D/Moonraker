@@ -431,6 +431,32 @@ class TestPrincipals:
         assert (p.name, p.level, p.role, p.home) == (
             "device:abcd", policy.MEMBER, "viewer", False)
 
+    @pytest.mark.parametrize("level", sorted(policy.PRINCIPAL_LEVELS))
+    @pytest.mark.parametrize("role", list(policy.ROLES))
+    @pytest.mark.parametrize("home", [True, False])
+    def test_a_token_naming_a_principal_resolves_exactly_as_before(
+        self, level, role, home
+    ):
+        # KAN-877 regression guard: every explicit (level, role, home) token
+        # is untouched by the least-privilege change. It is identified, and
+        # carries exactly what it named.
+        p = policy.resolve_principal(
+            HTTP, SENTINEL, gateway(level, role, home=home), "open")
+        assert p is not None
+        assert (p.kind, p.name, p.level, p.role, p.home, p.identified) == (
+            "gateway", "device:abcd", policy.PRINCIPAL_LEVELS[level], role,
+            home, True)
+
+    def test_only_an_identified_gateway_principal_may_tag_uploads(self):
+        from moonraker import muon_access_files as files
+        named = policy.resolve_principal(
+            HTTP, SENTINEL, gateway("admin", "operator"), "open")
+        nameless = policy.resolve_principal(
+            HTTP, SENTINEL, LEGACY_GATEWAY_USER, "open")
+        assert named is not None and nameless is not None
+        assert files.can_tag(named) is True
+        assert files.can_tag(nameless) is False
+
     def test_the_password_login_name_agrees_with_moonraker_32(self):
         panel_login = getattr(muon_floor, "PANEL_LOGIN_USER", None)
         if panel_login is None:
