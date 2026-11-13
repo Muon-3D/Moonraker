@@ -986,7 +986,7 @@ def _join_runner(
                 and baseline_ssid != ssid and baseline_address is not None)
             else None)
         link_box[0] = previous_link
-        if already:
+        if already and baseline_address is not None:
             await handle.update(connect_started=True)
             setup._join_requested = None
             await _complete_join(setup, handle, ssid, baseline_address,
