@@ -932,6 +932,9 @@ def _join_runner(
     setup: MuonSetup, ssid: str, psk: Optional[str], security: str,
     region_arg: Optional[str], saved_before: bool
 ):
+    #: The SSID of the working link at baseline, for `guarded` to restore.
+    link_box: List[Optional[str]] = [None]
+
     async def run(handle: OpHandle) -> None:
         from . import AuxMissing, AuxRefused, AuxUnavailable
         # Step 3: the region switch runs first, still inside `kind: join`
@@ -956,8 +959,6 @@ def _join_runner(
         # status poll moves `op.phase`.
         requested = asyncio.Event()
         setup._join_requested = requested
-        if not saved_before:
-            await remember_cleanup(setup, ssid)
         try:
             baseline = await setup.aux("GET", "/wifi/device/status")
         except (AuxMissing, AuxRefused, AuxUnavailable):
@@ -967,6 +968,32 @@ def _join_runner(
             previous = await setup.aux("GET", "/wifi/current")
         except (AuxMissing, AuxRefused, AuxUnavailable):
             previous = MISSING_UPLINK
+        baseline_address = interface_ipv4(setup, "wlan0")
+        baseline_ssid = (previous.get("ssid") if isinstance(previous, dict)
+                         else None)
+        # KAN-2519: wlan0 is already on the requested SSID with an IPv4, so
+        # the join is already true. Nothing is torn down or re-activated, and
+        # no fresh activation is waited for.
+        already = (
+            isinstance(baseline_ssid, str) and baseline_ssid == ssid
+            and baseline_address is not None
+            and not (isinstance(baseline, dict)
+                     and baseline.get("state") not in (None, "activated")))
+        # The working link to put back if a join to a different SSID fails.
+        previous_link: Optional[str] = (
+            baseline_ssid if (
+                isinstance(baseline_ssid, str) and baseline_ssid
+                and baseline_ssid != ssid and baseline_address is not None)
+            else None)
+        link_box[0] = previous_link
+        if already:
+            await handle.update(connect_started=True)
+            setup._join_requested = None
+            await _complete_join(setup, handle, ssid, baseline_address,
+                                 saved_before, bool(region_arg))
+            return
+        if not saved_before:
+            await remember_cleanup(setup, ssid)
         known_previous = (previous is None or (
             isinstance(previous, dict) and isinstance(previous.get("ssid"), str)
             and bool(previous["ssid"])))
@@ -1083,28 +1110,30 @@ def _join_runner(
             if address is None:
                 await _finish_fail(setup, handle, "no_address", "dhcp",
                                    ssid, saved_before,
-                                   "no verified IPv4 on the requested network")
+                                   "no verified IPv4 on the requested network",
+                                   previous_link)
                 return
-            await handle.update(phase="internet_check")
-            internet = await _internet(setup)
-            await handle.update(phase="update_check")
-            # 02 §5.6 step 4: refresh the clock state first, then a waited
-            # update check.
-            await clock.refresh(setup)
-            checked = await _update_check(setup)
-            if internet is MISSING_UPLINK:
-                # until OS-2: no /wifi/uplink on this image -- whether the
-                # update check reached Aux is the internet verdict.
-                internet = True if checked else None
-            setup._join_connect = None
-            setup._join_requested = None
-            await _finish_join(setup, handle, ssid, address, internet,
-                               saved_before, bool(region_arg))
+            await _complete_join(setup, handle, ssid, address,
+                                 saved_before, bool(region_arg))
             return
         await _finish_fail(setup, handle, code,
                            _last_phase(setup, handle), ssid, saved_before,
-                           detail_text)
-    return run
+                           detail_text, previous_link)
+
+    async def guarded(handle: OpHandle) -> None:
+        # Whatever goes wrong inside the join, the working link comes back.
+        try:
+            await run(handle)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.exception("muon_setup: the join raised")
+            if handle.current():
+                await _finish_fail(
+                    setup, handle, "timeout", _last_phase(setup, handle),
+                    ssid, saved_before, "the join failed unexpectedly",
+                    link_box[0])
+    return guarded
 
 
 async def _connect(setup: MuonSetup, ssid: str,
@@ -1202,6 +1231,85 @@ async def _update_check(setup: MuonSetup) -> bool:
     return answered
 
 
+async def _complete_join(
+    setup: MuonSetup, handle: OpHandle, ssid: str, address: str,
+    saved_before: bool, explicit_region: bool
+) -> None:
+    """The success tail of a join: internet and update checks, then the
+    step is finished."""
+    await handle.update(phase="internet_check")
+    internet = await _internet(setup)
+    await handle.update(phase="update_check")
+    # 02 s5.6 step 4: refresh the clock state first, then a waited
+    # update check.
+    await clock.refresh(setup)
+    checked = await _update_check(setup)
+    if internet is MISSING_UPLINK:
+        # until OS-2: no /wifi/uplink on this image -- whether the
+        # update check reached Aux is the internet verdict.
+        internet = True if checked else None
+    setup._join_connect = None
+    setup._join_requested = None
+    await _finish_join(setup, handle, ssid, address, internet,
+                       saved_before, explicit_region)
+
+
+#: How long a restore waits for the previous link to get its IPv4 back.
+RESTORE_WAIT = 20.0
+
+
+async def _link_up(setup: MuonSetup, ssid: str) -> bool:
+    from . import AuxMissing, AuxRefused, AuxUnavailable
+    try:
+        current = await setup.aux("GET", "/wifi/current")
+    except (AuxMissing, AuxRefused, AuxUnavailable):
+        return False
+    return (isinstance(current, dict) and current.get("ssid") == ssid
+            and interface_ipv4(setup, "wlan0") is not None)
+
+
+async def _restore_previous(setup: MuonSetup, ssid: str) -> Tuple[bool, bool]:
+    """KAN-2519: put the link the printer had before a failed join back.
+
+    Re-activates the saved profile (POST /wifi/connect with no password,
+    which never creates or deletes a profile) and checks wlan0 has its IPv4.
+    If that fails, raise the hotspot (POST /wifi/ap/up) so the printer stays
+    reachable. Returns (restored, hotspot_up)."""
+    from . import AuxMissing, AuxRefused, AuxUnavailable
+    connect = setup._join_connect
+    if connect is not None and not connect.done():
+        # A late connect still running at Aux would race the restore.
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(connect), CONNECT_TIMEOUT + 5.0)
+        except Exception:  # noqa: BLE001 -- timed out or failed; restore anyway
+            pass
+    if await _link_up(setup, ssid):
+        return True, False
+    try:
+        await setup.aux("POST", "/wifi/connect", {"ssid": ssid},
+                        timeout=CONNECT_TIMEOUT)
+    except (AuxMissing, AuxRefused, AuxUnavailable) as exc:
+        logging.info("muon_setup: restore of %r failed: %s", ssid, exc)
+    except Exception:  # noqa: BLE001 -- the restore must still reach the hotspot
+        logging.exception("muon_setup: restore raised")
+    deadline = time.monotonic() + RESTORE_WAIT
+    while True:
+        if await _link_up(setup, ssid):
+            return True, False
+        if time.monotonic() > deadline:
+            break
+        await asyncio.sleep(STATUS_POLL)
+    try:
+        await setup.aux("POST", "/wifi/ap/up")
+        return False, True
+    except (AuxMissing, AuxRefused, AuxUnavailable) as exc:
+        logging.warning("muon_setup: hotspot up after a failed restore: %s", exc)
+    except Exception:  # noqa: BLE001
+        logging.exception("muon_setup: hotspot up raised")
+    return False, False
+
+
 async def _finish_join(
     setup: MuonSetup, handle: OpHandle, ssid: str, address: str,
     internet: Any, saved_before: bool, explicit_region: bool = False
@@ -1244,7 +1352,8 @@ async def _finish_join(
 
 async def _finish_fail(
     setup: MuonSetup, handle: OpHandle, code: str, phase: Optional[str],
-    ssid: str, saved_before: bool, detail: str
+    ssid: str, saved_before: bool, detail: str,
+    previous: Optional[str] = None
 ) -> None:
     cleanup = None
     if not saved_before:
@@ -1252,8 +1361,21 @@ async def _finish_fail(
         # Register required cleanup before finish() clears the operation.
         # Reset can then cancel the runner without losing this owned work.
         cleanup = setup._join_cleanup = setup._spawn(_join_cleanup(setup, ssid))
-    await handle.finish(
-        lambda doc: _join_fail(doc, code, phase, ssid, detail))
+    outcome: Optional[Tuple[bool, bool]] = None
+    if previous is not None:
+        # The new profile's cleanup goes first (it may disconnect the new
+        # SSID); then the previous link comes back, or the hotspot does.
+        if cleanup is not None:
+            await asyncio.shield(cleanup)
+        outcome = await _restore_previous(setup, previous)
+
+    def failed(doc: Dict[str, Any]) -> None:
+        _join_fail(doc, code, phase, ssid, detail)
+        if outcome is not None:
+            info = doc["steps"]["network"]["error"]["detail"]
+            info["restored_previous"] = outcome[0]
+            info["hotspot_up"] = outcome[1]
+    await handle.finish(failed)
     connect = setup._join_connect
     if connect is not None and connect.done():
         setup._join_connect = None
