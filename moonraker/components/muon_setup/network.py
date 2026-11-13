@@ -1378,8 +1378,6 @@ async def _finish_fail(
     else:
         # No working link before (first-run over the hotspot): never leave
         # both radios down.
-        if cleanup is not None:
-            await asyncio.shield(cleanup)
         outcome = (False, await _raise_hotspot(setup))
 
     def failed(doc: Dict[str, Any]) -> None:
