@@ -1888,6 +1888,50 @@ class TestJoinKeepsTheWorkingConnection:
             assert self.OLD not in script.forgets
         run(go())
 
+    def test_a_failed_join_with_no_previous_link_raises_the_hotspot(
+            self, monkeypatch):
+        """No working Wi-Fi at baseline (first-run over the hotspot): a
+        failed join still brings ap0 up."""
+        async def go():
+            def wrong(net):
+                net.set(None, None)
+                raise ServerError("Secrets were required, but not provided",
+                                  400)
+            h, script, aux, _ = await self.rig(
+                monkeypatch, saved=[], on_new=wrong, current=None)
+            await h.post("/network", join_body(rev=h.doc["rev"]))
+            await joined(h)
+            err = h.doc["steps"]["network"]["error"]
+            assert err["code"] == "wrong_password"
+            assert err["detail"]["restored_previous"] is False
+            assert err["detail"]["hotspot_up"] is True
+            assert len(aux.posted("/wifi/ap/up")) == 1
+        run(go())
+
+    def test_a_failing_hotspot_call_still_finishes_the_join_failed(
+            self, monkeypatch):
+        async def go():
+            def wrong(net):
+                net.set(None, None)
+                raise ServerError("Secrets were required, but not provided",
+                                  400)
+
+            def ap_fails(_body):
+                raise ServerError("Aux is unavailable", 503)
+            h, script, aux, _ = await self.rig(
+                monkeypatch, saved=[], on_new=wrong, current=None)
+            aux.routes[("POST", "/wifi/ap/up")] = ap_fails
+            await h.post("/network", join_body(rev=h.doc["rev"]))
+            await joined(h)
+            step = h.doc["steps"]["network"]
+            assert step["status"] != "done"
+            err = step["error"]
+            assert err["code"] == "wrong_password"
+            assert err["detail"]["restored_previous"] is False
+            assert err["detail"]["hotspot_up"] is False
+            assert len(aux.posted("/wifi/ap/up")) == 1
+        run(go())
+
     def test_a_fresh_join_to_a_new_ssid_leaves_the_old_profile(
             self, monkeypatch):
         """Case (e)."""

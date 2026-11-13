@@ -1300,14 +1300,21 @@ async def _restore_previous(setup: MuonSetup, ssid: str) -> Tuple[bool, bool]:
         if time.monotonic() > deadline:
             break
         await asyncio.sleep(STATUS_POLL)
+    return False, await _raise_hotspot(setup)
+
+
+async def _raise_hotspot(setup: MuonSetup) -> bool:
+    """POST /wifi/ap/up so the printer stays reachable. Never raises;
+    returns whether the hotspot was brought up."""
+    from . import AuxMissing, AuxRefused, AuxUnavailable
     try:
         await setup.aux("POST", "/wifi/ap/up")
-        return False, True
+        return True
     except (AuxMissing, AuxRefused, AuxUnavailable) as exc:
-        logging.warning("muon_setup: hotspot up after a failed restore: %s", exc)
+        logging.warning("muon_setup: hotspot up after a failed join: %s", exc)
     except Exception:  # noqa: BLE001
         logging.exception("muon_setup: hotspot up raised")
-    return False, False
+    return False
 
 
 async def _finish_join(
@@ -1368,6 +1375,12 @@ async def _finish_fail(
         if cleanup is not None:
             await asyncio.shield(cleanup)
         outcome = await _restore_previous(setup, previous)
+    else:
+        # No working link before (first-run over the hotspot): never leave
+        # both radios down.
+        if cleanup is not None:
+            await asyncio.shield(cleanup)
+        outcome = (False, await _raise_hotspot(setup))
 
     def failed(doc: Dict[str, Any]) -> None:
         _join_fail(doc, code, phase, ssid, detail)
