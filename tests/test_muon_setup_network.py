@@ -25,6 +25,13 @@ PSK = "hunter2hunter2"  # never logged anywhere
 SSID = "HomeWiFi"
 
 
+@pytest.fixture(autouse=True)
+def _short_restore_wait(monkeypatch):
+    """KAN-2519: a failed join waits for the old link to come back; the fake
+    Aux answers at once or never, so do not wait the real 20 s."""
+    monkeypatch.setattr(network, "RESTORE_WAIT", 0.2)
+
+
 def join_body(**kw: Any) -> Dict[str, Any]:
     body: Dict[str, Any] = {
         "rev": 5, "kind": "wifi", "ssid": SSID, "security": "wpa2",
@@ -617,11 +624,13 @@ class TestDeferredCleanup:
     when the late connect put the printer on the cancelled SSID."""
 
     def _blocked_aux(self, script: JoinScript, gate: asyncio.Event,
-                     result: Any = None) -> FakeAux:
+                     result: Any = None, lands: bool = False) -> FakeAux:
         started = asyncio.Event()
 
         async def slow_connect(body: Any) -> Any:
             started.set()
+            if lands:  # the late connect puts wlan0 on the requested SSID
+                script.current_ssid = body["ssid"]
             await gate.wait()
             return result or {"status": "connecting",
                               "ssid": body["ssid"]}
@@ -634,9 +643,9 @@ class TestDeferredCleanup:
         async def go():
             gate = asyncio.Event()
             script = JoinScript()
-            script.current_ssid = SSID  # the late connect landed on it
-            h = await Harness(stored=join_state(),
-                              aux=self._blocked_aux(script, gate)).start()
+            h = await Harness(
+                stored=join_state(),
+                aux=self._blocked_aux(script, gate, lands=True)).start()
             await h.post("/network", join_body())
             await asyncio.wait_for(h.aux.connect_started.wait(), 30.)
             out = await h.post("/network/cancel", {})
@@ -671,9 +680,9 @@ class TestDeferredCleanup:
             gate = asyncio.Event()
             script = JoinScript(device_states=["associating"],
                                 uplink=None)
-            script.current_ssid = SSID
-            h = await Harness(stored=join_state(),
-                              aux=self._blocked_aux(script, gate)).start()
+            h = await Harness(
+                stored=join_state(),
+                aux=self._blocked_aux(script, gate, lands=True)).start()
             h.setup.join_timeout = 0.2
             await h.post("/network", join_body())
             # The op ends on its timeout while the connect still runs; the
@@ -694,9 +703,9 @@ class TestDeferredCleanup:
         async def go():
             gate = asyncio.Event()
             script = JoinScript(saved=[SSID])
-            script.current_ssid = SSID
-            h = await Harness(stored=join_state(),
-                              aux=self._blocked_aux(script, gate)).start()
+            h = await Harness(
+                stored=join_state(),
+                aux=self._blocked_aux(script, gate, lands=True)).start()
             await h.post("/network", join_body())
             await asyncio.wait_for(h.aux.connect_started.wait(), 30.)
             await h.post("/network/cancel", {})
@@ -802,8 +811,17 @@ class TestJoinRegionAndResetBoundaries:
         async def go():
             entered, release = asyncio.Event(), asyncio.Event()
             script = JoinScript(connect_result=ServerError("bad-psk", 400))
-            script.current_ssid = SSID
-            h = await Harness(stored=join_state(), aux=wifi_aux(script)).start()
+            script.current_ssid = "PreviousWiFi"
+            aux = wifi_aux(script)
+            h = await Harness(stored=join_state(), aux=aux).start()
+
+            def landed_then_failed(body):
+                if body["ssid"] != SSID:  # the restore of the old link
+                    script.current_ssid = body["ssid"]
+                    return {"status": "connecting", "ssid": body["ssid"]}
+                script.current_ssid = SSID  # the new SSID took wlan0
+                raise ServerError("bad-psk", 400)
+            aux.routes[("POST", "/wifi/connect")] = landed_then_failed
             original = h.setup._commit
 
             async def commit():
@@ -939,8 +957,7 @@ class TestJoinRegionAndResetBoundaries:
 
     def test_cancel_disconnects_a_completed_connect_still_waiting_for_dhcp(self):
         async def go():
-            script = JoinScript()
-            script.current_ssid = SSID
+            script = JoinScript(lands=True)
             h = await Harness(stored=join_state(), aux=wifi_aux(script)).start()
             h.server.components["machine"].addresses = []
             await h.post("/network", join_body())
@@ -1138,8 +1155,7 @@ class TestJoinRegionAndResetBoundaries:
         async def go():
             gate = asyncio.Event()
             script = JoinScript(saved=[SSID] if saved else [])
-            script.current_ssid = SSID
-            aux = TestDeferredCleanup()._blocked_aux(script, gate)
+            aux = TestDeferredCleanup()._blocked_aux(script, gate, lands=True)
             h = await Harness(stored=join_state(), aux=aux).start()
             await h.post("/network", join_body())
             await asyncio.wait_for(h.aux.connect_started.wait(), 30.)
@@ -1332,11 +1348,12 @@ class TestPersistedJoinBoundaries:
     def test_restart_resumes_cleanup_after_the_join_operation_was_cleared(self, stage):
         async def go():
             entered, release = asyncio.Event(), asyncio.Event()
-            script = JoinScript(connect_result=ServerError("bad-psk", 400))
-            script.current_ssid = SSID
+            script = JoinScript(connect_result=ServerError("bad-psk", 400),
+                                lands=True)
             aux = wifi_aux(script)
 
             async def blocked(_body):
+                script.current_ssid = SSID
                 entered.set()
                 await release.wait()
                 return {"status": "connecting", "ssid": SSID}
@@ -1396,8 +1413,8 @@ class TestDurableCleanupLifetime:
     @pytest.mark.parametrize("stage", ["disconnect", "forget"])
     def test_failed_cleanup_stays_recoverable_and_blocks_a_new_join(self, stage):
         async def go():
-            script = JoinScript(connect_result=ServerError("bad-psk", 400))
-            script.current_ssid = SSID
+            script = JoinScript(connect_result=ServerError("bad-psk", 400),
+                                lands=True)
             aux = wifi_aux(script)
             key = (("POST", "/wifi/disconnect") if stage == "disconnect"
                    else ("DELETE", "/wifi/forget"))
@@ -1455,8 +1472,8 @@ class TestResetWithPendingCleanup:
     @pytest.mark.parametrize("recovers", [False, True])
     def test_reset_preserves_pending_cleanup_or_waits_for_its_retry(self, recovers):
         async def go():
-            script = JoinScript(connect_result=ServerError("bad-psk", 400))
-            script.current_ssid = SSID
+            script = JoinScript(connect_result=ServerError("bad-psk", 400),
+                                lands=True)
             aux = wifi_aux(script)
             aux.routes[("DELETE", "/wifi/forget")] = ServerError("unavailable", 503)
             h = await Harness(stored=join_state(), aux=aux).start()
@@ -1496,103 +1513,6 @@ class TestAlreadyRemovedCleanup:
             else:
                 assert out["error"]["code"] == "busy"
             await h.setup.close()
-        run(go())
-
-
-class TestSameSsidActivationEvidence:
-    @pytest.mark.parametrize("evidence", ["unchanged", "identity", "transition",
-                                          "legacy_transition", "ssid_transition",
-                                          "unavailable_current", "failed_then_restored",
-                                          "malformed_status", "malformed_current",
-                                          "malformed_identity", "malformed_initial",
-                                          "failed_verified_only", "unavailable_activation",
-                                          "profile_activation"])
-    def test_an_accepted_same_ssid_join_requires_fresh_activation(self, monkeypatch, evidence):
-        async def go():
-            monkeypatch.setattr(network, "STATUS_POLL", 0.01)
-            script = JoinScript(saved=[SSID])
-            script.current_ssid = SSID
-            aux = wifi_aux(script)
-            doc = TestJoinRegionAndResetBoundaries.completed()
-            doc["steps"]["network"]["ssid"] = SSID
-            h = await Harness(stored=doc, aux=aux).start()
-            machine = h.server.components["machine"]
-            machine.addresses = ["192.168.1.7"]
-            reads = []
-            failed_current = False
-            activation_unknown = False
-            old_path = "/org/freedesktop/NetworkManager/ActiveConnection/10"
-            new_path = "/org/freedesktop/NetworkManager/ActiveConnection/11"
-
-            def status(_body):
-                reads.append(True)
-                if activation_unknown:
-                    raise ServerError("activation state unavailable", 503)
-                if script.connects and evidence == "failed_verified_only" and len(reads) == 3:
-                    return {"state": "failed"}
-                if script.connects and 3 <= len(reads) <= 4:
-                    if evidence == "failed_then_restored":
-                        return {"state": "failed"}
-                    if evidence == "malformed_status":
-                        return {"state": "bogus"}
-                if script.connects and evidence in ("transition", "legacy_transition"):
-                    if 3 <= len(reads) <= 4:
-                        return {"state": "preparing"}
-                    if len(reads) >= 5:
-                        machine.addresses = ["10.0.0.9"]
-                if evidence == "ssid_transition" and len(reads) >= 5:
-                    machine.addresses = ["10.0.0.9"]
-                return {"state": "activated"}
-
-            def show(_body):
-                nonlocal activation_unknown
-                if script.connects and evidence in ("unavailable_activation", "profile_activation") and len(reads) >= 4:
-                    activation_unknown = True
-                    machine.addresses = ["10.0.0.9"]
-                    out = {"GENERAL.DBUS-PATH": new_path}
-                    if evidence == "profile_activation":
-                        out["GENERAL.STATE"] = "activated"
-                    return out
-                if script.connects and evidence == "malformed_identity":
-                    return {"GENERAL.DBUS-PATH": new_path + "invalid"}
-                if evidence == "legacy_transition":
-                    return {"connection.id": SSID}
-                if script.connects and evidence in ("identity", "failed_verified_only") and len(reads) >= 4:
-                    machine.addresses = ["10.0.0.9"]
-                    return {"GENERAL.DBUS-PATH": new_path}
-                return {"GENERAL.DBUS-PATH": old_path}
-
-            def current(_body):
-                nonlocal failed_current
-                if not script.connects and evidence == "malformed_initial":
-                    return []
-                if script.connects and evidence == "unavailable_current" and not failed_current:
-                    failed_current = True
-                    raise ServerError("Aux is unavailable", 503)
-                if script.connects and 3 <= len(reads) <= 4:
-                    if evidence == "ssid_transition":
-                        return None
-                    if evidence == "malformed_current":
-                        return []
-                return {"ssid": SSID}
-
-            aux.routes[("GET", "/wifi/current")] = current
-            aux.routes[("GET", "/wifi/device/status")] = status
-            aux.routes[("GET", "/wifi/show")] = show
-            await h.post("/network", join_body(rev=h.doc["rev"]))
-            await joined(h)
-            step = h.doc["steps"]["network"]
-            if evidence in ("unchanged", "unavailable_current", "failed_then_restored",
-                            "malformed_status", "malformed_current",
-                            "malformed_identity", "malformed_initial",
-                            "failed_verified_only", "unavailable_activation"):
-                assert step["status"] == "pending"
-                assert step["error"]["code"] == "no_address"
-                assert aux.posted("/wifi/ap/auto_off") == []
-            else:
-                assert step["status"] == "done"
-                assert step["addresses"] == ["10.0.0.9"]
-            assert script.forgets == []  # This is the owner's saved profile.
         run(go())
 
 
@@ -1826,4 +1746,208 @@ class TestPartialCapabilities:
             step = h.doc["steps"]["network"]
             assert step["region_confirmed"] is (missing == "both")
             assert step["status"] == ("done" if missing == "both" else "pending")
+        run(go())
+
+
+class TestJoinKeepsTheWorkingConnection:
+    """KAN-2519: a set-up join accepts a connection that is already there and
+    never leaves the printer with less connectivity than it had."""
+
+    OLD = "Muon3D_Dev"
+    OLD_IP = "192.168.1.7"
+    NEW_IP = "10.0.0.9"
+
+    @staticmethod
+    async def rig(monkeypatch, *, saved, on_new, on_old=None, current=OLD):
+        """A printer on `current` with an IPv4. `on_new(net)` / `on_old(net)`
+        say what POST /wifi/connect does for the requested SSID / the old
+        one (raise to fail); `net` is the live link."""
+        monkeypatch.setattr(network, "STATUS_POLL", 0.01)
+        monkeypatch.setattr(network, "RESTORE_WAIT", 0.1)
+        script = JoinScript(saved=saved)
+        aux = wifi_aux(script)
+        stored = TestJoinRegionAndResetBoundaries.completed()
+        h = await Harness(stored=stored, aux=aux).start()
+        h.setup.join_timeout = 0.3
+        machine = h.server.components["machine"]
+        machine.addresses = [TestJoinKeepsTheWorkingConnection.OLD_IP]
+        script.current_ssid = current
+
+        class Net:
+            def set(self, ssid, address):
+                script.current_ssid = ssid
+                machine.addresses = [address] if address else []
+        net = Net()
+        old = TestJoinKeepsTheWorkingConnection.OLD
+
+        def connect(body):
+            script.connects.append(dict(body))
+            if body["ssid"] == old:
+                if on_old is not None:
+                    on_old(net)
+                else:
+                    net.set(old, TestJoinKeepsTheWorkingConnection.OLD_IP)
+                return {"status": "connecting", "ssid": old}
+            return on_new(net)
+
+        aux.routes[("POST", "/wifi/connect")] = connect
+        aux.routes[("GET", "/wifi/device/status")] = lambda _b: {
+            "device": "wlan0",
+            "state": "activated" if script.current_ssid else "disconnected"}
+        aux.routes[("POST", "/wifi/disconnect")] = lambda b: (
+            script.disconnects.append(b), net.set(None, None),
+            {"status": "disconnected"})[-1]
+        aux.routes[("POST", "/wifi/ap/up")] = {"status": "up"}
+        return h, script, aux, net
+
+    @pytest.mark.parametrize("saved", [["Muon3D_Dev"], []])
+    def test_already_on_the_requested_ssid_succeeds_at_once(
+            self, monkeypatch, saved):
+        """Case (a). `saved` [] is a profile whose name is not the SSID: the
+        join must still leave the live connection alone."""
+        async def go():
+            def never(_net):
+                raise AssertionError("no connect for an existing link")
+            h, script, aux, _ = await self.rig(
+                monkeypatch, saved=saved, on_new=never)
+            body = join_body(rev=h.doc["rev"], ssid=self.OLD)
+            await h.post("/network", body)
+            await joined(h)
+            step = h.doc["steps"]["network"]
+            assert step["status"] == "done"
+            assert step["error"] is None
+            assert step["ssid"] == self.OLD
+            assert step["addresses"] == [self.OLD_IP]
+            assert aux.posted("/wifi/connect") == []
+            assert script.disconnects == [] and script.forgets == []
+        run(go())
+
+    def test_wrong_password_restores_the_previous_profile(self, monkeypatch):
+        """Case (b)."""
+        async def go():
+            def wrong(net):
+                net.set(None, None)  # the old link went down on the way
+                raise ServerError("Secrets were required, but not provided",
+                                  400)
+            h, script, aux, _ = await self.rig(
+                monkeypatch, saved=[self.OLD], on_new=wrong)
+            await h.post("/network", join_body(rev=h.doc["rev"]))
+            await joined(h)
+            err = h.doc["steps"]["network"]["error"]
+            assert err["code"] == "wrong_password"
+            assert err["detail"]["restored_previous"] is True
+            assert err["detail"]["hotspot_up"] is False
+            assert script.connects[-1] == {"ssid": self.OLD}  # no password
+            assert script.current_ssid == self.OLD
+            assert self.OLD in script.saved
+            assert self.OLD not in script.forgets
+            assert aux.posted("/wifi/ap/up") == []
+        run(go())
+
+    def test_a_timeout_with_no_address_restores_the_previous_link(
+            self, monkeypatch):
+        """Case (c)."""
+        async def go():
+            def no_dhcp(net):
+                net.set(SSID, None)  # associated, never got an address
+                return {"status": "connecting", "ssid": SSID}
+            h, script, aux, _ = await self.rig(
+                monkeypatch, saved=[self.OLD], on_new=no_dhcp)
+            await h.post("/network", join_body(rev=h.doc["rev"]))
+            await joined(h)
+            err = h.doc["steps"]["network"]["error"]
+            assert err["code"] in ("no_address", "timeout")
+            assert err["detail"]["restored_previous"] is True
+            assert script.current_ssid == self.OLD
+            assert network.interface_ipv4(h.setup, "wlan0") == self.OLD_IP
+            assert self.OLD not in script.forgets
+            assert aux.posted("/wifi/ap/up") == []
+        run(go())
+
+    def test_a_failed_restore_brings_the_hotspot_up(self, monkeypatch):
+        """Case (d)."""
+        async def go():
+            def wrong(net):
+                net.set(None, None)
+                raise ServerError("Secrets were required, but not provided",
+                                  400)
+
+            def old_fails(_net):
+                raise ServerError("Aux is unavailable", 503)
+            h, script, aux, _ = await self.rig(
+                monkeypatch, saved=[self.OLD], on_new=wrong,
+                on_old=old_fails)
+            await h.post("/network", join_body(rev=h.doc["rev"]))
+            await joined(h)
+            err = h.doc["steps"]["network"]["error"]
+            assert err["code"] == "wrong_password"
+            assert err["detail"]["restored_previous"] is False
+            assert err["detail"]["hotspot_up"] is True
+            assert len(aux.posted("/wifi/ap/up")) == 1
+            assert self.OLD in script.saved
+            assert self.OLD not in script.forgets
+        run(go())
+
+    def test_a_failed_join_with_no_previous_link_raises_the_hotspot(
+            self, monkeypatch):
+        """No working Wi-Fi at baseline (first-run over the hotspot): a
+        failed join still brings ap0 up."""
+        async def go():
+            def wrong(net):
+                net.set(None, None)
+                raise ServerError("Secrets were required, but not provided",
+                                  400)
+            h, script, aux, _ = await self.rig(
+                monkeypatch, saved=[], on_new=wrong, current=None)
+            await h.post("/network", join_body(rev=h.doc["rev"]))
+            await joined(h)
+            err = h.doc["steps"]["network"]["error"]
+            assert err["code"] == "wrong_password"
+            assert err["detail"]["restored_previous"] is False
+            assert err["detail"]["hotspot_up"] is True
+            assert len(aux.posted("/wifi/ap/up")) == 1
+        run(go())
+
+    def test_a_failing_hotspot_call_still_finishes_the_join_failed(
+            self, monkeypatch):
+        async def go():
+            def wrong(net):
+                net.set(None, None)
+                raise ServerError("Secrets were required, but not provided",
+                                  400)
+
+            def ap_fails(_body):
+                raise ServerError("Aux is unavailable", 503)
+            h, script, aux, _ = await self.rig(
+                monkeypatch, saved=[], on_new=wrong, current=None)
+            aux.routes[("POST", "/wifi/ap/up")] = ap_fails
+            await h.post("/network", join_body(rev=h.doc["rev"]))
+            await joined(h)
+            step = h.doc["steps"]["network"]
+            assert step["status"] != "done"
+            err = step["error"]
+            assert err["code"] == "wrong_password"
+            assert err["detail"]["restored_previous"] is False
+            assert err["detail"]["hotspot_up"] is False
+            assert len(aux.posted("/wifi/ap/up")) == 1
+        run(go())
+
+    def test_a_fresh_join_to_a_new_ssid_leaves_the_old_profile(
+            self, monkeypatch):
+        """Case (e)."""
+        async def go():
+            def ok(net):
+                net.set(SSID, self.NEW_IP)
+                return {"status": "connecting", "ssid": SSID}
+            h, script, aux, _ = await self.rig(
+                monkeypatch, saved=[self.OLD], on_new=ok)
+            await h.post("/network", join_body(rev=h.doc["rev"]))
+            await joined(h)
+            step = h.doc["steps"]["network"]
+            assert step["error"] is None
+            assert step["ssid"] == SSID and step["addresses"] == [self.NEW_IP]
+            assert [c["ssid"] for c in script.connects] == [SSID]
+            assert script.forgets == [] and script.disconnects == []
+            assert self.OLD in script.saved
+            assert aux.posted("/wifi/ap/up") == []
         run(go())

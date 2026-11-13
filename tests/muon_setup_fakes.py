@@ -174,6 +174,7 @@ class JoinScript:
         connect_result: Any = None,
         saved: Optional[List[str]] = None,
         uplink: Any = None,
+        lands: bool = False,
     ) -> None:
         self.device_states = list(device_states or ["activated"])
         self.connect_result = (
@@ -181,6 +182,9 @@ class JoinScript:
             else connect_result)
         self.saved = list(saved) if saved is not None else []
         self.uplink = uplink
+        #: A connect puts wlan0 on the requested SSID at once (the radio
+        #: associates even when the join later fails).
+        self.lands = lands
         self.forgets: List[str] = []
         self.shows: List[str] = []
         self.disconnects: List[Any] = []
@@ -200,6 +204,8 @@ class JoinScript:
 
         def connect(body: Any) -> Any:
             self.connects.append(copy.deepcopy(body))
+            if self.lands:
+                self.current_ssid = body.get("ssid")
             if isinstance(self.connect_result, BaseException):
                 raise self.connect_result
             answer = copy.deepcopy(self.connect_result)
