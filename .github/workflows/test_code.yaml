@@ -31,6 +31,13 @@ jobs:
     runs-on: ${{ fromJSON(vars.LINUX_RUNS_ON || '["self-hosted","muon-ci"]') }}
     steps:
       - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+      - name: Check generated dependencies
+        run: |
+          python -m pip install -r scripts/moonraker-dev-reqs.txt
+          pre-commit run --all-files
       - uses: weibullguy/python-lint-plus@v1.12.0
         with:
           python-root-list: "moonraker scripts"
