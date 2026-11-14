@@ -1851,7 +1851,10 @@ class TestJoinKeepsTheWorkingConnection:
             assert step["addresses"] == [self.OLD_IP]
             assert aux.posted("/wifi/connect") == []
             assert aux.posted("/wifi/ap/up") == []
-            assert [c for c in aux.calls if c[0] != "GET"] == []
+            # Only the hotspot auto-off timer (a join-complete step) may write.
+            assert [c[:2] for c in aux.calls if c[0] != "GET"
+                    and c[1].startswith("/wifi")] == [
+                ("POST", "/wifi/ap/auto_off")]
             assert script.connects == [] and script.disconnects == []
             assert script.forgets == []
         run(go())
@@ -1985,3 +1988,42 @@ class TestJoinKeepsTheWorkingConnection:
             assert self.OLD in script.saved
             assert aux.posted("/wifi/ap/up") == []
         run(go())
+
+
+class TestWifiStateVocabulary:
+    """KAN-2767: Aux's device status speaks nmcli's device words; connection
+    profiles speak NetworkManager's. One helper reads both."""
+
+    @pytest.mark.parametrize("state,kind", [
+        ("connected", "connected"),
+        ("connected (externally)", "connected"),
+        ("connected (site only)", "connected"),
+        ("100 (connected)", "connected"),
+        ("activated", "connected"),
+        ("connecting (prepare)", "connecting"),
+        ("connecting (configuring)", "connecting"),
+        ("connecting (need authentication)", "connecting"),
+        ("connecting (getting IP configuration)", "connecting"),
+        ("connecting (checking IP connectivity)", "connecting"),
+        ("connecting (starting secondary connections)", "connecting"),
+        ("activating", "connecting"),
+        ("connection failed", "failed"),
+        ("failed", "failed"),
+        ("disconnected", "other"),
+        ("deactivating", "other"),
+        ("deactivated", "other"),
+        ("unavailable", "other"),
+        ("unmanaged", "other"),
+        (None, "other"),
+    ])
+    def test_state_class(self, state, kind):
+        assert network.wifi_state_class(state) == kind
+
+    def test_the_phase_follows_the_device_word(self):
+        assert network.wifi_state_phase(DEV_PREPARE) == "associating"
+        assert network.wifi_state_phase(DEV_NEED_AUTH) == "authenticating"
+        assert network.wifi_state_phase(DEV_GETTING_IP) == "dhcp"
+        assert network.wifi_state_phase(DEV_CONNECTED) == "internet_check"
+        assert network.wifi_state_phase(DEV_CONNECTED_EXTERNALLY) == (
+            "internet_check")
+        assert network.wifi_state_phase(DEV_DISCONNECTED) is None

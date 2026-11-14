@@ -23,6 +23,7 @@ import fcntl
 import ipaddress
 import logging
 import os
+import re
 import socket
 import struct
 import time
@@ -47,18 +48,88 @@ STATUS_POLL = 0.5
 JOIN_PHASES = ("saving", "region", "associating", "authenticating",
                "dhcp", "internet_check", "update_check")
 
-#: nmcli's device states, mapped onto the phases (03 §4 step 2).
+#: Aux's GET /wifi/device/status `state`, mapped onto the phases (03 §4
+#: step 2). Keys are `wifi_state_detail` output: the bracketed part of nmcli's
+#: "connecting (...)" device words, or the bare word.
 DEVICE_PHASES = {
-    "preparing": "associating",
+    "prepare": "associating",
     "configuring": "associating",
+    "need authentication": "authenticating",
+    "getting ip configuration": "dhcp",
+    "checking ip connectivity": "dhcp",
+    "starting secondary connections": "dhcp",
+    "connecting": "associating",
+    "connected": "internet_check",
+    # NetworkManager's own short names, and the connection vocabulary.
+    "preparing": "associating",
     "need-auth": "authenticating",
     "ip-config": "dhcp",
     "ip-check": "dhcp",
-    "activated": "internet_check",
     "secondaries": "dhcp",
-    "connecting": "associating",
-    "getting IP configuration": "dhcp",
+    "activating": "associating",
+    "activated": "internet_check",
 }
+
+# Two vocabularies reach this file. Aux's GET /wifi/device/status relays
+# `nmcli device status`, whose STATE words are "connected", "connected
+# (externally)", "connecting (prepare)", "connection failed" and so on; it
+# never says "activated". `nmcli connection show` GENERAL.STATE (Aux's
+# GET /wifi/show) says "activated"/"activating"/"deactivated". Both go through
+# `wifi_state_class`, so a comparison cannot read the wrong one.
+_STATE_NUMBERED = re.compile(r"^\d+\s*\((.*)\)$")
+_CONNECTED_WORDS = ("connected", "activated")
+_CONNECTING_WORDS = (
+    "connecting", "activating", "preparing", "configuring", "need-auth",
+    "ip-config", "ip-check", "secondaries")
+_FAILED_WORDS = ("failed", "connection failed")
+
+
+def wifi_state_detail(state: Any) -> str:
+    """A device/connection state word, lower-cased and unwrapped: "100
+    (connected)" -> "connected"; "connecting (prepare)" -> "prepare"."""
+    if not isinstance(state, str):
+        return ""
+    text = state.strip().lower()
+    numbered = _STATE_NUMBERED.match(text)
+    if numbered:
+        text = numbered.group(1).strip()
+    if text.startswith("connecting (") and text.endswith(")"):
+        return text[len("connecting ("):-1].strip()
+    return text
+
+
+def wifi_state_class(state: Any) -> str:
+    """Classify an nmcli device or connection state as "connected",
+    "connecting", "failed" or "other" ("disconnected", "unavailable",
+    "deactivating", "deactivated", None, junk)."""
+    if not isinstance(state, str):
+        return "other"
+    text = state.strip().lower()
+    numbered = _STATE_NUMBERED.match(text)
+    if numbered:
+        text = numbered.group(1).strip()
+    head = text.split("(", 1)[0].strip()
+    if text in _FAILED_WORDS:
+        return "failed"
+    if head in _CONNECTED_WORDS:
+        return "connected"
+    if head in _CONNECTING_WORDS:
+        return "connecting"
+    if text in _CONNECTING_WORDS:
+        return "connecting"
+    return "other"
+
+
+def wifi_state_phase(state: Any) -> Optional[str]:
+    """The join phase a device state stands for, or None."""
+    detail = wifi_state_detail(state)
+    phase = DEVICE_PHASES.get(detail)
+    if phase is None:
+        kind = wifi_state_class(state)
+        phase = {"connected": "internet_check",
+                 "connecting": "associating"}.get(kind)
+    return phase
+
 
 SECURITY_KINDS = ("open", "owe", "wep", "wpa2", "wpa3", "wpa2_wpa3",
                   "enterprise")
@@ -925,7 +996,8 @@ async def _active_connection_info(
     number = path[len(prefix):]
     if not number.isascii() or not number.isdigit():
         return None, False
-    return path, profile.get("GENERAL.STATE") == "activated"
+    # `nmcli connection show` vocabulary ("activated"), not the device one.
+    return path, wifi_state_class(profile.get("GENERAL.STATE")) == "connected"
 
 
 def _join_runner(
@@ -963,7 +1035,8 @@ def _join_runner(
             baseline = await setup.aux("GET", "/wifi/device/status")
         except (AuxMissing, AuxRefused, AuxUnavailable):
             baseline = None
-        stale_failure = isinstance(baseline, dict) and baseline.get("state") == "failed"
+        stale_failure = (isinstance(baseline, dict)
+                         and wifi_state_class(baseline.get("state")) == "failed")
         try:
             previous = await setup.aux("GET", "/wifi/current")
         except (AuxMissing, AuxRefused, AuxUnavailable):
@@ -978,7 +1051,8 @@ def _join_runner(
             isinstance(baseline_ssid, str) and baseline_ssid == ssid
             and baseline_address is not None
             and not (isinstance(baseline, dict)
-                     and baseline.get("state") not in (None, "activated")))
+                     and baseline.get("state") is not None
+                     and wifi_state_class(baseline.get("state")) != "connected"))
         # The working link to put back if a join to a different SSID fails.
         previous_link: Optional[str] = (
             baseline_ssid if (
@@ -1010,14 +1084,14 @@ def _join_runner(
             if not after_request or not isinstance(value, dict):
                 return
             observed = value.get("state")
-            if observed == "failed":
+            kind = wifi_state_class(observed)
+            if kind == "failed":
                 if not stale_failure:
                     activation_failed = True
-            elif observed == "activated":
+            elif kind == "connected":
                 stale_failure = False
-            elif observed in ("preparing", "configuring", "need-auth", "ip-config",
-                              "ip-check", "secondaries", "deactivating",
-                              "disconnected"):
+            elif kind == "connecting" or wifi_state_detail(observed) in (
+                    "deactivating", "disconnected"):
                 transitioned = True
                 stale_failure = False
 
@@ -1043,7 +1117,7 @@ def _join_runner(
                 status = None
             observe_state(status, after_request)
             if isinstance(status, dict):
-                phase = DEVICE_PHASES.get(str(status.get("state", "")))
+                phase = wifi_state_phase(status.get("state"))
                 if phase is not None:
                     await handle.update(phase=phase)
             # Verify the target before sampling its activation and IPv4.
@@ -1077,7 +1151,8 @@ def _join_runner(
                     observe_state(verified_status, True)
                     fresh = fresh or transitioned
                     activated = (isinstance(verified_status, dict)
-                                 and verified_status.get("state") == "activated")
+                                 and wifi_state_class(
+                                     verified_status.get("state")) == "connected")
                     if not isinstance(verified_status, dict):
                         if need_fresh:
                             if not profile_read:
