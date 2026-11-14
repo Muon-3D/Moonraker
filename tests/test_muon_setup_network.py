@@ -17,8 +17,10 @@ from moonraker.components.muon_setup import network
 from moonraker.utils.exceptions import ServerError
 
 from muon_setup_fakes import (
-    FakeAux, Harness, JoinScript, REGION_174, REGION_OPTIONS_174,
-    fresh_aux, run, state_with,
+    DEV_CONNECTED, DEV_CONNECTED_EXTERNALLY, DEV_DISCONNECTED, DEV_FAILED,
+    DEV_GETTING_IP, DEV_NEED_AUTH, DEV_PREPARE, FakeAux, Harness, JoinScript,
+    REGION_174, REGION_OPTIONS_174, aux_device_status, fresh_aux, run,
+    state_with,
 )
 
 PSK = "hunter2hunter2"  # never logged anywhere
@@ -127,7 +129,7 @@ class TestJoin:
         step stays pending for the owner to confirm (02 §5.6a)."""
         async def go():
             script = JoinScript(
-                device_states=["preparing", "ip-config", "activated"],
+                device_states=[DEV_PREPARE, DEV_GETTING_IP, DEV_CONNECTED],
                 uplink={"kind": "wifi", "ssid": SSID,
                         "addresses": ["192.168.1.37"], "internet": True})
             h = await Harness(stored=join_state(),
@@ -212,7 +214,7 @@ class TestJoin:
         """02 §8 test 5: 'restored' answers are failures; the code comes
         from `code`, never state_reason."""
         async def go():
-            script = JoinScript(device_states=["need-auth", "disconnected"],
+            script = JoinScript(device_states=[DEV_NEED_AUTH, DEV_DISCONNECTED],
                                 connect_result=result)
             h = await Harness(stored=join_state(),
                               aux=wifi_aux(script)).start()
@@ -242,7 +244,7 @@ class TestJoin:
         state_reason is never consulted."""
         async def go():
             script = JoinScript(
-                device_states=["disconnected"],
+                device_states=[DEV_DISCONNECTED],
                 connect_result=ServerError(text, 400))
             h = await Harness(stored=join_state(),
                               aux=wifi_aux(script)).start()
@@ -678,7 +680,7 @@ class TestDeferredCleanup:
     def test_join_timeout_defers_the_cleanup(self):
         async def go():
             gate = asyncio.Event()
-            script = JoinScript(device_states=["associating"],
+            script = JoinScript(device_states=[DEV_PREPARE],
                                 uplink=None)
             h = await Harness(
                 stored=join_state(),
@@ -901,7 +903,7 @@ class TestJoinRegionAndResetBoundaries:
                 # Complete the accepted connect between the loop's initial
                 # done check and its deadline check, without assigning DHCP.
                 await asyncio.sleep(0)
-                return {"state": "preparing"}
+                return aux_device_status(DEV_PREPARE)
             aux.routes[("GET", "/wifi/device/status")] = preparing
             await h.post("/network", join_body(rev=h.doc["rev"]))
             await joined(h)
@@ -947,7 +949,8 @@ class TestJoinRegionAndResetBoundaries:
                 if len(polls) >= 4:
                     script.current_ssid = SSID
                     machine.addresses = ["10.0.0.9"]
-                return {"state": "activated" if len(polls) >= 4 else "preparing"}
+                return aux_device_status(
+                    DEV_CONNECTED if len(polls) >= 4 else DEV_PREPARE)
             aux.routes[("GET", "/wifi/device/status")] = status
             await h.post("/network", join_body(rev=h.doc["rev"]))
             await joined(h)
@@ -1011,7 +1014,8 @@ class TestJoinRegionAndResetBoundaries:
                 if len(polls) >= 3:
                     machine.addresses = ["10.0.0.9"]
                     script.current_ssid = SSID
-                return {"state": "activated" if len(polls) >= 3 else "ip-config"}
+                return aux_device_status(
+                    DEV_CONNECTED if len(polls) >= 3 else DEV_GETTING_IP)
             aux.routes[("GET", "/wifi/device/status")] = status
             await h.post("/network", join_body())
             await joined(h)
@@ -1191,7 +1195,7 @@ class TestReviewConnectionSampling:
                 return {"ssid": SSID}
 
             aux.routes[("GET", "/wifi/current")] = current
-            aux.routes[("GET", "/wifi/device/status")] = {"state": "activated"}
+            aux.routes[("GET", "/wifi/device/status")] = aux_device_status(DEV_CONNECTED)
             await h.post("/network", join_body(rev=h.doc["rev"]))
             await joined(h)
             assert h.doc["steps"]["network"]["addresses"] == ["10.0.0.9"]
@@ -1570,16 +1574,17 @@ class TestReviewAttemptBoundaries:
             def status(_body):
                 reads.append(True)
                 if not script.connects:
-                    return {"state": "failed"}
+                    return aux_device_status(DEV_FAILED)
                 if len(reads) < 4:
-                    return {"state": "failed"}
+                    return aux_device_status(DEV_FAILED)
                 if len(reads) == 4:
-                    return {"state": "preparing"}
+                    return aux_device_status(DEV_PREPARE)
                 if len(reads) == 5:
                     gate.set()
-                    return {"state": "failed" if new_failure else "ip-config"}
+                    return aux_device_status(
+                        DEV_FAILED if new_failure else DEV_GETTING_IP)
                 script.current_ssid = SSID
-                return {"state": "activated"}
+                return aux_device_status(DEV_CONNECTED)
 
             async def connect(body):
                 script.connects.append(body)
@@ -1791,9 +1796,9 @@ class TestJoinKeepsTheWorkingConnection:
             return on_new(net)
 
         aux.routes[("POST", "/wifi/connect")] = connect
-        aux.routes[("GET", "/wifi/device/status")] = lambda _b: {
-            "device": "wlan0",
-            "state": "activated" if script.current_ssid else "disconnected"}
+        aux.routes[("GET", "/wifi/device/status")] = lambda _b: aux_device_status(
+            DEV_CONNECTED if script.current_ssid else DEV_DISCONNECTED,
+            script.current_ssid)
         aux.routes[("POST", "/wifi/disconnect")] = lambda b: (
             script.disconnects.append(b), net.set(None, None),
             {"status": "disconnected"})[-1]
@@ -1820,6 +1825,35 @@ class TestJoinKeepsTheWorkingConnection:
             assert step["addresses"] == [self.OLD_IP]
             assert aux.posted("/wifi/connect") == []
             assert script.disconnects == [] and script.forgets == []
+        run(go())
+
+    @pytest.mark.parametrize(
+        "device_state", [DEV_CONNECTED, DEV_CONNECTED_EXTERNALLY])
+    def test_a_same_ssid_join_with_another_psk_is_a_no_op_on_a_real_printer(
+            self, monkeypatch, device_state):
+        """KAN-2767 (C3 case 1). Aux's device status says "connected", never
+        "activated". A join to the SSID the printer is already on, with a
+        different psk, must touch nothing: no connect (it would overwrite the
+        saved key and drop the link), no profile change, no hotspot."""
+        async def go():
+            def never(_net):
+                raise AssertionError("no connect for an existing link")
+            h, script, aux, _ = await self.rig(
+                monkeypatch, saved=["Smith"], on_new=never, current="Smith")
+            aux.routes[("GET", "/wifi/device/status")] = (
+                lambda _b: aux_device_status(device_state, "Smith"))
+            await h.post("/network", join_body(
+                rev=h.doc["rev"], ssid="Smith", psk="not-the-saved-psk"))
+            await joined(h)
+            step = h.doc["steps"]["network"]
+            assert step["status"] == "done" and step["error"] is None
+            assert step["ssid"] == "Smith"
+            assert step["addresses"] == [self.OLD_IP]
+            assert aux.posted("/wifi/connect") == []
+            assert aux.posted("/wifi/ap/up") == []
+            assert [c for c in aux.calls if c[0] != "GET"] == []
+            assert script.connects == [] and script.disconnects == []
+            assert script.forgets == []
         run(go())
 
     def test_wrong_password_restores_the_previous_profile(self, monkeypatch):
