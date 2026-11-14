@@ -158,6 +158,30 @@ class FakeAux:
         return await self.get_identity()
 
 
+#: What Aux's GET /wifi/device/status answers: the nmcli library's `Device`
+#: (`nmcli device status`: device, device_type, state, connection) plus
+#: state_reason and user_disconnected. STATE is nmcli's device vocabulary, not
+#: NetworkManager's connection one: it says "connected", never "activated".
+DEV_CONNECTED = "connected"
+DEV_CONNECTED_EXTERNALLY = "connected (externally)"
+DEV_PREPARE = "connecting (prepare)"
+DEV_CONFIGURING = "connecting (configuring)"
+DEV_NEED_AUTH = "connecting (need authentication)"
+DEV_GETTING_IP = "connecting (getting IP configuration)"
+DEV_FAILED = "connection failed"
+DEV_DISCONNECTED = "disconnected"
+
+
+def aux_device_status(
+    state: str = DEV_CONNECTED, connection: Optional[str] = None,
+    state_reason: Optional[str] = None, user_disconnected: bool = False,
+) -> Dict[str, Any]:
+    """One Aux DeviceStatus body, shaped exactly like the Aux model."""
+    return {"device": "wlan0", "device_type": "wifi", "state": state,
+            "connection": connection, "state_reason": state_reason,
+            "user_disconnected": user_disconnected}
+
+
 class JoinScript:
     """Scripted Aux Wi-Fi behaviour for a join (tests only).
 
@@ -176,7 +200,7 @@ class JoinScript:
         uplink: Any = None,
         lands: bool = False,
     ) -> None:
-        self.device_states = list(device_states or ["activated"])
+        self.device_states = list(device_states or [DEV_CONNECTED])
         self.connect_result = (
             {"status": "connecting", "ssid": None} if connect_result is None
             else connect_result)
@@ -196,11 +220,9 @@ class JoinScript:
         def dev_status(body: Any) -> Dict[str, Any]:
             i = min(self.device_reads, len(self.device_states) - 1)
             self.device_reads += 1
-            if self.device_states[i] == "activated" and self.connects:
+            if self.device_states[i].startswith("connected") and self.connects:
                 self.current_ssid = self.connects[-1]["ssid"]
-            return {"device": "wlan0", "device_type": "wifi",
-                    "state": self.device_states[i], "connection": None,
-                    "user_disconnected": False}
+            return aux_device_status(self.device_states[i])
 
         def connect(body: Any) -> Any:
             self.connects.append(copy.deepcopy(body))
