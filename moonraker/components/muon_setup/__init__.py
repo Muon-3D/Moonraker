@@ -107,7 +107,15 @@ OpRunner = Callable[["OpHandle"], Awaitable[None]]
 
 
 class AuxUnavailable(Exception):
-    """Aux did not answer, or answered with a server error."""
+    """Aux did not answer, or answered with a server error. When the error
+    came with a body, `code` is its `detail.code` and `detail` the whole
+    object (KAN-3358: a failed join's 500 keeps the join's own code)."""
+
+    def __init__(self, message: str = "", code: Optional[str] = None,
+                 detail: Optional[Dict[str, Any]] = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.detail = detail
 
 
 class AuxMissing(Exception):
@@ -584,7 +592,11 @@ class MuonSetup:
             if status in (404, 405):
                 raise AuxMissing(path) from exc
             if status >= 500 or status in (401, 403):
-                raise AuxUnavailable(f"{method} {path}: {exc}") from exc
+                detail = getattr(exc, "aux_detail", None)
+                raise AuxUnavailable(
+                    f"{method} {path}: {exc}",
+                    getattr(exc, "aux_code", None),
+                    detail if isinstance(detail, dict) else None) from exc
             raise AuxRefused(
                 status, str(exc), getattr(exc, "aux_code", None)) from exc
 

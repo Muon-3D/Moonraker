@@ -108,6 +108,18 @@ def _aux_error_code(resp: Any) -> Optional[str]:
     return code if isinstance(code, str) and code else None
 
 
+def _aux_error_detail(resp: Any) -> Optional[dict]:
+    """The Aux API's `detail` when it is an object, else None. KAN-3358: a
+    failed Wi-Fi join's detail carries `restored` and `restore_detail` beside
+    the code, and the caller reads them from here."""
+    try:
+        payload = resp.json()
+    except Exception:
+        return None
+    detail = payload.get("detail") if isinstance(payload, dict) else None
+    return dict(detail) if isinstance(detail, dict) else None
+
+
 def _raise_for_aux_status(resp: Any) -> None:
     """raise_for_status with the Aux API's own message, and its `detail.code`
     attached to the ServerError as `aux_code`."""
@@ -115,6 +127,7 @@ def _raise_for_aux_status(resp: Any) -> None:
         resp.raise_for_status(_aux_error_message(resp))
     except Exception as exc:
         setattr(exc, "aux_code", _aux_error_code(resp))
+        setattr(exc, "aux_detail", _aux_error_detail(resp))
         raise
 
 

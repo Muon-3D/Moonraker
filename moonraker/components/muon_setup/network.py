@@ -1255,7 +1255,10 @@ def _connect_outcome(done: Tuple[Any, Any]) -> Tuple[str, str]:
             return _join_code(None, result), str(result.get("warning") or "")
         return _join_code(None, result), str(result)
     if isinstance(exc, AuxUnavailable):
-        return "timeout", str(exc)
+        # A failed join answers 500 with the join's own code (KAN-3358);
+        # keep it. No code: classify the text, nmcli's wrong-key words
+        # included, else the join timed out.
+        return _join_code(exc, None), str(exc)
     if isinstance(exc, AuxMissing):
         return "timeout", "this image has no Aux Wi-Fi connect"
     return _join_code(exc, None), str(exc)
@@ -1378,6 +1381,41 @@ async def _restore_previous(setup: MuonSetup, ssid: str) -> Tuple[bool, bool]:
     return False, await _raise_hotspot(setup)
 
 
+async def _hotspot_live(setup: MuonSetup) -> bool:
+    """Is ap0 up right now? Read from Aux's device status, as the setup
+    document's own hotspot flag is, not from what a request answered."""
+    from . import AuxMissing, AuxRefused, AuxUnavailable
+    try:
+        status = await setup.aux("GET", "/wifi/ap/device/status")
+    except (AuxMissing, AuxRefused, AuxUnavailable):
+        return False
+    state = str(status.get("state", "")) if isinstance(status, dict) else ""
+    return state.startswith("connected")
+
+
+def _aux_restore_report(
+    setup: MuonSetup
+) -> Tuple[Optional[bool], Optional[str]]:
+    """What Aux said about the restore in the failed join's answer, if it
+    said: (restored, restore_detail). Aux read `restored` from live state."""
+    connect = setup._join_connect
+    if connect is None or not connect.done() or connect.cancelled():
+        return None, None
+    try:
+        result, exc = connect.result()
+    except Exception:  # noqa: BLE001
+        return None, None
+    detail = getattr(exc, "detail", None)
+    if not isinstance(detail, dict) and isinstance(result, dict):
+        detail = result
+    if not isinstance(detail, dict):
+        return None, None
+    restored = detail.get("restored")
+    why = detail.get("restore_detail")
+    return (restored if isinstance(restored, bool) else None,
+            why if isinstance(why, str) and why else None)
+
+
 async def _raise_hotspot(setup: MuonSetup) -> bool:
     """POST /wifi/ap/up so the printer stays reachable. Never raises;
     returns whether the hotspot was brought up."""
@@ -1437,6 +1475,8 @@ async def _finish_fail(
     ssid: str, saved_before: bool, detail: str,
     previous: Optional[str] = None
 ) -> None:
+    # Read before the cleanup below: it clears `_join_connect` when done.
+    aux_report = _aux_restore_report(setup)
     cleanup = None
     if not saved_before:
         await remember_cleanup(setup, ssid)
@@ -1450,17 +1490,24 @@ async def _finish_fail(
         if cleanup is not None:
             await asyncio.shield(cleanup)
         outcome = await _restore_previous(setup, previous)
+        # The request's answer is not the state: read ap0 itself.
+        outcome = (outcome[0], await _hotspot_live(setup))
     else:
         # No working link before (first-run over the hotspot): never leave
         # both radios down.
-        outcome = (False, await _raise_hotspot(setup))
+        await _raise_hotspot(setup)
+        outcome = (False, await _hotspot_live(setup))
 
     def failed(doc: Dict[str, Any]) -> None:
         _join_fail(doc, code, phase, ssid, detail)
         if outcome is not None:
             info = doc["steps"]["network"]["error"]["detail"]
-            info["restored_previous"] = outcome[0]
+            aux_restored, aux_why = aux_report
+            info["restored_previous"] = (
+                aux_restored if aux_restored is not None else outcome[0])
             info["hotspot_up"] = outcome[1]
+            if aux_why is not None:
+                info["restore_detail"] = aux_why
     await handle.finish(failed)
     connect = setup._join_connect
     if connect is not None and connect.done():

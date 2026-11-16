@@ -1802,7 +1802,16 @@ class TestJoinKeepsTheWorkingConnection:
         aux.routes[("POST", "/wifi/disconnect")] = lambda b: (
             script.disconnects.append(b), net.set(None, None),
             {"status": "disconnected"})[-1]
-        aux.routes[("POST", "/wifi/ap/up")] = {"status": "up"}
+        # ap0 is down until POST /wifi/ap/up succeeds: its live state.
+        ap = {"up": False}
+
+        def ap_up(_b):
+            ap["up"] = True
+            return {"status": "up"}
+        aux.routes[("POST", "/wifi/ap/up")] = ap_up
+        aux.routes[("GET", "/wifi/ap/device/status")] = lambda _b: {
+            "device": "ap0", "device_type": "wifi", "connection": "ap0-con",
+            "state": "connected" if ap["up"] else "disconnected"}
         return h, script, aux, net
 
     @pytest.mark.parametrize("saved", [["Muon3D_Dev"], []])
@@ -2057,7 +2066,7 @@ class TestRestoreReportKAN3358:
             return {"status": "up"}
         aux.routes[("POST", "/wifi/ap/up")] = up
         aux.routes[("GET", "/wifi/ap/device/status")] = {
-            "state": "100 (connected)" if live_up else "30 (disconnected)"}
+            "state": "connected" if live_up else "disconnected"}
 
     def test_the_joins_own_code_beats_the_timeout_mapping(self, monkeypatch):
         async def go():
