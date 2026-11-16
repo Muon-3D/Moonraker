@@ -2027,3 +2027,145 @@ class TestWifiStateVocabulary:
         assert network.wifi_state_phase(DEV_CONNECTED_EXTERNALLY) == (
             "internet_check")
         assert network.wifi_state_phase(DEV_DISCONNECTED) is None
+
+
+WRONG_KEY_TEXT = ("Failed to connect to 'Smith': Connection activation "
+                  "failed: Secrets were required, but not provided.")
+
+
+def _aux_500(message, code=None, detail=None):
+    """What aux_api_proxy raises for an Aux 500 that has an HTTP response."""
+    exc = ServerError(message, 500)
+    exc.aux_code = code
+    exc.aux_detail = detail
+    return exc
+
+
+class TestRestoreReportKAN3358:
+    """Aux answers a failed join with a 500 whose detail keeps the join's own
+    code primary and adds `restored` / `restore_detail` (KAN-3358)."""
+
+    rig = staticmethod(TestJoinKeepsTheWorkingConnection.rig)
+    OLD = TestJoinKeepsTheWorkingConnection.OLD
+
+    @staticmethod
+    def ap(aux, *, live_up, up_raises=False):
+        """ap0's live state is `live_up`, whatever POST /wifi/ap/up said."""
+        def up(_b):
+            if up_raises:
+                raise ServerError("Aux is unavailable", 503)
+            return {"status": "up"}
+        aux.routes[("POST", "/wifi/ap/up")] = up
+        aux.routes[("GET", "/wifi/ap/device/status")] = {
+            "state": "100 (connected)" if live_up else "30 (disconnected)"}
+
+    def test_the_joins_own_code_beats_the_timeout_mapping(self, monkeypatch):
+        async def go():
+            def failed(net):
+                net.set(self.OLD, "192.168.1.7")
+                raise _aux_500(WRONG_KEY_TEXT, "wrong_password",
+                               {"code": "wrong_password", "restored": True})
+            h, script, aux, _ = await self.rig(
+                monkeypatch, saved=[self.OLD], on_new=failed)
+            await h.post("/network", join_body(rev=h.doc["rev"]))
+            await joined(h)
+            err = h.doc["steps"]["network"]["error"]
+            assert err["code"] == "wrong_password"
+        run(go())
+
+    def test_the_nmcli_exit_4_text_alone_is_a_wrong_password(
+            self, monkeypatch):
+        """No code in the detail: the text nmcli prints for exit 4 under
+        `--ask` still says wrong password, not timeout."""
+        async def go():
+            def failed(net):
+                raise _aux_500(WRONG_KEY_TEXT)
+            h, script, aux, _ = await self.rig(
+                monkeypatch, saved=[self.OLD], on_new=failed)
+            await h.post("/network", join_body(rev=h.doc["rev"]))
+            await joined(h)
+            err = h.doc["steps"]["network"]["error"]
+            assert err["code"] == "wrong_password"
+        run(go())
+
+    def test_hotspot_up_is_ap0s_live_state_not_the_request_result(
+            self, monkeypatch):
+        """POST /wifi/ap/up answers, ap0 is still down: not up."""
+        async def go():
+            def failed(net):
+                net.set(None, None)
+                raise _aux_500(WRONG_KEY_TEXT, "wrong_password")
+
+            def old_fails(_net):
+                raise ServerError("Aux is unavailable", 503)
+            h, script, aux, _ = await self.rig(
+                monkeypatch, saved=[self.OLD], on_new=failed, on_old=old_fails)
+            self.ap(aux, live_up=False)
+            await h.post("/network", join_body(rev=h.doc["rev"]))
+            await joined(h)
+            info = h.doc["steps"]["network"]["error"]["detail"]
+            assert info["hotspot_up"] is False
+        run(go())
+
+    def test_hotspot_up_when_ap0_is_live_though_the_request_failed(
+            self, monkeypatch):
+        async def go():
+            def failed(net):
+                net.set(None, None)
+                raise _aux_500(WRONG_KEY_TEXT, "wrong_password")
+
+            def old_fails(_net):
+                raise ServerError("Aux is unavailable", 503)
+            h, script, aux, _ = await self.rig(
+                monkeypatch, saved=[self.OLD], on_new=failed, on_old=old_fails)
+            self.ap(aux, live_up=True, up_raises=True)
+            await h.post("/network", join_body(rev=h.doc["rev"]))
+            await joined(h)
+            info = h.doc["steps"]["network"]["error"]["detail"]
+            assert info["hotspot_up"] is True
+        run(go())
+
+    def test_the_restore_fields_from_aux_are_reported(self, monkeypatch):
+        """Aux says the restore failed and why; Moonraker's own look at the
+        link cannot see it either. The report carries Aux's reason."""
+        async def go():
+            def failed(net):
+                net.set(None, None)
+                raise _aux_500(WRONG_KEY_TEXT, "wrong_password", {
+                    "code": "wrong_password", "restored": False,
+                    "restore_detail": "the previous network did not come back"})
+
+            def old_fails(_net):
+                raise ServerError("Aux is unavailable", 503)
+            h, script, aux, _ = await self.rig(
+                monkeypatch, saved=[self.OLD], on_new=failed, on_old=old_fails)
+            self.ap(aux, live_up=True)
+            await h.post("/network", join_body(rev=h.doc["rev"]))
+            await joined(h)
+            info = h.doc["steps"]["network"]["error"]["detail"]
+            assert info["restored_previous"] is False
+            assert info["restore_detail"] == (
+                "the previous network did not come back")
+        run(go())
+
+    def test_aux_saying_restored_wins_over_a_stale_local_read(
+            self, monkeypatch):
+        """Aux read the live state after the restore and says restored. The
+        local address read is late (no wlan0 IPv4 yet): trust Aux."""
+        async def go():
+            def failed(net):
+                net.set(None, None)
+                raise _aux_500(WRONG_KEY_TEXT, "wrong_password", {
+                    "code": "wrong_password", "restored": True})
+
+            def old_slow(net):
+                net.set(self.OLD, None)  # associated, address not read yet
+                return {"status": "connecting", "ssid": self.OLD}
+            h, script, aux, _ = await self.rig(
+                monkeypatch, saved=[self.OLD], on_new=failed, on_old=old_slow)
+            self.ap(aux, live_up=False)
+            await h.post("/network", join_body(rev=h.doc["rev"]))
+            await joined(h)
+            info = h.doc["steps"]["network"]["error"]["detail"]
+            assert info["restored_previous"] is True
+        run(go())
