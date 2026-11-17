@@ -320,6 +320,16 @@ class FileGuard:
               args: Mapping[str, Any], principal: policy.Principal) -> None:
         scope = self.scope()
         method = getattr(request_type, "name", None)
+        # MUON: removable media is shared read-only, never an account drive.
+        destinations = [args.get("dest")]
+        if method != "GET" and endpoint in (
+                "/server/files/directory", "/server/files/delete_file"):
+            destinations.append(args.get("path"))
+        if endpoint == "/server/files/move":
+            destinations.append(args.get("source"))
+        if any(isinstance(p, str) and p.strip('/').split('/')[0].lower() == 'usb'
+               for p in destinations):
+            raise self.error("The USB root is read-only.", 403)
         if endpoint in READ_BY_FILENAME:
             self._read(scope, relative(args.get("filename")), principal)
         elif endpoint == "/server/files/download":
@@ -493,6 +503,9 @@ class FileGuard:
                     form_args: Dict[str, Any]) -> Optional[Any]:
         root = str(form_args.get("root", "gcodes")).lower()
         form_args["root"] = root
+        # MUON: no upload may turn the removable root into a writable one.
+        if root == "usb":
+            raise self.error("The USB root is read-only.", 403)
         if root != "gcodes":
             return None
         try:

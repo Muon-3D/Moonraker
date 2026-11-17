@@ -514,6 +514,17 @@ class FileManager:
     ) -> bool:
         if isinstance(req_path, str):
             req_path = pathlib.Path(req_path)
+        # MUON: USB downloads/copies must not follow links, even read-only.
+        usb = self.server.lookup_component("muon_usb", None)
+        if usb is not None and usb.root in req_path.parents:
+            try:
+                if need_write:
+                    raise self.server.error("The USB root is read-only.", 403)
+                usb.resolve("usb/" + req_path.relative_to(usb.root).as_posix())
+            except self.server.error:
+                if raise_error:
+                    raise
+                return True
         req_path = req_path.expanduser().resolve()
         if ".git" in req_path.parts:
             if raise_error:
@@ -603,6 +614,11 @@ class FileManager:
                                        web_request: WebRequest
                                        ) -> List[Dict[str, Any]]:
         root = web_request.get_str('root', "gcodes")
+        # MUON: USB scans are bounded, metadata-free and off the event loop.
+        if root == "usb":
+            usb = self.server.lookup_component("muon_usb")
+            usb.ensure_root()
+            return await self.event_loop.run_in_thread(usb.file_list)
         flist = self.get_file_list(root, list_format=True)
         return cast(List[Dict[str, Any]], flist)
 
@@ -1291,6 +1307,11 @@ class FileManager:
                       root: str,
                       list_format: bool = False
                       ) -> Union[Dict[str, Any], List[Dict[str, Any]]]:
+        # MUON: never use the upstream followlinks walk for removable media.
+        if root == "usb":
+            usb = self.server.lookup_component("muon_usb")
+            usb.ensure_root()
+            return usb.file_list(list_format)
         # Use os.walk find files in sd path and subdirs
         filelist: Dict[str, Any] = {}
         path = self.file_paths.get(root, None)

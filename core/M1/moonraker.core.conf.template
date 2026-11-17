@@ -256,6 +256,9 @@ admin_address: 127.0.0.1:7131
 # section the level cannot be raised at all, and the printer is Open for good.
 [muon_protection]
 
+# MUON: read-only USB browsing and copy-then-print.
+[muon_usb]
+
 # KAN-162: start the bed ramp when a job is queued instead of at the top
 # of PRINT_START.  This turns on the 170W bed heater with no human input,
 # so the component itself defaults to disabled -- enabling it is an

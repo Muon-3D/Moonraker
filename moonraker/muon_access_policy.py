@@ -562,6 +562,7 @@ READ = ACTIONS["read"]
 #: Writes, by registered endpoint, matched on a path-segment boundary. The
 #: first match wins, so a longer prefix comes before a shorter one.
 WRITE_ACTIONS: Tuple[Tuple[str, str], ...] = (
+    ("/server/muon/usb/print", "print"),
     ("/server/muon/setup", "setup"),
     ("/server/muon/link", "owner"),
     ("/server/muon/protection", "protection"),
