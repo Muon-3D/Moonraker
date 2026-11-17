@@ -78,7 +78,7 @@ RELAXED = dict(
     STANDARD, print="signed_out_guest", files="signed_out_guest",
     motion="signed_out_guest", heat="signed_out_guest",
     files_others="member", console="member",
-    wifi="signed_out_guest", rename="signed_in_guest",
+    wifi="signed_out_guest", rename="signed_out_guest",
 )
 STRICT = dict(
     STANDARD, read="signed_in_guest", print="member", files="member",
@@ -206,7 +206,8 @@ class TestTheTableIsTheDesign:
         # ACC-24, plus emergency stop's "never above this"
         fixed = {n for n, a in policy.ACTIONS.items() if a.fixed}
         assert fixed == {"emergency_stop", "protection", "owner", "dev_mode",
-                         "setup", "access_api", "access_request"}
+                         "setup", "access_api", "access_request",
+                         "dev_mode_request"}
 
     def test_each_sample_is_classified_as_its_row(self):
         for row, (endpoint, rtype, args) in SAMPLES.items():
@@ -600,8 +601,9 @@ class TestTheUnknownOwnerWindow:
         for row in ("read", "emergency_stop", "print", "files", "motion",
                     "wifi"):
             assert refused(row, LAN, TRUSTED_USER) is None, row
-        # an account owner would need a signed-in guest to rename
-        assert refused("rename", LAN, TRUSTED_USER) is not None
+        # KAN-3603: Relaxed lets anyone at home rename (it needed a signed-in
+        # guest before Jack's 17 Nov rule for an Open printer)
+        assert refused("rename", LAN, TRUSTED_USER) is None
         trusted = gateway("admin", "operator")
         for row in ("protection", "hotspot", "updates", "console", "config",
                     "files_others"):
