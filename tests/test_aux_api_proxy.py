@@ -309,6 +309,7 @@ def test_an_empty_spec_still_registers_only_the_openapi_route():
     # what stops it becoming a way to *change* the mode.
     assert server.paths() == [
         "/server/muon/dev_mode",
+        "/server/muon/dev_mode/request",
         "/server/muon/identity",
         "/server/muon/identity/name",
         "/server/aux/openapi.json",
@@ -334,6 +335,7 @@ def test_the_muon_endpoints_exist_before_any_spec():
 
     assert server.paths() == [
         "/server/muon/dev_mode",
+        "/server/muon/dev_mode/request",
         "/server/muon/identity",
         "/server/muon/identity/name",
     ]

@@ -35,6 +35,12 @@ HTTP_VERBS = {"get": "GET", "post": "POST", "put": "PUT",
 
 _PATH_PARAM_RE = re.compile(r"\{[^}]+\}")
 
+# KAN-3604: Aux routes that only Moonraker's own handlers may call, through
+# the internal helper. They are never mirrored under /server/aux. The `dev_mode`
+# access row is delegated to Aux, so a mirror of /dev_mode/request would let any
+# admitted client skip the owner rule that guards /server/muon/dev_mode/request.
+INTERNAL_ONLY_AUX_PATHS = frozenset({"/dev_mode/request"})
+
 
 def _path_pattern(fast_path: str) -> "re.Pattern[str]":
     """Turn an OpenAPI path into an anchored matcher for the proxy.
@@ -263,6 +269,18 @@ class AuxAutoProxy:
             ["GET"],
             self._dev_mode_status_handler
         )
+        # KAN-3604 (Jack, 17 Nov): Control asks for developer mode on or off.
+        # POST only, and only ever to Aux's /dev_mode/request through the
+        # internal helper below -- never a pass-through of /server/aux, which
+        # stays the panel's under the `dev_mode` row. Who may ask is decided
+        # centrally (muon_access_policy's `dev_mode_request` row: anyone on an
+        # open printer with no owner, the owning account on a linked one, the
+        # Protected entry respected). Off the floor like the GET above.
+        self.server.register_endpoint(
+            "/server/muon/dev_mode/request",
+            ["POST"],
+            self._dev_mode_request_handler
+        )
 
         # MUON, ID-2/ID-3/ID-4: this printer's name.
         #
@@ -329,6 +347,9 @@ class AuxAutoProxy:
                 self._proxy_allowed.append(
                     (_path_pattern(fast_path), param_verbs)
                 )
+                continue
+
+            if fast_path in INTERNAL_ONLY_AUX_PATHS:
                 continue
 
             verbs = [HTTP_VERBS[k] for k in path_item if k in HTTP_VERBS]
@@ -610,6 +631,28 @@ class AuxAutoProxy:
         # banner, not the path. The panel reads the full state over loopback.
         return {"enabled": bool(state.get("enabled", False))}
 
+
+    async def _dev_mode_request_handler(self, webreq):
+        enabled = webreq.get_args().get("enabled")
+        if not isinstance(enabled, bool):
+            raise self.server.error("'enabled' must be true or false", 400)
+        try:
+            result = await self.post("/dev_mode/request", {"enabled": enabled})
+        except ServerError as exc:
+            if getattr(exc, "aux_code", None) == "panel_only":
+                # Control shows the code as it is.
+                raise self.server.error("panel_only", 403) from exc
+            if _not_answering(exc):
+                raise self.server.error(
+                    "The Aux API is not answering yet (/dev_mode/request)", 503
+                ) from exc
+            raise
+        if not isinstance(result, dict):
+            raise self.server.error(
+                "Aux returned an unreadable dev_mode answer", 502)
+        if result.get("challenge_id"):
+            return {"challenge_id": result["challenge_id"]}
+        return {"enabled": bool(result.get("enabled", False))}
 
     # ===== Internal aux-api helpers for other Moonraker components =====
     async def get(self, path: str) -> Any:

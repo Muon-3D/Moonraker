@@ -206,7 +206,8 @@ class TestTheTableIsTheDesign:
         # ACC-24, plus emergency stop's "never above this"
         fixed = {n for n, a in policy.ACTIONS.items() if a.fixed}
         assert fixed == {"emergency_stop", "protection", "owner", "dev_mode",
-                         "setup", "access_api", "access_request"}
+                         "setup", "access_api", "access_request",
+                         "dev_mode_request"}
 
     def test_each_sample_is_classified_as_its_row(self):
         for row, (endpoint, rtype, args) in SAMPLES.items():

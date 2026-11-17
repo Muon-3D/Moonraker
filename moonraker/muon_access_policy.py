@@ -207,6 +207,11 @@ _ROWS = (
     # Developer mode: dev_mode_consent in the Aux API asks the hardware
     # (KAN-371), which is how this row's "panel" is met.
     _A("dev_mode", PANEL, PANEL, PANEL, fixed=True, delegated=True),
+    # KAN-3604 (Jack, 17 Nov): asking Control to turn developer mode on or off.
+    # Open printer with no owner: anyone admitted. Linked: the owning account
+    # (the admin level) under every preset, fixed so no override can open it.
+    # The first warranty release still needs the panel; Aux asks for that.
+    _A("dev_mode_request", ADMIN, ADMIN, ADMIN, fixed=True),
     # First-run setup: muon_setup decides its own callers (02 section 3).
     _A("setup", SIGNED_OUT_GUEST, SIGNED_OUT_GUEST, SIGNED_OUT_GUEST,
        fixed=True, delegated=True),
@@ -562,6 +567,7 @@ WRITE_ACTIONS: Tuple[Tuple[str, str], ...] = (
     # answer, and anything new under the prefix: the protection row
     ("/server/muon/access", "protection"),
     ("/server/muon/identity/name", "rename"),
+    ("/server/muon/dev_mode/request", "dev_mode_request"),
     ("/server/aux/dev_mode", "dev_mode"),
     ("/server/aux/wifi/ap", "hotspot"),
     ("/server/aux/wifi", "wifi"),
