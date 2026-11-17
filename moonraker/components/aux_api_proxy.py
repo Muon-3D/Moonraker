@@ -41,6 +41,10 @@ _PATH_PARAM_RE = re.compile(r"\{[^}]+\}")
 # admitted client skip the owner rule that guards /server/muon/dev_mode/request.
 INTERNAL_ONLY_AUX_PATHS = frozenset({"/dev_mode/request"})
 
+# KAN-3603: the Aux API's own ZONE_NAME (time_routes.py), copied. Aux still
+# checks that tzdata carries the zone; this keeps junk from being forwarded.
+ZONE_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_+-]*(/[A-Za-z0-9_+-]+){0,2}$")
+
 
 def _path_pattern(fast_path: str) -> "re.Pattern[str]":
     """Turn an OpenAPI path into an anchored matcher for the proxy.
@@ -280,6 +284,17 @@ class AuxAutoProxy:
             "/server/muon/dev_mode/request",
             ["POST"],
             self._dev_mode_request_handler
+        )
+
+        # KAN-3603 (Jack, 17 Nov): the time zone from Control after set-up.
+        # GET reads Aux's /time, POST sets it through Aux's /time/zone (the
+        # existing timedatectl set-timezone path; sudoers is not widened).
+        # Who may do either is muon_access_policy's `timezone` row, the same
+        # for both. Never a pass-through of /server/aux.
+        self.server.register_endpoint(
+            "/server/muon/timezone",
+            ["GET", "POST"],
+            self._timezone_handler
         )
 
         # MUON, ID-2/ID-3/ID-4: this printer's name.
@@ -653,6 +668,34 @@ class AuxAutoProxy:
         if result.get("challenge_id"):
             return {"challenge_id": result["challenge_id"]}
         return {"enabled": bool(result.get("enabled", False))}
+
+    async def _timezone_handler(self, webreq):
+        if webreq.get_action() == "GET":
+            state = await self._get_or_unavailable("/time")
+            if not isinstance(state, dict) or not isinstance(
+                    state.get("tz"), str):
+                raise self.server.error(
+                    "Aux returned an unreadable time state", 502)
+            return {"zone": state["tz"]}
+        zone = webreq.get_args().get("zone")
+        if (not isinstance(zone, str) or not ZONE_NAME.match(zone)
+                or ".." in zone):
+            raise self.server.error("'zone' must be an IANA zone name", 400)
+        try:
+            state = await self.post("/time/zone", {"tz": zone})
+        except ServerError as exc:
+            if getattr(exc, "aux_code", None) == "invalid_timezone":
+                raise self.server.error(
+                    f"{zone!r} is not a time zone this printer knows", 400
+                ) from exc
+            if _not_answering(exc):
+                raise self.server.error(
+                    "The Aux API is not answering yet (/time/zone)", 503
+                ) from exc
+            raise
+        if not isinstance(state, dict) or not isinstance(state.get("tz"), str):
+            raise self.server.error("Aux returned an unreadable time state", 502)
+        return {"zone": state["tz"]}
 
     # ===== Internal aux-api helpers for other Moonraker components =====
     async def get(self, path: str) -> Any:

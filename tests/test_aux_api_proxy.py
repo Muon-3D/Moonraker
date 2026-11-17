@@ -310,6 +310,7 @@ def test_an_empty_spec_still_registers_only_the_openapi_route():
     assert server.paths() == [
         "/server/muon/dev_mode",
         "/server/muon/dev_mode/request",
+        "/server/muon/timezone",
         "/server/muon/identity",
         "/server/muon/identity/name",
         "/server/aux/openapi.json",
@@ -336,6 +337,7 @@ def test_the_muon_endpoints_exist_before_any_spec():
     assert server.paths() == [
         "/server/muon/dev_mode",
         "/server/muon/dev_mode/request",
+        "/server/muon/timezone",
         "/server/muon/identity",
         "/server/muon/identity/name",
     ]

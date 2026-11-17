@@ -196,7 +196,10 @@ _ROWS = (
     # Install updates
     _A("updates", ADMIN, ADMIN, ADMIN, home_only=True, admin_from_away=True),
     # Rename the printer
-    _A("rename", SIGNED_IN_GUEST, ADMIN, ADMIN),
+    # KAN-3603 (Jack, 17 Nov): Relaxed, which is what an Open printer uses, lets
+    # anyone at home and any relay client rename it, as Control needs. It was a
+    # signed-in guest, which refused a guest on an Open printer with an owner.
+    _A("rename", SIGNED_OUT_GUEST, ADMIN, ADMIN),
     # printer.cfg (config root)
     _A("config", ADMIN, ADMIN, ADMIN, home_only=True),
     # Protection: entry, ways in, people, levels, data, private uploads
@@ -212,6 +215,11 @@ _ROWS = (
     # (the admin level) under every preset, fixed so no override can open it.
     # The first warranty release still needs the panel; Aux asks for that.
     _A("dev_mode_request", ADMIN, ADMIN, ADMIN, fixed=True),
+    # KAN-3603 (Jack, 17 Nov): the time zone after set-up, GET and POST alike.
+    # An open printer (Relaxed, or no owner) lets any client; Protected, or a
+    # linked printer under Standard or Strict, the owner. Overridable like any
+    # general setting.
+    _A("timezone", SIGNED_OUT_GUEST, ADMIN, ADMIN),
     # First-run setup: muon_setup decides its own callers (02 section 3).
     _A("setup", SIGNED_OUT_GUEST, SIGNED_OUT_GUEST, SIGNED_OUT_GUEST,
        fixed=True, delegated=True),
@@ -751,6 +759,10 @@ def classify(
         # over Iroh, away from the printer, is the case it exists for.
         # Listing stays a read; muon-link shows the names too.
         return (ACTIONS["system"],)
+    if endpoint == "/server/muon/timezone":
+        # KAN-3603: the read follows the write's rule (Control hides the row
+        # on a 404, shows the reason on a 403).
+        return (ACTIONS["timezone"],)
     if method == "GET":
         return (READ,)
     if endpoint == "/api/printer/command":
