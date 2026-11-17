@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import json
 import os
 import re
@@ -23,6 +24,10 @@ if TYPE_CHECKING:
 MAX_DEPTH = 4
 READ_BYTES = 65536
 REMOVED = "The USB stick was removed while copying. Nothing was printed."
+NO_SPACE = "Not enough space on the printer"
+HEADROOM = 256 * 1024 * 1024
+MAX_FOLDER_ENTRIES = 2000
+MAX_TOTAL_FILES = 10000
 
 
 class MuonUSB:
@@ -31,12 +36,33 @@ class MuonUSB:
         self.root = Path(self.server.get_app_args()['data_path']) / 'usb'
         self.rejected = Path(config.get('rejected_path', '/run/muon-usb/rejected'))
         self._print_lock = asyncio.Lock()
+        self.cleanup_temporaries()
         self.ensure_root()
         for name in ('status', 'list', 'metadata', 'print'):
             self.server.register_endpoint(
                 '/server/muon/usb/' + name,
                 RequestType.POST if name == 'print' else RequestType.GET,
                 getattr(self, '_handle_' + name))
+
+    def cleanup_temporaries(self) -> None:
+        # A crash or power loss mid-copy leaves .usb-* files behind.
+        fm = self.server.lookup_component('file_manager')
+        gcodes = fm.get_directory('gcodes') if fm else ''
+        if not gcodes:
+            return
+        directory = Path(gcodes) / 'usb-import'
+        if directory.is_symlink() or not directory.is_dir():
+            return
+        with contextlib.suppress(OSError):
+            for entry in os.scandir(directory):
+                if entry.name.startswith('.usb-') and not entry.is_dir(
+                        follow_symlinks=False):
+                    with contextlib.suppress(OSError):
+                        os.unlink(entry.path)
+
+    def is_stick(self, name: str) -> bool:
+        # Only a real mountpoint is a stick; a leftover directory is not.
+        return os.path.ismount(self.root / name)
 
     def ensure_root(self) -> None:
         fm = self.server.lookup_component('file_manager')
@@ -65,6 +91,8 @@ class MuonUSB:
             target = target / part
             if target.is_symlink():
                 raise ServerError('USB symlinks are not allowed.', 403)
+        if parts and not self.is_stick(parts[0]):
+            raise ServerError('The USB stick or path is no longer available.', 404)
         if not target.exists():
             raise ServerError('The USB stick or path is no longer available.', 404)
         # Check actual directory depth too (directory names may contain dots).
@@ -101,10 +129,17 @@ class MuonUSB:
             raise ServerError('The USB directory is no longer available.', 404)
         dirs: List[Dict[str, Any]] = []
         files: List[Dict[str, Any]] = []
+        at_root = path == 'usb'
+        truncated = False
         try:
             with os.scandir(target) as entries:
                 for entry in entries:
+                    if len(dirs) + len(files) >= MAX_FOLDER_ENTRIES:
+                        truncated = True
+                        break
                     if entry.name.startswith('.') or entry.is_symlink():
+                        continue
+                    if at_root and not self.is_stick(entry.name):
                         continue
                     try:
                         info = entry.stat(follow_symlinks=False)
@@ -122,7 +157,7 @@ class MuonUSB:
             raise ServerError('The USB directory is no longer available.', 404)
         for group in (dirs, files):
             group.sort(key=lambda item: (-item['modified'], item['name']))
-        return {'path': path, 'dirs': dirs, 'files': files}
+        return {'path': path, 'dirs': dirs, 'files': files, 'truncated': truncated}
 
     def file_list(self, list_format: bool = True) -> Any:
         result: Dict[str, Any] = {}
@@ -131,6 +166,9 @@ class MuonUSB:
             listing = self.listing(pending.pop())
             pending.extend(item['path'] for item in listing['dirs'])
             for item in listing['files']:
+                if len(result) >= MAX_TOTAL_FILES:
+                    pending.clear()
+                    break
                 result[item['path'][4:]] = {
                     'size': item['size'], 'modified': item['modified'],
                     'permissions': 'r'}
@@ -145,7 +183,7 @@ class MuonUSB:
                 sticks = [{'name': p.name, 'path': 'usb/' + p.name}
                           for p in self.root.iterdir()
                           if not p.name.startswith('.') and not p.is_symlink()
-                          and p.is_dir()]
+                          and p.is_dir() and self.is_stick(p.name)]
             except OSError:
                 pass
         rejected = []
@@ -209,11 +247,15 @@ class MuonUSB:
         try:
             with self.open_gcode(path) as source:
                 before = os.fstat(source.fileno())
+                free = shutil.disk_usage(destination).free
+                if free < before.st_size + HEADROOM:
+                    raise ServerError(NO_SPACE, 507)
                 fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
                              0o644, dir_fd=directory)
                 with os.fdopen(fd, 'wb') as output:
                     shutil.copyfileobj(source, output)
                     output.flush()
+                    os.fsync(output.fileno())
                     if output.tell() != before.st_size:
                         raise OSError('Incomplete USB read')
                 after = self.resolve(path).stat()
@@ -222,7 +264,15 @@ class MuonUSB:
                     raise OSError('USB source changed')
                 os.replace(temporary, filename, src_dir_fd=directory,
                            dst_dir_fd=directory)
-        except (OSError, ServerError):
+                with contextlib.suppress(OSError):
+                    os.fsync(directory)
+        except ServerError as err:
+            if err.status_code == 507:
+                raise
+            raise ServerError(REMOVED, 404)
+        except OSError as err:
+            if err.errno == errno.ENOSPC:
+                raise ServerError(NO_SPACE, 507)
             raise ServerError(REMOVED, 404)
         finally:
             with contextlib.suppress(FileNotFoundError):

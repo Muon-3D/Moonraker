@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import configparser
 import contextlib
+import errno
 import json
+import os
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -79,9 +81,14 @@ class Config:
 
 
 @pytest.fixture
-def usb(tmp_path: Path) -> Any:
+def usb(tmp_path: Path, monkeypatch: Any) -> Any:
     server = Server(tmp_path)
     component = muon_usb.load_component(Config(server))  # type: ignore[arg-type]
+    # tmp directories are not mountpoints: treat <root>/<name> as a mounted stick
+    real_ismount = os.path.ismount
+    monkeypatch.setattr(
+        os.path, 'ismount',
+        lambda p: Path(p).parent == component.root or real_ismount(p))
     server.components['muon_usb'] = component
     return component
 
@@ -141,14 +148,46 @@ def test_huge_directory_both_endpoints_stat_only(usb: Any, monkeypatch: Any) -> 
     monkeypatch.setattr(usb, 'open_gcode', no_read)
     start = time.monotonic()
     listing = asyncio.run(usb._handle_list(request('usb/Demo')))
-    assert len(listing['files']) == 5000
+    assert len(listing['files']) == muon_usb.MAX_FOLDER_ENTRIES
+    assert listing['truncated'] is True
     assert time.monotonic() - start < 2
     fm = SimpleNamespace(server=usb.server, event_loop=EventLoop())
     start = time.monotonic()
     files = asyncio.run(FileManager._handle_filelist_request(
         fm, WebRequest('/server/files/list', {'root': 'usb'})))
-    assert len(files) == 5000
+    assert len(files) == muon_usb.MAX_FOLDER_ENTRIES
     assert time.monotonic() - start < 2
+
+
+def test_total_file_cap(usb: Any, monkeypatch: Any) -> None:
+    monkeypatch.setattr(muon_usb, 'MAX_TOTAL_FILES', 5)
+    for folder in ('A', 'B'):
+        for index in range(4):
+            gcode(usb, f'{folder}/{index}.gcode')
+    assert len(usb.file_list()) == 5
+    assert usb.listing('usb/A')['truncated'] is False
+
+
+def test_only_mountpoints_are_sticks(usb: Any, monkeypatch: Any) -> None:
+    gcode(usb, 'Real/part.gcode')
+    gcode(usb, 'Ghost/part.gcode')
+    monkeypatch.setattr(usb, 'is_stick', lambda name: name == 'Real')
+    assert [s['name'] for s in usb.status()['sticks']] == ['Real']
+    assert [d['name'] for d in usb.listing('usb')['dirs']] == ['Real']
+    with pytest.raises(ServerError) as err:
+        usb.listing('usb/Ghost')
+    assert err.value.status_code == 404
+    assert set(usb.file_list(False)) == {'Real/part.gcode'}
+
+
+def test_startup_cleans_temporaries(tmp_path: Path) -> None:
+    server = Server(tmp_path)
+    imports = tmp_path / 'gcodes/usb-import'
+    imports.mkdir()
+    (imports / '.usb-deadbeef').write_text('partial')
+    (imports / 'keep.gcode').write_text('G1\n')
+    muon_usb.load_component(Config(server))  # type: ignore[arg-type]
+    assert [p.name for p in imports.iterdir()] == ['keep.gcode']
 
 
 def test_hidden_files_extensions_sort_and_depth(usb: Any) -> None:
@@ -339,3 +378,50 @@ def test_access_usb_shared_readonly() -> None:
             guard.check(endpoint, RequestType.POST, args, who)
     with pytest.raises(ServerError, match='read-only'):
         guard.plan_upload(who, {'root': 'usb'})
+
+
+def test_not_enough_space_refuses_before_copy(usb: Any, monkeypatch: Any) -> None:
+    gcode(usb, data='G1 X1\n' * 100)
+    size = (usb.root / 'Demo/part.gcode').stat().st_size
+    monkeypatch.setattr(
+        muon_usb.shutil, 'disk_usage',
+        lambda p: SimpleNamespace(total=0, used=0, free=size + muon_usb.HEADROOM - 1))
+    with pytest.raises(ServerError, match='Not enough space on the printer') as err:
+        asyncio.run(usb._handle_print(request('usb/Demo/part.gcode')))
+    assert err.value.status_code == 507
+    assert not list((usb.server.data / 'gcodes/usb-import').iterdir())
+    usb.server.components['klippy_apis'].start_print.assert_not_called()
+
+
+def test_enough_space_copies(usb: Any, monkeypatch: Any) -> None:
+    gcode(usb)
+    size = (usb.root / 'Demo/part.gcode').stat().st_size
+    monkeypatch.setattr(
+        muon_usb.shutil, 'disk_usage',
+        lambda p: SimpleNamespace(total=0, used=0, free=size + muon_usb.HEADROOM))
+    assert asyncio.run(usb._handle_print(request('usb/Demo/part.gcode'))) == {
+        'filename': 'usb-import/part.gcode'}
+
+
+def test_enospc_during_copy_is_not_stick_removed(usb: Any, monkeypatch: Any) -> None:
+    gcode(usb)
+    def full(src: Any, dst: Any) -> None:
+        dst.write(b'partial')
+        raise OSError(errno.ENOSPC, 'No space left on device')
+    monkeypatch.setattr(muon_usb.shutil, 'copyfileobj', full)
+    with pytest.raises(ServerError) as err:
+        asyncio.run(usb._handle_print(request('usb/Demo/part.gcode')))
+    assert err.value.status_code == 507
+    assert err.value.args[0] == muon_usb.NO_SPACE
+    assert not list((usb.server.data / 'gcodes/usb-import').iterdir())
+
+
+def test_copy_fsyncs_before_rename(usb: Any, monkeypatch: Any) -> None:
+    gcode(usb)
+    calls = []
+    real_fsync, real_replace = os.fsync, os.replace
+    monkeypatch.setattr(os, 'fsync', lambda fd: (calls.append('fsync'), real_fsync(fd))[1])
+    monkeypatch.setattr(
+        os, 'replace', lambda *a, **k: (calls.append('replace'), real_replace(*a, **k))[1])
+    asyncio.run(usb._handle_print(request('usb/Demo/part.gcode')))
+    assert calls.index('fsync') < calls.index('replace')

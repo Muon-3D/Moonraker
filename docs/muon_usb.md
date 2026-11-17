@@ -25,13 +25,18 @@ omitted. Not following any symlinks also makes traversal cycle-safe.
   these three string fields; Moonraker does not expose device nodes or UUIDs.
 * `GET /server/muon/usb/list?path=usb/Demo`
   ```json
-  {"path":"usb/Demo","dirs":[{"name":"Parts","path":"usb/Demo/Parts","modified":1700000000.0}],"files":[{"name":"part.gcode","path":"usb/Demo/part.gcode","size":1234,"modified":1700000001.0}]}
+  {"path":"usb/Demo","dirs":[{"name":"Parts","path":"usb/Demo/Parts","modified":1700000000.0}],"files":[{"name":"part.gcode","path":"usb/Demo/part.gcode","size":1234,"modified":1700000001.0}],"truncated":false}
   ```
   Files use `file_manager.VALID_GCODE_EXTS`, case-insensitively. Files and
   directories are independently sorted newest first, then by name. Four
   directory levels **below usb** are permitted: `usb/Demo/a/b/c/file.gcode`
   is valid; `usb/Demo/a/b/c/d/file.gcode` is not. At the deepest directory no
   deeper directories are advertised.
+  A folder lists at most 2000 entries (`truncated` is true when more exist);
+  the flat `/server/files/list` stops at 10000 files. Only real mountpoints
+  count as sticks. Printing needs free space of file size plus 256 MB on the
+  printer, otherwise HTTP 507 "Not enough space on the printer". Leftover
+  `.usb-*` temporary copies are removed at startup.
 * `GET /server/files/list?root=usb` returns the standard flat file list:
   ```json
   [{"path":"Demo/part.gcode","size":1234,"modified":1700000001.0,"permissions":"r"}]
