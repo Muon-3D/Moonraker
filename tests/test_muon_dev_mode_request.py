@@ -70,8 +70,17 @@ class TestWhoMayAsk:
         printer(PROTECTED, LINKED)
         assert ask(LOOPBACK, TRUSTED_USER) is None
 
-    def test_a_linked_printer_lets_the_owning_account_only(self):
+    def test_an_open_linked_printer_lets_anyone_admitted(self):
+        """D-166: Open is open, owner or not."""
         printer(OPEN, LINKED)
+        assert ask(LAN, None) is None
+        assert ask(LAN, PASSWORD_USER) is None
+        assert ask(SENTINEL, gateway("signed_out_guest", "operator")) is None
+        assert ask(SENTINEL, gateway("member", "operator")) is None
+        assert ask(SENTINEL, gateway("admin", "operator")) is None
+
+    def test_a_protected_linked_printer_lets_the_owning_account_only(self):
+        printer(PROTECTED, LINKED)
         assert ask(SENTINEL, gateway("admin", "operator")) is None
         # a stranger at home, a guest, a member, and the printer password
         assert "dev_mode_request" in ask(LAN, None)
@@ -97,18 +106,21 @@ class TestWhoMayAsk:
         assert ask(SENTINEL, gateway("admin", "operator")) is None
         assert ask(LAN, PASSWORD_USER) is not None
 
-    @pytest.mark.parametrize("preset", ["relaxed", "standard", "strict"])
-    def test_no_preset_opens_a_linked_printer(self, preset):
+    def test_the_relaxed_preset_opens_a_linked_printer(self):
+        printer(OPEN, LINKED, preset="relaxed")
+        assert ask(LAN, None) is None
+
+    @pytest.mark.parametrize("preset", ["standard", "strict"])
+    def test_a_stricter_preset_holds_a_linked_printer_to_its_owner(self, preset):
         printer(OPEN, LINKED, preset=preset)
         assert ask(LAN, None) is not None
         assert ask(SENTINEL, gateway("member", "operator")) is not None
         assert ask(SENTINEL, gateway("admin", "operator")) is None
 
-    def test_an_override_cannot_open_it(self):
-        # the row is fixed: a stored override of it is ignored
-        printer(OPEN, LINKED,
-                overrides={"dev_mode_request": policy.SIGNED_OUT_GUEST})
+    def test_an_override_can_hold_an_open_printer_to_its_owner(self):
+        printer(OPEN, LINKED, overrides={"dev_mode_request": policy.ADMIN})
         assert ask(LAN, None) is not None
+        assert ask(SENTINEL, gateway("admin", "operator")) is None
 
     def test_a_phone_still_in_bluetooth_setup_is_refused(self):
         printer(OPEN, NOBODY)
@@ -116,8 +128,8 @@ class TestWhoMayAsk:
         with pytest.raises(ServerError):
             muon_floor.check_bluetooth(ENDPOINT, HTTP, BLUETOOTH, user)
 
-    def test_an_unknown_owner_is_panel_only_not_open(self):
-        printer(OPEN, policy.OWNER_UNKNOWN)
+    def test_an_unknown_owner_on_a_protected_printer_admits_no_stranger(self):
+        printer(PROTECTED, policy.OWNER_UNKNOWN)
         assert ask(LAN, None) is not None
 
 
@@ -282,14 +294,17 @@ class TestGetWhoMayAsk:
         }
 
     def test_a_stranger_is_told_who_may_instead_of_being_refused(self):
-        printer(OPEN, LINKED)
+        printer(PROTECTED, LINKED)
         out = self.ask_as(LAN, None)
         assert out["as_owner"] is False
         assert out["may_ask"] is False
         assert out["owner"] == {"linked": True, "account": "o***@example.com"}
 
-    def test_a_member_is_not_the_owner(self):
+    def test_a_member_is_not_the_owner_but_may_ask_while_open(self):
         printer(OPEN, LINKED)
+        out = self.ask_as(SENTINEL, gateway("member", "operator"))
+        assert (out["as_owner"], out["may_ask"]) == (False, True)
+        printer(PROTECTED, LINKED)
         out = self.ask_as(SENTINEL, gateway("member", "operator"))
         assert (out["as_owner"], out["may_ask"]) == (False, False)
 
@@ -310,7 +325,7 @@ class TestGetWhoMayAsk:
         assert (out["as_owner"], out["may_ask"]) == (False, False)
 
     def test_an_owner_not_yet_known_is_null_not_false(self):
-        printer(OPEN, policy.OWNER_UNKNOWN)
+        printer(PROTECTED, policy.OWNER_UNKNOWN)
         out = self.ask_as(LAN, None)
         assert out["owner"] == {"linked": None, "account": None}
         assert out["may_ask"] is False
@@ -530,7 +545,7 @@ class TestAStrangerSeesNoEmailAndCannotComplete:
         assert str(err.value).startswith("dev-mode:bad_request: ")
 
     def test_a_strangers_completion_on_a_linked_printer_is_refused(self):
-        printer(OPEN, LINKED)
+        printer(PROTECTED, LINKED)
         api = _api(ENDPOINT)
         with pytest.raises(ServerError) as err:
             asyncio.run(api.request(
@@ -541,7 +556,7 @@ class TestAStrangerSeesNoEmailAndCannotComplete:
         assert "dev_mode_request" in str(err.value)
 
     def test_a_strangers_poll_on_a_linked_printer_is_refused(self):
-        printer(OPEN, LINKED)
+        printer(PROTECTED, LINKED)
         api = _api(ENDPOINT)
         with pytest.raises(ServerError) as err:
             asyncio.run(api.request(
@@ -551,3 +566,50 @@ class TestAStrangerSeesNoEmailAndCannotComplete:
             {"challenge_id": CHALLENGE}, RequestType.GET, HTTP, SENTINEL,
             gateway("admin", "operator")))
         assert out == {"reached": ENDPOINT}
+
+    def test_a_stranger_on_a_linked_open_printer_may_ask_complete_and_poll(self):
+        printer(OPEN, LINKED)
+        api = _api(ENDPOINT)
+        for verb, args in (
+            (RequestType.POST, {"enabled": True}),
+            (RequestType.POST, {
+                "enabled": True, "challenge_id": CHALLENGE,
+                "waiver_acknowledged": True, "waiver_version": "v"}),
+            (RequestType.GET, {"challenge_id": CHALLENGE}),
+        ):
+            out = asyncio.run(api.request(args, verb, HTTP, LAN, None))
+            assert out == {"reached": ENDPOINT}
+
+    def test_the_owner_can_always_ask_complete_and_poll(self):
+        owner = gateway("admin", "operator")
+        api = _api(ENDPOINT)
+        for entry in (OPEN, PROTECTED):
+            printer(entry, LINKED)
+            for verb, args in (
+                (RequestType.POST, {"enabled": True}),
+                (RequestType.POST, {"enabled": True,
+                                    "challenge_id": CHALLENGE}),
+                (RequestType.GET, {"challenge_id": CHALLENGE}),
+            ):
+                out = asyncio.run(
+                    api.request(args, verb, HTTP, SENTINEL, owner))
+                assert out == {"reached": ENDPOINT}
+
+    def test_a_stranger_on_a_linked_protected_printer_gets_403_everywhere(self):
+        printer(PROTECTED, LINKED)
+        api = _api(ENDPOINT)
+        for verb, args in (
+            (RequestType.POST, {"enabled": True}),
+            (RequestType.POST, {"enabled": True, "challenge_id": CHALLENGE}),
+            (RequestType.GET, {"challenge_id": CHALLENGE}),
+        ):
+            with pytest.raises(ServerError) as err:
+                asyncio.run(api.request(args, verb, HTTP, LAN, None))
+            assert err.value.status_code == 403
+
+    def test_the_masked_email_stays_for_a_stranger_on_an_open_printer(self):
+        printer(OPEN, LINKED)
+        out, _c = call(TestAStrangerSeesNoEmailAndCannotComplete.ROUTES,
+                       _GatewayRequest("GET", ip=LAN))
+        assert (out["as_owner"], out["may_ask"]) == (False, True)
+        assert out["owner"]["account"] == "o***@example.com"
