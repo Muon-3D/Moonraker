@@ -607,16 +607,16 @@ class AuxAutoProxy:
 
     @staticmethod
     def _entry() -> str:
-        """open only when the access policy is loaded and says Open; every
-        other case (Protected, locked down, no policy, unreadable) is
-        protected."""
+        """open iff the protection level is Open (muon_floor, the same level
+        muon-link reads for GET /pairing); anything else, or any error,
+        is protected."""
         try:
-            current = policy.state()
-            if current is not None and current.entry == policy.ENTRY_OPEN:
-                return policy.ENTRY_OPEN
+            from .. import muon_floor
+            if muon_floor.protection_level() == muon_floor.LEVEL_OPEN:
+                return "open"
         except Exception:
-            logging.exception("Could not read the access entry")
-        return policy.ENTRY_PROTECTED
+            logging.exception("Could not read the protection level")
+        return "protected"
 
     def _setup_state(self) -> Optional[str]:
         """new | in_progress | complete, from muon_setup, or None when it is
