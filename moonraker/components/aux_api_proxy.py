@@ -29,6 +29,11 @@ MOON_PREFIX = "/server/aux"  # Moonraker namespace
 AUX_TOKEN_FILE = Path(os.getenv("AUX_API_TOKEN_FILE", "/run/aux_api/token"))
 AUX_TOKEN_HEADER = "X-Aux-Api-Key"
 
+# KAN-4297: the HTTP client's address, for the Aux API to tell a device on
+# the printer's own hotspot from anyone else (MuonOS #554). The Aux API trusts
+# it only from a loopback peer, which Moonraker is.
+CLIENT_IP_HEADER = "X-Muon-Client-Ip"
+
 # Map lower-case OpenAPI keys → canonical HTTP verbs
 HTTP_VERBS = {"get": "GET", "post": "POST", "put": "PUT",
               "patch": "PATCH", "delete": "DELETE"}
@@ -220,6 +225,26 @@ class AuxAutoProxy:
         token = self._aux_token()
         if token:
             merged[AUX_TOKEN_HEADER] = token
+        return merged
+
+    def _client_ip_headers(self, webreq: Any,
+                           headers: Optional[Dict[str, Any]] = None
+                           ) -> Dict[str, Any]:
+        """Set X-Muon-Client-Ip from the address Moonraker resolved for this
+        request (WebRequest.get_ip_address(): tornado's remote_ip, which takes
+        X-Real-IP from the trusted local nginx and is validated by
+        validate_real_ip_header). Any value the caller supplied is dropped
+        first. Omitted unless the request is plain HTTP from a client:
+        websocket/JSON-RPC, unix-socket, MQTT and internal calls get none."""
+        merged = {k: v for k, v in (headers or {}).items()
+                  if k.lower() != CLIENT_IP_HEADER.lower()}
+        is_http = getattr(webreq, "is_plain_http", None)
+        get_ip = getattr(webreq, "get_ip_address", None)
+        if is_http is None or get_ip is None or not is_http():
+            return merged
+        ip = get_ip()
+        if ip is not None:
+            merged[CLIENT_IP_HEADER] = str(ip)
         return merged
 
     def _aux_token(self) -> Optional[str]:
@@ -419,7 +444,8 @@ class AuxAutoProxy:
                 method=method,
                 url=url,
                 body=body,
-                headers=self._auth_headers(headers),
+                headers=self._auth_headers(
+                    self._client_ip_headers(webreq, headers)),
                 connect_timeout=3.,
                 # Wi-Fi association + 4-way handshake + DHCP routinely runs
                 # 8-30s on this board, so an 8s budget here turned successful
@@ -481,7 +507,7 @@ class AuxAutoProxy:
             method=verb,
             url=url,
             body=webreq.get("body", None),
-            headers=self._auth_headers(),
+            headers=self._auth_headers(self._client_ip_headers(webreq)),
             connect_timeout=3.,
             request_timeout=8.,
         )
