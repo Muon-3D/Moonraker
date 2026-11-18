@@ -599,7 +599,24 @@ class AuxAutoProxy:
             # KAN-203 (spec 02 §7): whether this printer still needs setting
             # up, so an app that finds it can route it (06 §1).
             "setup": self._setup_state(),
+            # KAN-3993: open | protected, the same value muon-link's GET
+            # /pairing reports. Lets a client hide "Ask for access" on an
+            # Open printer. Read-only; fails closed to "protected".
+            "entry": self._entry(),
         }
+
+    @staticmethod
+    def _entry() -> str:
+        """open only when the access policy is loaded and says Open; every
+        other case (Protected, locked down, no policy, unreadable) is
+        protected."""
+        try:
+            current = policy.state()
+            if current is not None and current.entry == policy.ENTRY_OPEN:
+                return policy.ENTRY_OPEN
+        except Exception:
+            logging.exception("Could not read the access entry")
+        return policy.ENTRY_PROTECTED
 
     def _setup_state(self) -> Optional[str]:
         """new | in_progress | complete, from muon_setup, or None when it is

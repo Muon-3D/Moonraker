@@ -435,6 +435,7 @@ def test_the_identity_is_the_derived_name_until_the_owner_renames_it():
         # KAN-403 (#27): null until Aux reports an EndpointId.
         "endpoint_id": None,
         "setup": None,
+        "entry": "protected",
     }
 
     renamed = asyncio.run(rename(FakeWebRequest("POST", {"name": "  Workshop "})))
@@ -470,6 +471,40 @@ def test_the_identity_says_whether_setup_is_done(state: str):
     server.components["muon_setup"] = Setup()
     get = server.handler_for("/server/muon/identity")
     assert asyncio.run(get(FakeWebRequest("GET")))["setup"] == state
+
+
+@pytest.mark.parametrize("entry,preset,expected", [
+    ("open", "relaxed", "open"),
+    ("open", None, "open"),
+    ("protected", "standard", "protected"),
+    ("protected", "strict", "protected"),
+    ("protected", "relaxed", "protected"),
+    ("garbage", None, "protected"),
+])
+def test_the_identity_reports_the_entry(monkeypatch, entry, preset, expected):
+    """KAN-3993: open|protected, as muon-link's /pairing says it."""
+    from moonraker import muon_access_policy as pol
+    monkeypatch.setattr(
+        pol, "_state", pol.AccessState(entry=entry, preset=preset))
+    _proxy, server, _client = make_proxy(
+        FakeHttpClient(FakeResponse(dict(AUX_IDENTITY))))
+    get = server.handler_for("/server/muon/identity")
+    assert asyncio.run(get(FakeWebRequest("GET")))["entry"] == expected
+
+
+def test_the_identity_entry_fails_closed(monkeypatch):
+    from moonraker import muon_access_policy as pol
+
+    monkeypatch.setattr(pol, "_state", None)
+    _proxy, server, _client = make_proxy(
+        FakeHttpClient(FakeResponse(dict(AUX_IDENTITY))))
+    get = server.handler_for("/server/muon/identity")
+    assert asyncio.run(get(FakeWebRequest("GET")))["entry"] == "protected"
+
+    def boom():
+        raise RuntimeError("unreadable")
+    monkeypatch.setattr(pol, "state", boom)
+    assert asyncio.run(get(FakeWebRequest("GET")))["entry"] == "protected"
 
 
 def test_the_public_identity_methods_are_what_the_endpoints_serve():
