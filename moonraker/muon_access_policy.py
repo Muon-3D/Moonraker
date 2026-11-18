@@ -764,6 +764,11 @@ def classify(
         # KAN-3603: the read follows the write's rule (Control hides the row
         # on a 404, shows the reason on a 403).
         return (ACTIONS["timezone"],)
+    if (endpoint == "/server/muon/dev_mode/request" and method == "GET"
+            and "challenge_id" in args):
+        # KAN-4351: who may ask is who may poll an asker's challenge. The
+        # bare GET stays a read, so a stranger is told who may ask.
+        return (ACTIONS["dev_mode_request"],)
     if method == "GET":
         return (READ,)
     if endpoint == "/api/printer/command":
