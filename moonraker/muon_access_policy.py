@@ -210,11 +210,14 @@ _ROWS = (
     # Developer mode: dev_mode_consent in the Aux API asks the hardware
     # (KAN-371), which is how this row's "panel" is met.
     _A("dev_mode", PANEL, PANEL, PANEL, fixed=True, delegated=True),
-    # KAN-3604 (Jack, 17 Nov): asking Control to turn developer mode on or off.
-    # Open printer with no owner: anyone admitted. Linked: the owning account
-    # (the admin level) under every preset, fixed so no override can open it.
-    # The first warranty release still needs the panel; Aux asks for that.
-    _A("dev_mode_request", ADMIN, ADMIN, ADMIN, fixed=True),
+    # KAN-3604 / KAN-4351 (Jack, D-166 "open by default"): asking, completing
+    # and polling developer mode on or off follows the printer's setting like
+    # print or motion. Open (Relaxed, which an Open printer uses, owner or
+    # not): anyone admitted. Protected, or a stricter preset: the owning
+    # account (the admin level), and an unlinked printer admits no one it
+    # does not admit already. The first warranty release still needs the
+    # panel; Aux asks for that, not this table.
+    _A("dev_mode_request", SIGNED_OUT_GUEST, ADMIN, ADMIN),
     # KAN-3603 (Jack, 17 Nov): the time zone after set-up, GET and POST alike.
     # An open printer (Relaxed, or no owner) lets any client; Protected, or a
     # linked printer under Standard or Strict, the owner. Overridable like any
