@@ -54,6 +54,8 @@ ZONE_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_+-]*(/[A-Za-z0-9_+-]+){0,2}$")
 # KAN-4351: a challenge id as the Aux API makes them (Control checks the same
 # shape before it sends one). Anything else is never put into an Aux path.
 CHALLENGE_ID = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
+# The longest waiver version forwarded to Aux.
+MAX_WAIVER_VERSION = 64
 # A refusal code Control can read: `dev-mode:<code>: <why>`.
 REFUSAL_CODE = re.compile(r"^[a-z_]+$")
 # What the Aux API says with a bare status and no code of its own.
@@ -72,6 +74,14 @@ def _path_pattern(fast_path: str) -> "re.Pattern[str]":
     parts = [re.escape(seg) if not _PATH_PARAM_RE.fullmatch(seg) else "[^/?#]+"
              for seg in fast_path.split("/")]
     return re.compile("^" + "/".join(parts) + "$")
+
+
+def _mask_email(email: str) -> str:
+    """`j***@example.com`: the first character and the domain."""
+    local, sep, domain = email.partition("@")
+    if not sep or not local or not domain:
+        return email[:1] + "***"
+    return f"{local[0]}***@{domain}"
 
 
 def _aux_error_message(resp: Any) -> Optional[str]:
@@ -762,7 +772,10 @@ class AuxAutoProxy:
         if linked:
             access = self.server.lookup_component("muon_access", None)
             email = getattr(access, "owner_email", None)
-            account = email if isinstance(email, str) and email else None
+            if isinstance(email, str) and email:
+                # Anyone who can read may GET this: only the owner is shown
+                # the whole address.
+                account = email if as_owner else _mask_email(email)
         return {
             "as_owner": as_owner,
             "may_ask": may_ask,
@@ -833,6 +846,10 @@ class AuxAutoProxy:
                 args.get("waiver_acknowledged") is True)
             version = args.get("waiver_version")
             if isinstance(version, str) and version:
+                if len(version) > MAX_WAIVER_VERSION:
+                    raise self.server.error(
+                        "dev-mode:bad_request: 'waiver_version' is too long",
+                        400)
                 body["waiver_version"] = version
         try:
             # Turning on restarts Klipper: Aux takes its time over it.

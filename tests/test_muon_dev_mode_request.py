@@ -286,7 +286,7 @@ class TestGetWhoMayAsk:
         out = self.ask_as(LAN, None)
         assert out["as_owner"] is False
         assert out["may_ask"] is False
-        assert out["owner"] == {"linked": True, "account": "owner@example.com"}
+        assert out["owner"] == {"linked": True, "account": "o***@example.com"}
 
     def test_a_member_is_not_the_owner(self):
         printer(OPEN, LINKED)
@@ -503,3 +503,51 @@ class TestOtherMethods:
             ENDPOINT, server.verbs_for(ENDPOINT), callback)
         assert api.request_types == RequestType.GET | RequestType.POST
         assert RequestType.DELETE not in api.request_types
+
+
+class TestAStrangerSeesNoEmailAndCannotComplete:
+    ROUTES = {"/dev_mode/waiver": _Answered(WAIVER)}
+
+    def test_a_stranger_gets_the_masked_account(self):
+        printer(OPEN, LINKED)
+        out, _c = call(self.ROUTES, _GatewayRequest("GET", ip=LAN))
+        assert out["as_owner"] is False
+        assert out["owner"]["account"] == "o***@example.com"
+
+    def test_the_owner_gets_the_whole_address(self):
+        printer(OPEN, LINKED)
+        out, _c = call(self.ROUTES, _GatewayRequest(
+            "GET", ip=SENTINEL, user=gateway("admin", "operator")))
+        assert out["owner"]["account"] == "owner@example.com"
+
+    def test_waiver_version_is_capped(self):
+        with pytest.raises(Exception) as err:
+            call({"/dev_mode": _Answered({"enabled": True})},
+                 FakeWebRequest("POST", {
+                     "enabled": True, "challenge_id": CHALLENGE,
+                     "waiver_acknowledged": True, "waiver_version": "v" * 65}))
+        assert err.value.status_code == 400
+        assert str(err.value).startswith("dev-mode:bad_request: ")
+
+    def test_a_strangers_completion_on_a_linked_printer_is_refused(self):
+        printer(OPEN, LINKED)
+        api = _api(ENDPOINT)
+        with pytest.raises(ServerError) as err:
+            asyncio.run(api.request(
+                {"enabled": True, "challenge_id": CHALLENGE,
+                 "waiver_acknowledged": True, "waiver_version": "v"},
+                RequestType.POST, HTTP, LAN, None))
+        assert err.value.status_code == 403
+        assert "dev_mode_request" in str(err.value)
+
+    def test_a_strangers_poll_on_a_linked_printer_is_refused(self):
+        printer(OPEN, LINKED)
+        api = _api(ENDPOINT)
+        with pytest.raises(ServerError) as err:
+            asyncio.run(api.request(
+                {"challenge_id": CHALLENGE}, RequestType.GET, HTTP, LAN, None))
+        assert err.value.status_code == 403
+        out = asyncio.run(api.request(
+            {"challenge_id": CHALLENGE}, RequestType.GET, HTTP, SENTINEL,
+            gateway("admin", "operator")))
+        assert out == {"reached": ENDPOINT}
