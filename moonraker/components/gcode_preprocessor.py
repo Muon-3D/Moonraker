@@ -139,6 +139,16 @@ def split_marker(data: bytes) -> tuple[bytes, tuple[str, str] | None]:
     return data[:end], fields
 
 
+# avoid_excluded_zone exit codes (GCodePostprocessor main.rs): 1 = REFUSED, the
+# file is understood but cannot be printed here, reason on stderr; 2 = I/O
+# error; anything else (panic 101, a signal) is a crash.  Only 1 is the user's
+# to fix, so only 1 becomes a 4xx (KAN-4346).
+EXIT_REFUSED = 1
+REFUSED_PREFIX = "This print can't be used on this printer: "
+MAX_REASON_LEN = 300
+CONTROL_CHARS_RE = re.compile("[" + chr(0) + "-" + chr(31) + chr(127) + "-" + chr(159) + "]")
+
+
 class GCodePreprocessorComponent:
     def __init__(self, config: ConfigHelper):
         self.server = config.get_server()
@@ -399,11 +409,18 @@ class GCodePreprocessorComponent:
             )
 
         if proc.returncode != 0:
-            LOG.error(
-                "[gcode_preprocessor] '%s' failed (exit %s):\n%s",
-                self.binary, proc.returncode,
-                stderr.decode(errors="ignore")
+            err_text = stderr.decode(errors="ignore")
+            LOG.info(
+                "[gcode_preprocessor] '%s' failed (exit %s) on %s; stderr:\n%s",
+                self.binary, proc.returncode, file_path, err_text
             )
+            if proc.returncode == EXIT_REFUSED:
+                # The tool read the file and says it cannot be printed here.
+                # The reason is for the person who sliced it (KAN-4346).
+                raise self.server.error(
+                    REFUSED_PREFIX + self._refusal_reason(err_text, file_path),
+                    422
+                )
             raise self.server.error(
                 f"G-code safety postprocessor exited {proc.returncode}", 500
             )
@@ -412,6 +429,27 @@ class GCodePreprocessorComponent:
         summary = stdout.decode(errors="ignore").strip()
         if summary:
             LOG.info("[gcode_preprocessor] %s", summary)
+
+    @staticmethod
+    def _refusal_reason(stderr_text: str, file_path: str) -> str:
+        """The tool's reason, fit to show a person: last meaningful line,
+        without the binary's ``REFUSED <path>:`` lead-in (the path is ours,
+        not theirs), control characters stripped, at most MAX_REASON_LEN."""
+        lines = [ln.strip() for ln in stderr_text.splitlines() if ln.strip()]
+        reason = lines[-1] if lines else ""
+        marker = "REFUSED "
+        idx = reason.find(marker)
+        if idx != -1:
+            reason = reason[idx + len(marker):]
+            lead = file_path + ": "
+            if reason.startswith(lead):
+                reason = reason[len(lead):]
+            else:
+                reason = re.sub(r"^\S+: ", "", reason, count=1)
+        reason = CONTROL_CHARS_RE.sub("", reason).strip()
+        if len(reason) > MAX_REASON_LEN:
+            reason = reason[:MAX_REASON_LEN - 3].rstrip() + "..."
+        return reason or "the file was refused"
 
     @staticmethod
     def _kill_process_group(proc: asyncio.subprocess.Process) -> None:
