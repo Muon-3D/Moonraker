@@ -186,9 +186,13 @@ class FakeWebRequest:
         self,
         action: str = "GET",
         args: Optional[Dict[str, Any]] = None,
+        ip: Optional[str] = None,
+        plain_http: bool = False,
     ) -> None:
         self._action = action
         self._args = args or {}
+        self._ip = ipaddress.ip_address(ip) if ip else None
+        self._plain_http = plain_http
         self.raw_responses: List[Tuple[Any, int, Dict[str, str]]] = []
 
     def get_action(self) -> str:
@@ -196,6 +200,12 @@ class FakeWebRequest:
 
     def get_args(self) -> Dict[str, Any]:
         return dict(self._args)
+
+    def get_ip_address(self) -> Any:
+        return self._ip
+
+    def is_plain_http(self) -> bool:
+        return self._plain_http
 
     def get_str(self, name: str, default: Any = None) -> str:
         if name in self._args:
@@ -857,6 +867,71 @@ def test_every_call_out_carries_this_boots_aux_api_token(tmp_path, monkeypatch):
 
     asyncio.run(proxy.post("/update/commit", {}))
     assert client.last["headers"][aux_api_proxy.AUX_TOKEN_HEADER] == "s3cret"
+
+
+# --------------------------------------------------------------------------
+# KAN-4297: the client address reaches the Aux API
+# --------------------------------------------------------------------------
+
+CLIENT_IP = aux_api_proxy.CLIENT_IP_HEADER
+
+
+def test_the_client_address_is_forwarded_on_both_proxy_paths():
+    proxy, server, client = make_proxy()
+    proxy._register_from_spec(SPEC_WITH_PARAMS)
+
+    asyncio.run(server.handler_for("/server/aux/wifi/scan")(
+        FakeWebRequest(ip="10.42.0.7", plain_http=True)))
+    assert client.last["headers"][CLIENT_IP] == "10.42.0.7"
+
+    asyncio.run(server.handler_for("/server/aux/wifi/connect")(
+        FakeWebRequest("POST", {"ssid": "x"}, ip="192.168.1.9",
+                       plain_http=True)))
+    assert client.last["headers"][CLIENT_IP] == "192.168.1.9"
+    assert client.last["headers"]["Content-Type"] == "application/json"
+
+    asyncio.run(proxy._handle_dynamic_proxy(FakeWebRequest(
+        args={"path": "/wifi/show/home"}, ip="fe80::1", plain_http=True)))
+    assert client.last["headers"][CLIENT_IP] == "fe80::1"
+
+
+def test_a_client_supplied_address_header_is_replaced_not_passed_through():
+    proxy, _server, _client = make_proxy()
+    req = FakeWebRequest(ip="192.168.1.9", plain_http=True)
+
+    headers = proxy._client_ip_headers(
+        req, {CLIENT_IP.lower(): "10.42.0.99", "Content-Type": "x"})
+
+    assert headers == {"Content-Type": "x", CLIENT_IP: "192.168.1.9"}
+
+
+def test_a_spoofed_header_is_dropped_when_there_is_no_address_to_set():
+    proxy, _server, _client = make_proxy()
+
+    headers = proxy._client_ip_headers(
+        FakeWebRequest(plain_http=True), {CLIENT_IP: "10.42.0.99"})
+
+    assert CLIENT_IP not in headers
+
+
+def test_internal_and_non_http_requests_send_no_address():
+    proxy, server, client = make_proxy()
+    proxy._register_from_spec(SPEC_WITH_PARAMS)
+
+    # unix socket, MQTT, JSON-RPC: not plain HTTP, even if an address is known
+    asyncio.run(server.handler_for("/server/aux/wifi/scan")(
+        FakeWebRequest(ip="10.42.0.7", plain_http=False)))
+    assert CLIENT_IP not in client.last["headers"]
+
+    asyncio.run(proxy._handle_dynamic_proxy(FakeWebRequest(
+        args={"path": "/wifi/show/home"}, ip="10.42.0.7", plain_http=False)))
+    assert CLIENT_IP not in client.last["headers"]
+
+    # the helpers other components call have no client at all
+    asyncio.run(proxy.get("/update/status"))
+    assert CLIENT_IP not in client.last["headers"]
+    asyncio.run(proxy.post("/update/commit", {}))
+    assert CLIENT_IP not in client.last["headers"]
 
 
 # --------------------------------------------------------------------------
