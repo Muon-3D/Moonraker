@@ -146,7 +146,9 @@ def split_marker(data: bytes) -> tuple[bytes, tuple[str, str] | None]:
 EXIT_REFUSED = 1
 REFUSED_PREFIX = "This print can't be used on this printer: "
 MAX_REASON_LEN = 300
-CONTROL_CHARS_RE = re.compile("[" + chr(0) + "-" + chr(31) + chr(127) + "-" + chr(159) + "]")
+CONTROL_CHARS_RE = re.compile(
+    "[" + chr(0) + "-" + chr(31) + chr(127) + "-" + chr(159) + "]"
+)
 
 
 class GCodePreprocessorComponent:
