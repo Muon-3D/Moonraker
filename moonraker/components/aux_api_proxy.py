@@ -16,6 +16,7 @@ from urllib.parse import unquote, urlencode
 
 from tornado.httpclient import HTTPClientError
 
+from .. import muon_access_policy as policy
 from ..utils import ServerError
 from ..utils import redact
 
@@ -49,6 +50,14 @@ INTERNAL_ONLY_AUX_PATHS = frozenset({"/dev_mode/request"})
 # KAN-3603: the Aux API's own ZONE_NAME (time_routes.py), copied. Aux still
 # checks that tzdata carries the zone; this keeps junk from being forwarded.
 ZONE_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_+-]*(/[A-Za-z0-9_+-]+){0,2}$")
+
+# KAN-4351: a challenge id as the Aux API makes them (Control checks the same
+# shape before it sends one). Anything else is never put into an Aux path.
+CHALLENGE_ID = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
+# A refusal code Control can read: `dev-mode:<code>: <why>`.
+REFUSAL_CODE = re.compile(r"^[a-z_]+$")
+# What the Aux API says with a bare status and no code of its own.
+REFUSAL_CODE_BY_STATUS = {428: "consent_required", 429: "throttled"}
 
 
 def _path_pattern(fast_path: str) -> "re.Pattern[str]":
@@ -298,16 +307,23 @@ class AuxAutoProxy:
             ["GET"],
             self._dev_mode_status_handler
         )
-        # KAN-3604 (Jack, 17 Nov): Control asks for developer mode on or off.
-        # POST only, and only ever to Aux's /dev_mode/request through the
-        # internal helper below -- never a pass-through of /server/aux, which
-        # stays the panel's under the `dev_mode` row. Who may ask is decided
-        # centrally (muon_access_policy's `dev_mode_request` row: anyone on an
-        # open printer with no owner, the owning account on a linked one, the
-        # Protected entry respected). Off the floor like the GET above.
+        # KAN-3604 / KAN-4351 (Jack, 17 Nov): Control asks for developer mode
+        # on or off through this one route, and only ever to Aux's
+        # /dev_mode/request, /dev_mode/waiver, /dev_mode/consent/<id> and
+        # /dev_mode through the internal helper below -- never a pass-through
+        # of /server/aux, which stays the panel's under the `dev_mode` row.
+        #   GET                  who may ask, and the waiver turning on agrees to
+        #   GET ?challenge_id    has the person at the printer answered
+        #   POST {enabled}       ask: a panel challenge, or applied at once
+        #   POST {enabled, challenge_id, waiver_*}   make the confirmed change
+        # Who may ask is decided centrally (muon_access_policy's
+        # `dev_mode_request` row, on the POSTs: anyone on an open printer with
+        # no owner, the owning account on a linked one, the Protected entry
+        # respected). A GET is a read, so a client that may not ask can still
+        # be told who may. Off the floor like the GET above.
         self.server.register_endpoint(
             "/server/muon/dev_mode/request",
-            ["POST"],
+            ["GET", "POST"],
             self._dev_mode_request_handler
         )
 
@@ -673,26 +689,159 @@ class AuxAutoProxy:
         return {"enabled": bool(state.get("enabled", False))}
 
 
+    def _dev_mode_refusal(self, exc: ServerError, path: str,
+                          gone_code: Optional[str] = None) -> Exception:
+        """What a failed Aux call means to Control: `dev-mode:<code>: <why>`
+        with the Aux API's own words, or the plain 503 while it is not
+        answering. An error with no code to name is returned as it was."""
+        if _not_answering(exc):
+            return self.server.error(
+                f"The Aux API is not answering yet ({path})", 503)
+        detail = getattr(exc, "aux_detail", None) or {}
+        code = getattr(exc, "aux_code", None) or detail.get("error")
+        status = exc.status_code
+        if not isinstance(code, str):
+            code = REFUSAL_CODE_BY_STATUS.get(status)
+            if code is None and status == 404:
+                code = gone_code
+        if not isinstance(code, str) or not REFUSAL_CODE.match(code):
+            return exc
+        return self.server.error(f"dev-mode:{code}: {exc}", status)
+
+    async def _dev_mode_waiver(self) -> Optional[Dict[str, str]]:
+        """The waiver turning developer mode on agrees to, from Aux's
+        GET /dev_mode/waiver, or None when Aux cannot say (an older Aux, or
+        not answering): the caller then has no waiver to show."""
+        try:
+            waiver = await self.get("/dev_mode/waiver")
+        except ServerError:
+            return None
+        if (isinstance(waiver, dict)
+                and isinstance(waiver.get("version"), str)
+                and isinstance(waiver.get("text"), str)):
+            return {"version": waiver["version"], "text": waiver["text"]}
+        return None
+
     async def _dev_mode_request_handler(self, webreq):
-        enabled = webreq.get_args().get("enabled")
+        args = webreq.get_args()
+        if webreq.get_action() == "GET":
+            if "challenge_id" in args:
+                return await self._dev_mode_answer(args["challenge_id"])
+            return await self._dev_mode_who_may_ask(webreq)
+        enabled = args.get("enabled")
         if not isinstance(enabled, bool):
             raise self.server.error("'enabled' must be true or false", 400)
+        if args.get("challenge_id") is not None:
+            return await self._dev_mode_complete(enabled, args)
+        return await self._dev_mode_ask(enabled)
+
+    async def _dev_mode_who_may_ask(self, webreq) -> Dict[str, Any]:
+        """GET with nothing: whether this connection is the printer's owner,
+        who owns it, whether this connection may ask, and the waiver."""
+        state = policy.state()
+        principal = None
+        if state is not None:
+            get_user = getattr(webreq, "get_current_user", None)
+            principal = policy.resolve_principal(
+                getattr(webreq, "transport", None),
+                webreq.get_ip_address(),
+                get_user() if callable(get_user) else None,
+                state.entry,
+                state.home,
+            )
+        as_owner = principal is not None and principal.level >= policy.ADMIN
+        may_ask = state is not None and policy.decide_action(
+            policy.ACTIONS["dev_mode_request"], principal, state).allowed
+        linked: Optional[bool] = None
+        if state is not None:
+            if state.owner == policy.OWNER_NONE:
+                linked = False
+            elif state.owner != policy.OWNER_UNKNOWN:
+                linked = True
+        account = None
+        if linked:
+            access = self.server.lookup_component("muon_access", None)
+            email = getattr(access, "owner_email", None)
+            account = email if isinstance(email, str) and email else None
+        return {
+            "as_owner": as_owner,
+            "may_ask": may_ask,
+            "owner": {"linked": linked, "account": account},
+            "waiver": await self._dev_mode_waiver(),
+        }
+
+    async def _dev_mode_answer(self, challenge_id: Any) -> Dict[str, Any]:
+        """GET ?challenge_id: has the person at the printer answered. Aux's
+        GET /dev_mode/consent/<id> only reads; it advances nothing."""
+        if (not isinstance(challenge_id, str)
+                or not CHALLENGE_ID.match(challenge_id)):
+            raise self.server.error("'challenge_id' is not a challenge id", 400)
+        try:
+            state = await self.get(f"/dev_mode/consent/{challenge_id}")
+        except ServerError as exc:
+            raise self._dev_mode_refusal(
+                exc, "/dev_mode/consent", "unknown_challenge") from exc
+        if not isinstance(state, dict) or not isinstance(
+                state.get("confirmed"), bool):
+            raise self.server.error(
+                "Aux returned an unreadable dev_mode answer", 502)
+        return {
+            "confirmed": state["confirmed"],
+            "refused": state.get("refused") is True,
+        }
+
+    async def _dev_mode_ask(self, enabled: bool) -> Dict[str, Any]:
+        """POST {enabled}: Aux either opens a challenge on the panel (the
+        first release of the warranty) or applies the change at once. Its
+        answer is passed through as it is: Control follows what it says."""
         try:
             result = await self.post("/dev_mode/request", {"enabled": enabled})
         except ServerError as exc:
-            if getattr(exc, "aux_code", None) == "panel_only":
-                # Control shows the code as it is.
-                raise self.server.error("panel_only", 403) from exc
-            if _not_answering(exc):
-                raise self.server.error(
-                    "The Aux API is not answering yet (/dev_mode/request)", 503
-                ) from exc
-            raise
+            raise self._dev_mode_refusal(exc, "/dev_mode/request") from exc
         if not isinstance(result, dict):
             raise self.server.error(
                 "Aux returned an unreadable dev_mode answer", 502)
         if result.get("challenge_id"):
-            return {"challenge_id": result["challenge_id"]}
+            challenge: Dict[str, Any] = {
+                "challenge_id": result["challenge_id"],
+                "enabled": (result["enabled"]
+                            if isinstance(result.get("enabled"), bool)
+                            else enabled),
+            }
+            for key in ("expires_in_seconds", "instruction"):
+                if result.get(key) is not None:
+                    challenge[key] = result[key]
+            # Turning on is what the waiver is for.
+            if enabled:
+                challenge["waiver"] = await self._dev_mode_waiver()
+            return challenge
+        return {"enabled": bool(result.get("enabled", False))}
+
+    async def _dev_mode_complete(self, enabled: bool,
+                                 args: Dict[str, Any]) -> Dict[str, Any]:
+        """POST {enabled, challenge_id, waiver_acknowledged, waiver_version}:
+        make the change the person at the printer confirmed, through Aux's
+        POST /dev_mode. Only those four fields are forwarded."""
+        challenge_id = args["challenge_id"]
+        if (not isinstance(challenge_id, str)
+                or not CHALLENGE_ID.match(challenge_id)):
+            raise self.server.error("'challenge_id' is not a challenge id", 400)
+        body: Dict[str, Any] = {"enabled": enabled,
+                                "challenge_id": challenge_id}
+        if enabled:
+            body["waiver_acknowledged"] = (
+                args.get("waiver_acknowledged") is True)
+            version = args.get("waiver_version")
+            if isinstance(version, str) and version:
+                body["waiver_version"] = version
+        try:
+            # Turning on restarts Klipper: Aux takes its time over it.
+            result = await self.post("/dev_mode", body, timeout=60.0)
+        except ServerError as exc:
+            raise self._dev_mode_refusal(exc, "/dev_mode") from exc
+        if not isinstance(result, dict):
+            raise self.server.error(
+                "Aux returned an unreadable dev_mode answer", 502)
         return {"enabled": bool(result.get("enabled", False))}
 
     async def _timezone_handler(self, webreq):
