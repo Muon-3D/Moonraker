@@ -19,7 +19,10 @@ import threading
 import time
 import uuid
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Any, BinaryIO, Dict, Iterator, List, Optional, Tuple
+from typing import (
+    TYPE_CHECKING, Any, BinaryIO, Dict, Generator, List, Optional,
+    Tuple
+)
 from urllib.parse import quote
 
 from ..common import RequestType
@@ -709,7 +712,8 @@ class MuonUSB:
         return {'status': 206, 'headers': headers, 'start': start,
                 'length': end - start + 1}
 
-    def iter_file(self, path: str, start: int, length: int) -> Iterator[bytes]:
+    def iter_file(self, path: str, start: int, length: int
+                  ) -> Generator[bytes, None, None]:
         with self.open_gcode(path) as source:
             source.seek(start)
             remaining = length
@@ -1285,8 +1289,10 @@ class MuonUSB:
             self._fail(job, '', 'write_error')
             outcome = 'failed'
         with contextlib.suppress(RuntimeError):
-            loop.call_soon_threadsafe(
-                lambda: done.done() or done.set_result(outcome))
+            def settle() -> None:
+                if not done.done():
+                    done.set_result(outcome)
+            loop.call_soon_threadsafe(settle)
 
     # -- planning ------------------------------------------------------------
 
@@ -1352,8 +1358,7 @@ class MuonUSB:
                     continue
                 rel = parts[1:]
                 if target.is_dir():
-                    base = shown
-                    self._walk(base, target, rel, lambda r: len(r) + 1 <= MAX_DEPTH,
+                    self._walk(shown, target, rel, lambda r: len(r) + 1 <= MAX_DEPTH,
                                entries, seen)
                 elif Path(parts[-1]).suffix.lower() in VALID_GCODE_EXTS:
                     self._add_entry(entries, seen, shown.rsplit('/', 1)[0],
