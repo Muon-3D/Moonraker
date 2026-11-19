@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import contextlib
+import ctypes
+import email.utils
 import errno
 import json
 import logging
@@ -40,8 +42,10 @@ DEFAULT_LIMIT = 500
 MAX_LIMIT = 2000
 CHUNK = 256 * 1024
 MARGIN = 1024 * 1024
-RATE = 8 * 1024 * 1024
+RATE = 2 * 1024 * 1024
+SYNC_EVERY = 4 * 1024 * 1024
 FAT_MAX_FILE = 2 ** 32 - 1
+NAME_LIMIT = 255
 FAT_ILLEGAL = set('<>:"\\|?*')
 NOTIFY_INTERVAL = 0.5
 NOTIFY_FULL_ITEMS = 200
@@ -52,6 +56,14 @@ CONFLICTS = ('rename', 'skip', 'replace')
 WRITABLE_FS = ('vfat', 'exfat')
 ACTIVE = ('queued', 'running')
 MAX_ITEMS = 10000
+# Only our own temporary files are ever removed: .usb-<32 hex>, optionally with
+# a suffix. Nothing else on a stick or in the G-code tree is touched.
+TEMP_NAME = re.compile(r'\.usb-[0-9a-f]{32}(\..*)?')
+MAX_RECORDED_DESTS = 50
+STUCK_RW = 'stuck_rw'
+LEAVE_CYCLES = 2
+# Unit states in which a rw window may still be holding a stick read-write.
+LIVE_STATES = ('active', 'activating', 'reloading', 'deactivating', 'failed')
 
 
 class JobBusy(AgentError):
@@ -88,6 +100,39 @@ def idle_io() -> None:
         pass
 
 
+def is_temp_name(name: str) -> bool:
+    return TEMP_NAME.fullmatch(name) is not None
+
+
+def syncfs(path: Any) -> None:
+    """Flush ONE filesystem (the stick's), never every disk on the printer."""
+    fd = os.open(path, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+    try:
+        native = getattr(os, 'syncfs', None)          # Python 3.14 and later
+        if native is not None:
+            native(fd)
+            return
+        libc = ctypes.CDLL(None, use_errno=True)       # bookworm has Python 3.11
+        if libc.syncfs(fd) != 0:
+            code = ctypes.get_errno()
+            raise OSError(code, os.strerror(code))
+    finally:
+        os.close(fd)
+
+
+def fit_name(stem: str, tail: str, to_usb: bool) -> str:
+    """stem + tail within the destination's name limit: 255 UTF-16 units on a
+    FAT stick, 255 bytes on the printer. The stem is cut, never the tail."""
+    def size(text: str) -> int:
+        return (len(text.encode('utf-16-le')) // 2 if to_usb
+                else len(text.encode('utf-8')))
+    while stem and size(stem + tail) > NAME_LIMIT:
+        stem = stem[:-1]
+    if to_usb:
+        stem = stem.rstrip(' .')       # a FAT name may not end in a dot or space
+    return (stem or '_') + tail
+
+
 def systemd_escape(name: str) -> str:
     out = []
     for index, byte in enumerate(name.encode('utf-8')):
@@ -100,9 +145,14 @@ def systemd_escape(name: str) -> str:
 
 
 def parse_range(header: Optional[str], size: int) -> Optional[Tuple[int, int]]:
-    """None: serve everything. (start, end), inclusive. Anything that is not
-    exactly one satisfiable bytes range raises RangeNotSatisfiable (HTTP 416)."""
+    """None: serve everything. (start, end), inclusive. A unit that is not
+    `bytes` and a multi-range are ignored (HTTP 200, the whole file, as the RFC
+    allows); one bytes range that cannot be satisfied raises RangeNotSatisfiable
+    (HTTP 416)."""
     if header is None or not header.strip():
+        return None
+    unit, equals, spec = header.strip().partition('=')
+    if not equals or unit.strip().lower() != 'bytes' or ',' in spec:
         return None
     match = re.fullmatch(r'\s*bytes\s*=\s*(\d*)\s*-\s*(\d*)\s*', header)
     if not match or (not match[1] and not match[2]) or size <= 0:
@@ -121,7 +171,7 @@ def parse_range(header: Optional[str], size: int) -> Optional[Tuple[int, int]]:
 
 def fat_name_problem(name: str) -> bool:
     return (any(c in FAT_ILLEGAL or ord(c) < 32 for c in name)
-            or len(name.encode('utf-16-le')) // 2 > 255
+            or len(name.encode('utf-16-le')) // 2 > NAME_LIMIT
             or name.endswith(('.', ' ')))
 
 
@@ -159,8 +209,15 @@ class MuonUSB:
         self._rw_stick: Optional[str] = None
         self._ejecting = False
         self._ro_devs: set = set()
+        self._faults: Dict[str, str] = {}
         self.ejected: Dict[str, Dict[str, Any]] = {}
         self._pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
+        data_path = Path(self.server.get_app_args()['data_path'])
+        self.state_path = data_path / 'muon_usb_state.json'
+        self.sync_every = SYNC_EVERY
+        self.defer_poll = 5.0
+        self._deferred: set = set()
+        self._release_task: Optional[asyncio.Task] = None
         self.cleanup_temporaries()
         self.ensure_root()
         endpoints = (('status', RequestType.GET), ('list', RequestType.GET),
@@ -178,21 +235,101 @@ class MuonUSB:
     # existing read-only machinery
     # ------------------------------------------------------------------
 
+    def recorded_dests(self) -> List[List[str]]:
+        """Custom to_printer destinations (relative to gcodes) used before."""
+        try:
+            data = json.loads(self.state_path.read_text())
+            dests = data.get('dests', [])
+        except (OSError, ValueError, AttributeError):
+            return []
+        found = []
+        for dest in dests if isinstance(dests, list) else []:
+            try:
+                found.append(clean_segments(dest))
+            except (ServerError, AttributeError):
+                continue
+        return found
+
+    def record_dest(self, parts: List[str]) -> None:
+        """Remember a destination folder so startup cleanup can sweep it."""
+        if parts[:1] == ['usb-import']:
+            return        # always swept
+        dest = '/'.join(parts)
+        dests = ['/'.join(p) for p in self.recorded_dests()]
+        if dest in dests:
+            return
+        dests = (dests + [dest])[-MAX_RECORDED_DESTS:]
+        temp = self.state_path.with_name(self.state_path.name + '.tmp')
+        try:
+            temp.write_text(json.dumps({'dests': dests}))
+            os.replace(temp, self.state_path)
+        except OSError:
+            logging.exception('USB: could not record the destination folder')
+
+    @staticmethod
+    def sweep_tree(directory: Path, limit: int = 100000) -> int:
+        """Remove our own temporary files below `directory`, however deep.
+        Never follows a symlink, never touches a name that is not exactly
+        .usb-<32 hex>[.suffix]. Returns how many it removed."""
+        removed = 0
+        stack = [directory]
+        seen = 0
+        while stack and seen < limit:
+            current = stack.pop()
+            try:
+                with os.scandir(current) as entries:
+                    listing = list(entries)
+            except OSError:
+                continue
+            for entry in listing:
+                seen += 1
+                try:
+                    if entry.is_symlink():
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append(Path(entry.path))
+                    elif is_temp_name(entry.name) and entry.is_file(
+                            follow_symlinks=False):
+                        os.unlink(entry.path)
+                        removed += 1
+                except OSError:
+                    continue
+        return removed
+
     def cleanup_temporaries(self) -> None:
-        # A crash or power loss mid-copy leaves .usb-* files behind.
+        # A crash or power loss mid-copy leaves .usb-<hex> files behind, at any
+        # depth below usb-import and in any custom destination used before.
         fm = self.server.lookup_component('file_manager')
         gcodes = fm.get_directory('gcodes') if fm else ''
         if not gcodes:
             return
-        directory = Path(gcodes) / 'usb-import'
-        if directory.is_symlink() or not directory.is_dir():
-            return
-        with contextlib.suppress(OSError):
-            for entry in os.scandir(directory):
-                if entry.name.startswith('.usb-') and not entry.is_dir(
-                        follow_symlinks=False):
-                    with contextlib.suppress(OSError):
-                        os.unlink(entry.path)
+        roots = [Path(gcodes) / 'usb-import']
+        roots += [Path(gcodes).joinpath(*parts) for parts in self.recorded_dests()]
+        for directory in roots:
+            if directory.is_symlink() or not directory.is_dir():
+                continue
+            self.sweep_tree(directory)
+
+    @staticmethod
+    def sweep_folder(directory: Path, before: float) -> int:
+        """Remove our temporary files directly in `directory` (not below it) that
+        are older than `before` (the start of this job: never a live temp)."""
+        removed = 0
+        try:
+            with os.scandir(directory) as entries:
+                listing = list(entries)
+        except OSError:
+            return 0
+        for entry in listing:
+            try:
+                if (is_temp_name(entry.name) and not entry.is_symlink()
+                        and entry.is_file(follow_symlinks=False)
+                        and entry.stat(follow_symlinks=False).st_mtime < before):
+                    os.unlink(entry.path)
+                    removed += 1
+            except OSError:
+                continue
+        return removed
 
     def is_stick(self, name: str) -> bool:
         # Only a real mountpoint is a stick; a leftover directory is not.
@@ -395,14 +532,20 @@ class MuonUSB:
                     'unit': self.mount_unit(info['dev']) if info else None,
                     'fs': info['fs'] if info else None,
                     'free_bytes': None, 'total_bytes': None,
-                    'writable': self._rw_stick == name,
+                    # The real mount flag, not what a job believes.
+                    'writable': bool(info and info['rw']),
                     'read_only': self.stick_read_only(info)}
+                if name in self._faults and info and info['rw']:
+                    item['fault'] = self._faults[name]
                 with contextlib.suppress(OSError):
                     usage = shutil.disk_usage(self.root / name)
                     item['free_bytes'], item['total_bytes'] = usage.free, usage.total
                 sticks.append(item)
         present = {s['name'] for s in sticks}
         devs = {m['dev'] for m in mounts.values()}
+        for name in list(self._faults):
+            if name not in mounts or not mounts[name]['rw']:
+                del self._faults[name]          # back to read-only, or unplugged
         self._ro_devs &= devs
         for name, entry in list(self.ejected.items()):
             # Replugged (mounted again), or unplugged: no longer "safe to remove".
@@ -517,8 +660,20 @@ class MuonUSB:
     # download to the computer
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def if_range_holds(value: Optional[str], etag: str, modified: str) -> bool:
+        """If-Range: the Range applies only if the file is still the one the
+        client saw: a strong ETag equal to ours, or exactly our Last-Modified."""
+        if value is None or not value.strip():
+            return True
+        value = value.strip()
+        if value.startswith(('"', 'W/')):
+            return value == etag
+        return value == modified
+
     def download_info(self, path: str, range_header: Optional[str] = None,
-                      if_none_match: Optional[str] = None) -> Dict[str, Any]:
+                      if_none_match: Optional[str] = None,
+                      if_range: Optional[str] = None) -> Dict[str, Any]:
         target = self.resolve(path)
         parts = self.parts(path)
         if not parts or Path(parts[-1]).suffix.lower() not in VALID_GCODE_EXTS:
@@ -533,10 +688,14 @@ class MuonUSB:
             if '*' in tags or etag in tags or 'W/' + etag in tags:
                 return {'status': 304, 'headers': {'ETag': etag},
                         'start': 0, 'length': 0}
+        modified = email.utils.formatdate(info.st_mtime, usegmt=True)
         headers = {'Accept-Ranges': 'bytes', 'ETag': etag,
+                   'Last-Modified': modified,
                    'Content-Type': 'application/octet-stream',
                    'Content-Disposition':
                        "attachment; filename*=UTF-8''" + quote(parts[-1], safe='')}
+        if not self.if_range_holds(if_range, etag, modified):
+            range_header = None         # the file changed: the whole of it
         try:
             span = parse_range(range_header, size)
         except RangeNotSatisfiable:
@@ -595,7 +754,8 @@ class MuonUSB:
                 try:
                     info = await loop.run_in_executor(
                         usb.io_pool(), usb.download_info, path,
-                        headers.get('Range'), headers.get('If-None-Match'))
+                        headers.get('Range'), headers.get('If-None-Match'),
+                        headers.get('If-Range'))
                 except ServerError as err:
                     raise tornado.web.HTTPError(err.status_code, reason=str(err))
                 self.set_status(info['status'])
@@ -674,8 +834,19 @@ class MuonUSB:
             return False
         return job_state.get_last_stats().get('state') in ('printing', 'paused')
 
+    def _printing_file(self) -> Optional[str]:
+        """The file a running or paused print uses (relative to gcodes)."""
+        job_state = self.server.lookup_component('job_state', None)
+        if job_state is None:
+            return None
+        stats = job_state.get_last_stats()
+        if stats.get('state') not in ('printing', 'paused'):
+            return None
+        name = stats.get('filename')
+        return name.strip('/') if isinstance(name, str) and name else None
+
     def _pace(self, nbytes: int) -> None:
-        # While printing or paused the copy gives way: about 8 MB/s at most.
+        # While printing or paused the copy gives way: about 2 MB/s at most.
         if not self._printing():
             return
         now = self._now()
@@ -722,15 +893,20 @@ class MuonUSB:
         if dest is not None and not isinstance(dest, str):
             raise ServerError('Invalid dest.', 400)
         self._check_busy()
+        view = self._view(request)
         req = {'direction': direction, 'stick': stick, 'items': items,
-               'on_conflict': on_conflict}
+               'on_conflict': on_conflict, 'view': view}
         if direction == 'to_printer':
             for item in items:
                 parts = self.parts(item)
                 if not parts or parts[0] != stick:
                     raise ServerError('Items must be on the chosen stick.', 400)
-            req['dest_parts'] = (clean_segments(dest) if dest
-                                 else ['usb-import', stick])
+            dest_parts = clean_segments(dest) if dest else ['usb-import', stick]
+            if view is not None:
+                # As an upload: into the caller's own drive in accounts mode,
+                # refused in another account's. The same rule the guard applied.
+                dest_parts = view.dest_dir('/'.join(dest_parts)).split('/')
+            req['dest_parts'] = dest_parts
             req['src_parts'] = [self.parts(i) for i in items]
         else:
             req['src_parts'] = []
@@ -747,7 +923,8 @@ class MuonUSB:
                'state': 'queued', 'files_total': 0, 'files_done': 0,
                'bytes_total': 0, 'bytes_done': 0, 'current': None,
                'skipped': [], 'errors': [], 'items': [],
-               'started_at': None, 'ended_at': None, '_last': -1}
+               'started_at': None, 'ended_at': None, '_last': -1,
+               '_swept': set()}
         self._cancel.clear()
         self._debt = 0.0
         with self._lock:
@@ -755,6 +932,17 @@ class MuonUSB:
         loop = asyncio.get_running_loop()
         self.task = loop.create_task(self._run_job(job, req))
         return {'job_id': job['id']}
+
+    def _view(self, request: WebRequest) -> Any:
+        """The caller's file rights (muon_access), or None when no access
+        model applies to this request."""
+        try:
+            from .. import muon_access_policy as access
+        except ImportError:
+            return None
+        return access.usb_view(getattr(request, 'transport', None),
+                               request.get_ip_address(),
+                               request.get_current_user())
 
     async def _handle_job(self, request: WebRequest) -> Optional[Dict[str, Any]]:
         return self.job_snapshot(full=True)
@@ -781,7 +969,9 @@ class MuonUSB:
         loop = asyncio.get_running_loop()
         self._ejecting = True
         try:
-            await loop.run_in_executor(None, getattr(os, 'sync', lambda: None))
+            # One filesystem, not a global sync: other disks and the print's own
+            # SD card writes are none of this request's business.
+            await loop.run_in_executor(None, syncfs, self.root / stick)
             await self._db_machine().do_service_action(
                 'stop', self.mount_unit(info['dev']))
             deadline = loop.time() + self.eject_timeout
@@ -796,6 +986,18 @@ class MuonUSB:
 
     # -- read-write window -------------------------------------------------
 
+    async def _unit_state(self, unit: str) -> Optional[str]:
+        """The unit's ActiveState, or None when it cannot be asked."""
+        query = getattr(self._db_machine(), 'unit_active_state', None)
+        if query is None:
+            return None
+        try:
+            state = await query(unit)
+        except Exception:
+            logging.exception('USB: could not read the state of %s', unit)
+            return None
+        return state if isinstance(state, str) else None
+
     async def _wait_rw(self, stick: str, want: bool) -> bool:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.rw_timeout
@@ -807,42 +1009,160 @@ class MuonUSB:
                 return False
             await asyncio.sleep(min(0.2, max(0.01, self.rw_timeout / 10)))
 
+    async def _wait_active(self, stick: str, unit: str) -> str:
+        """Wait until the rw unit is ACTIVE (its start finished) and the mount
+        really is rw. 'ok', 'failed' (the unit failed: the filesystem refused
+        rw, definitive) or 'timeout' (not yet: nothing is known)."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.rw_timeout
+        while True:
+            state = await self._unit_state(unit)
+            if state == 'failed':
+                return 'failed'
+            info = self.mount_info().get(stick)
+            if info is None:
+                return 'timeout'
+            if info['rw'] and state in (None, 'active'):
+                return 'ok'
+            if loop.time() >= deadline:
+                return 'timeout'
+            await asyncio.sleep(min(0.2, max(0.01, self.rw_timeout / 10)))
+
+    def _mark_read_only(self, dev: str) -> None:
+        """A definitive failure: this device cannot be written until replugged."""
+        self._ro_devs.add(dev)
+
     async def _enter_rw(self, stick: str) -> str:
-        """Remount the stick rw. Returns '' or the failure reason."""
+        """Remount the stick rw. Returns '' or the failure reason. Only a
+        definitive refusal marks the device read_only; a timeout does not, so
+        the next job may try again."""
         info = self.mount_info().get(stick)
         if info is None:
             return 'stick_removed'
         if self.stick_read_only(info):
             return 'read_only'
         dev = info['dev']
+        unit = self.rw_unit(dev)
+        verdict = 'timeout'
         try:
-            await self._db_machine().do_service_action('start', self.rw_unit(dev))
-            ok = await self._wait_rw(stick, True)
+            await self._db_machine().do_service_action('start', unit)
+            verdict = await self._wait_active(stick, unit)
         except Exception:
             logging.exception('USB rw remount failed')
-            ok = False
-        if not ok:
-            self._ro_devs.add(dev)
-            await self._leave_rw(stick, dev)
+        if verdict == 'ok':
+            self._rw_stick = stick
+            return ''
+        await self._leave_rw(stick, dev)
+        if verdict == 'failed':
+            self._mark_read_only(dev)
             return 'read_only'
-        self._rw_stick = stick
-        return ''
+        if self.mount_info().get(stick) is None:
+            return 'stick_removed'
+        logging.warning('USB stick %s did not go read-write in time; '
+                        'it stays writable for the next job', stick)
+        return 'write_error'
 
-    async def _leave_rw(self, stick: str, dev: Optional[str] = None) -> None:
+    async def _leave_rw(self, stick: str, dev: Optional[str] = None) -> bool:
+        """Back to read-only, verified against the mount table. A stick that
+        stays rw gets a stop-start-stop cycle; if that fails too it is logged
+        and reported as fault 'stuck_rw'. True when the stick is read-only (or
+        gone)."""
         self._rw_stick = None
         if dev is None:
             info = self.mount_info().get(stick)
             dev = info['dev'] if info else self._dev_hint
         if not dev:
-            return
-        try:
-            await self._db_machine().do_service_action('stop', self.rw_unit(dev))
-            if not await self._wait_rw(stick, False):
-                logging.error('USB stick %s did not return to read-only', stick)
-        except Exception:
-            logging.exception('USB ro remount failed')
+            return True
+        unit = self.rw_unit(dev)
+        for cycle in range(LEAVE_CYCLES):
+            try:
+                machine = self._db_machine()
+                if cycle:
+                    await machine.do_service_action('start', unit)
+                    await self._wait_active(stick, unit)
+                await machine.do_service_action('stop', unit)
+                if await self._wait_rw(stick, False):
+                    self._faults.pop(stick, None)
+                    return True
+            except Exception:
+                logging.exception('USB ro remount failed')
+        info = self.mount_info().get(stick)
+        if info is None or not info['rw']:
+            self._faults.pop(stick, None)
+            return True
+        logging.error('USB stick %s is STILL READ-WRITE after %d stop cycles',
+                      stick, LEAVE_CYCLES)
+        self._faults[stick] = STUCK_RW
+        return False
 
     _dev_hint: Optional[str] = None
+
+    async def component_init(self) -> None:
+        await self.startup_read_only()
+
+    async def startup_read_only(self) -> None:
+        """Moonraker (re)started: no rw window may outlive the process that
+        opened it. Stop any live muon-usb-rw@ unit and check every stick is ro."""
+        try:
+            mounts = self.mount_info()
+        except Exception:
+            logging.exception('USB: could not read the mount table')
+            return
+        for name, info in sorted(mounts.items()):
+            dev = info['dev']
+            if not DEVICE_NAME.fullmatch(dev):
+                continue
+            unit = self.rw_unit(dev)
+            try:
+                state = await self._unit_state(unit)
+                if state in LIVE_STATES or (state is None and info['rw']):
+                    await self._db_machine().do_service_action('stop', unit)
+            except Exception:
+                logging.exception('USB: could not stop %s', unit)
+        for name, info in sorted(self.mount_info().items()):
+            if DEVICE_NAME.fullmatch(info['dev']) and not (
+                    await self._wait_rw(name, False)):
+                await self._leave_rw(name, info['dev'])
+
+    # -- metadata of copied files ------------------------------------------
+
+    def _metadata_storage(self) -> Any:
+        fm = self.server.lookup_component('file_manager')
+        getter = getattr(fm, 'get_metadata_storage', None)
+        return getter() if getter is not None else None
+
+    def _defer_metadata(self, prefix: str) -> None:
+        storage = self._metadata_storage()
+        defer = getattr(storage, 'defer_prefix', None)
+        if defer is not None:
+            defer(prefix)
+            self._deferred.add(prefix)
+
+    def _release_metadata(self) -> None:
+        storage = self._metadata_storage()
+        release = getattr(storage, 'release_prefix', None)
+        for prefix in list(self._deferred):
+            self._deferred.discard(prefix)
+            if release is not None:
+                with contextlib.suppress(Exception):
+                    release(prefix)
+
+    def _release_metadata_when_idle(self) -> None:
+        """The job ended: parse what it copied now, or, if a print is running,
+        as soon as it is over."""
+        if not self._deferred:
+            return
+        if not self._printing():
+            self._release_metadata()
+            return
+        if self._release_task is not None and not self._release_task.done():
+            return
+
+        async def wait() -> None:
+            while self._printing():
+                await asyncio.sleep(self.defer_poll)
+            self._release_metadata()
+        self._release_task = asyncio.get_running_loop().create_task(wait())
 
     # -- the job -------------------------------------------------------------
 
@@ -852,6 +1172,7 @@ class MuonUSB:
         outcome = 'done'
         rw = False
         thread_done: Optional[asyncio.Future] = None
+        deferred = ''
         try:
             if req['direction'] == 'to_usb':
                 info = self.mount_info().get(stick)
@@ -863,6 +1184,14 @@ class MuonUSB:
                 else:
                     rw = True
             if outcome == 'done':
+                if req['direction'] == 'to_printer':
+                    self.record_dest(req['dest_parts'])
+                    # The copied files are not parsed for metadata while the
+                    # copy runs (nor while a print runs): that is CPU on the
+                    # printer's own board.
+                    prefix = '/'.join(req['dest_parts']) + '/'
+                    self._defer_metadata(prefix)
+                    deferred = prefix
                 with self._lock:
                     job['state'] = 'running'
                     job['started_at'] = time.time()
@@ -892,6 +1221,8 @@ class MuonUSB:
         finally:
             if rw:
                 await self._leave_rw(stick)
+            if deferred:
+                self._release_metadata_when_idle()
             with self._lock:
                 job['state'] = outcome
                 job['ended_at'] = time.time()
@@ -926,7 +1257,8 @@ class MuonUSB:
         return Path(gcodes)
 
     def _walk(self, shown: str, real: Path, rel: List[str], depth_ok: Any,
-              out: List[Dict[str, Any]], seen: set) -> None:
+              out: List[Dict[str, Any]], seen: set,
+              visible: Any = None) -> None:
         try:
             with os.scandir(real) as entries:
                 listing = sorted(entries, key=lambda e: e.name)
@@ -943,9 +1275,15 @@ class MuonUSB:
             if stat.S_ISDIR(info.st_mode):
                 if depth_ok(child_rel):
                     self._walk(shown + '/' + entry.name if shown else entry.name,
-                               Path(entry.path), child_rel, depth_ok, out, seen)
+                               Path(entry.path), child_rel, depth_ok, out, seen,
+                               visible)
             elif (stat.S_ISREG(info.st_mode)
                   and Path(entry.name).suffix.lower() in VALID_GCODE_EXTS):
+                # A file the caller could not see in a listing is not copied
+                # (and not mentioned): other accounts' drives, private uploads.
+                if visible is not None and not visible(
+                        (shown + '/' + entry.name) if shown else entry.name):
+                    continue
                 self._add_entry(out, seen, shown, entry.name, Path(entry.path),
                                 child_rel, info.st_size)
 
@@ -962,6 +1300,7 @@ class MuonUSB:
         entries: List[Dict[str, Any]] = []
         skipped: List[Dict[str, Any]] = []
         seen: set = set()
+        view = req.get('view')
         for item, parts in zip(req['items'], req['src_parts']):
             if req['direction'] == 'to_printer':
                 shown = 'usb/' + '/'.join(parts)
@@ -994,8 +1333,11 @@ class MuonUSB:
                     skipped.append({'path': shown or '/', 'reason': 'read_error'})
                 elif target.is_dir():
                     self._walk(shown, target, list(parts),
-                               lambda r: len(r) <= MAX_DEPTH, entries, seen)
+                               lambda r: len(r) <= MAX_DEPTH, entries, seen,
+                               view.readable if view is not None else None)
                 elif Path(parts[-1]).suffix.lower() in VALID_GCODE_EXTS:
+                    if view is not None and not view.readable(shown):
+                        continue
                     self._add_entry(entries, seen, '/'.join(parts[:-1]), parts[-1],
                                     target, list(parts), target.stat().st_size)
                 else:
@@ -1047,6 +1389,11 @@ class MuonUSB:
         gcodes = self._gcodes()
         base = self.root / stick if to_usb else gcodes
         outcome = 'done'
+        if to_usb:
+            # Leftovers of an interrupted job: only our own temp names, only in
+            # the stick's top level (and each folder this job writes into),
+            # only files older than this job.
+            self.sweep_folder(base, job['started_at'])
         for position, entry in enumerate(eligible):
             index = entry['index']
             try:
@@ -1058,6 +1405,10 @@ class MuonUSB:
                 outcome = 'cancelled'
                 break
             except CopyError as err:
+                if err.reason == 'read_only' and to_usb:
+                    # EROFS on a write: the stick refuses writes. Definitive.
+                    dev = (self.mount_info().get(stick) or {}).get('dev')
+                    self._mark_read_only(dev or self._dev_hint or '')
                 self._set_item(job, index, 'failed', err.reason)
                 self._fail(job, entry['path'], err.reason)
                 if err.fatal:
@@ -1146,6 +1497,9 @@ class MuonUSB:
                     raise CopyError('no_space', True)
                 full_rel = entry['full_rel']
                 folder = self._make_dir(base, full_rel[:-1])
+                if to_usb and folder not in job['_swept']:
+                    job['_swept'].add(folder)
+                    self.sweep_folder(folder, job['started_at'])
                 name = full_rel[-1]
                 final = folder / name
                 exists = os.path.lexists(final)
@@ -1153,6 +1507,13 @@ class MuonUSB:
                     return self._skip_item(job, entry, 'exists')
                 if exists and (final.is_dir() or final.is_symlink()):
                     return self._skip_item(job, entry, 'name_invalid')
+                if exists and req['on_conflict'] == 'replace' and not to_usb:
+                    shown_rel = '/'.join(full_rel)
+                    if self._printing_file() == shown_rel:
+                        return self._skip_item(job, entry, 'in_use')
+                    view = req.get('view')
+                    if view is not None and not view.may_replace(shown_rel):
+                        return self._skip_item(job, entry, 'exists')
                 if not exists or req['on_conflict'] == 'rename':
                     with os.scandir(folder) as scan:
                         count = sum(1 for _ in scan)
@@ -1161,9 +1522,12 @@ class MuonUSB:
                 if exists and req['on_conflict'] == 'rename':
                     stem, suffix = Path(name).stem, Path(name).suffix
                     number = 1
-                    while os.path.lexists(folder / f'{stem} ({number}){suffix}'):
+                    while os.path.lexists(folder / fit_name(
+                            stem, f' ({number}){suffix}', to_usb)):
                         number += 1
-                    name = f'{stem} ({number}){suffix}'
+                    name = fit_name(stem, f' ({number}){suffix}', to_usb)
+                    if to_usb and fat_name_problem(name):
+                        return self._skip_item(job, entry, 'name_invalid')
                     final = folder / name
                     with self._lock:
                         job['items'][index]['dest'] = (
@@ -1175,6 +1539,7 @@ class MuonUSB:
                 except OSError as err:
                     raise self._classify(err, stick) if err.errno != errno.EACCES \
                         else CopyError('write_error')
+                unsynced = 0
                 with os.fdopen(fd, 'wb') as output:
                     while True:
                         if self._cancel.is_set():
@@ -1199,6 +1564,14 @@ class MuonUSB:
                             job['items'][index]['bytes_done'] = done
                         self._touch(index)
                         self._pace(len(data))
+                        if self._printing():
+                            # Dirty pages must not pile up behind the print's own
+                            # writes on the SD card: flush as we go.
+                            unsynced += len(data)
+                            if unsynced >= self.sync_every:
+                                output.flush()
+                                getattr(os, 'fdatasync', os.fsync)(output.fileno())
+                                unsynced = 0
                     output.flush()
                     os.fsync(output.fileno())
                 try:

@@ -36,7 +36,8 @@ omitted. Not following any symlinks also makes traversal cycle-safe.
   the flat `/server/files/list` stops at 10000 files. Only real mountpoints
   count as sticks. Printing needs free space of file size plus 256 MB on the
   printer, otherwise HTTP 507 "Not enough space on the printer". Leftover
-  `.usb-*` temporary copies are removed at startup.
+  `.usb-<32 hex>` temporary copies are removed at startup, however deep below
+  `gcodes/usb-import/` and in any custom `dest` used before.
 * `GET /server/files/list?root=usb` returns the standard flat file list:
   ```json
   [{"path":"Demo/part.gcode","size":1234,"modified":1700000001.0,"permissions":"r"}]
@@ -94,9 +95,13 @@ A folder item expands to its printable files, recursively, to depth 4.
 
 * `GET /server/muon/usb/status` gains, per stick, `dev`, `unit`
   (`muon-usb-mount@<dev>.service`), `fs`, `free_bytes`, `total_bytes`,
-  `writable` (true only during a `to_usb` job) and `read_only` (never
-  writable: write-protect switch, unsupported filesystem, or a failed rw
-  remount until the stick is replugged). Top level: `job` and
+  `writable` (the real rw flag from `/proc/self/mountinfo`; true only during a
+  `to_usb` job unless something is wrong), `read_only` (never writable:
+  write-protect switch, unsupported filesystem, or a definitive failure: EROFS
+  on a write, or the rw unit failed; a timeout alone is NOT read_only and the
+  next job retries) and `fault: "stuck_rw"` (present only when the stick is
+  still rw after a stop-start-stop cycle). At startup any live
+  `muon-usb-rw@*.service` is stopped and every stick is checked ro. Top level: `job` and
   `ejected: [{name, at}]` (ejected, still plugged in: "Safe to remove").
 * `GET /server/muon/usb/list?path=&offset=&limit=` keeps the `dirs`/`files`
   split. Files carry `size` and `modified`, dirs `modified`. Entries are sorted
@@ -105,20 +110,36 @@ A folder item expands to its printable files, recursively, to depth 4.
   page does not reach the end of the folder.
 * `GET /server/muon/usb/file?path=` streams a printable file: `Content-Length`,
   `Accept-Ranges: bytes`, one `Range` (206), `Content-Disposition:
-  attachment; filename*=UTF-8''<name>`, an `ETag` from mtime and size
-  (`If-None-Match` gives 304). Anything that is not exactly one satisfiable
-  range (malformed, reversed, past the end, multi-range) is 416 with
+  attachment; filename*=UTF-8''<name>`, an `ETag` from mtime and size and a
+  `Last-Modified` (`If-None-Match` gives 304). `If-Range` (the ETag or the exact
+  `Last-Modified`) that no longer matches sends the whole file (200). A
+  multi-range or a unit other than `bytes` also sends the whole file (200). A
+  single bytes range that is malformed, reversed or past the end is 416 with
   `Content-Range: bytes */<size>`. Read in 256 KiB chunks at ionice idle class.
 * `POST /server/muon/usb/copy {direction, stick, items, dest?, on_conflict?}`
   returns `{job_id}`; 409 while another job runs; 400 for bad paths. One job at
-  a time, run in its own thread at ionice idle class, limited to about 8 MB/s
-  while the printer prints or is paused. Each file goes to a hidden `.usb-<uuid>`
+  a time, run in its own thread at ionice idle class, limited to about 2 MB/s
+  while the printer prints or is paused, with an `fdatasync` every 4 MB then, so
+  dirty pages do not pile up on the SD card. Metadata extraction of copied
+  files is held until the job ends (or the print ends, if one is running).
+  Each file goes to a hidden `.usb-<uuid>`
   name, is fsynced, renamed, and the folder is fsynced; a source that changed
   while copying is `source_changed`. Cancel removes the in-flight temp file and
   keeps finished files.
   * `to_usb` first starts the root unit `muon-usb-rw@<dev>.service` (remount
     rw), and always stops it again in a `finally` block (remount ro, sync). A
     stick that cannot be remounted fails the job at once with `read_only`.
+    The unit is only a remount. Moonraker waits until it is ACTIVE, then removes
+    only `.usb-<32 hex>[.suffix]` files older than the job, in the stick's top
+    level and in each folder the job writes into. On the way out the mount table
+    is checked; a stick still rw gets one stop-start-stop cycle, then the
+    `stuck_rw` fault.
+  * `to_printer` `dest` is checked as an upload is (in accounts mode the copy
+    lands in the caller's own drive, never another's). `on_conflict: replace`
+    needs the files permission (files_others for another account's upload) and
+    never replaces the file being printed (`in_use`). `to_usb` walks (`"/"`,
+    folders) only include files the caller could see in a file listing.
+    A renamed `name (n).ext` is cut to fit the 255-unit name limit.
   * Skipped (job continues): `name_invalid` (FAT-illegal characters
     `<>:"\|?*`, over 255 UTF-16 units, trailing dot or space, deeper than 4
     folders), `too_large` (over 4 GiB on vfat), `exists` (`on_conflict: skip`),
@@ -130,7 +151,7 @@ A folder item expands to its printable files, recursively, to depth 4.
   second plus once at the end; past 200 items it carries `item` (the one that
   changed) and the totals instead of `items`.
 * `POST /server/muon/usb/job/cancel {job_id}`; the job ends as `cancelled`.
-* `POST /server/muon/usb/eject {stick}`: sync, then stop
+* `POST /server/muon/usb/eject {stick}`: `syncfs` of that stick only, then stop
   `muon-usb-mount@<dev>.service`. 409 `{reason: "job_running", job_id}` (in the
   HTTP error object, and as `extra` over WebSocket) while a job runs.
 
