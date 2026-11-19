@@ -755,6 +755,12 @@ class AuxAutoProxy:
             if "challenge_id" in args:
                 return await self._dev_mode_answer(args["challenge_id"])
             return await self._dev_mode_who_may_ask(webreq)
+        # KAN-4754: with no [muon_access] loaded, check_access enforces
+        # nothing, so this is the only gate a Protected printer has.
+        if policy.state() is None:
+            decision = self._no_policy_decision(webreq)
+            if not decision.allowed:
+                raise policy.refusal(decision)
         enabled = args.get("enabled")
         if not isinstance(enabled, bool):
             raise self.server.error("'enabled' must be true or false", 400)
@@ -770,6 +776,45 @@ class AuxAutoProxy:
         except Exception:
             logging.exception("Could not read the protection level")
             return False
+
+    def _no_policy_decision(self, webreq) -> "policy.Decision":
+        """Who may ask for developer mode when no [muon_access] is loaded.
+
+        KAN-4754. Every image ships muon_access unloaded (MuonOS #355), so
+        policy.state() is None and check_access lets everything through; the
+        muon_floor's has_identity also counts any home-network address, and
+        this route is not on the floor. So the handler decides, from the
+        floor level, and the GET's may_ask and the POST both read it:
+
+        * Open: anyone, as the table says for an Open printer (D-166).
+        * Protected or stricter (or the level unreadable): the table's own
+          rule for a Protected printer with an owner -- the printer's panel
+          (localhost, or an in-process caller), or a paired device that
+          muon-link forwards with an admin principal. A guest, a member,
+          the printer password and an unidentified home-network caller are
+          refused, exactly as they are when a policy is loaded.
+        """
+        action = policy.ACTIONS["dev_mode_request"]
+        if self._floor_is_open():
+            return policy.Decision(True, action.name)
+        stand_in = policy.AccessState(
+            entry=policy.ENTRY_PROTECTED, owner=policy.OWNER_ACCOUNT)
+        get_user = getattr(webreq, "get_current_user", None)
+        principal = policy.resolve_principal(
+            getattr(webreq, "transport", None),
+            webreq.get_ip_address(),
+            get_user() if callable(get_user) else None,
+            stand_in.entry,
+            stand_in.home,
+        )
+        decision = policy.decide_action(action, principal, stand_in)
+        if decision.allowed:
+            return decision
+        return policy.Decision(
+            False, action.name,
+            "this printer is Protected and no access policy is loaded, so "
+            "only its panel or its owner's paired device may ask for "
+            "developer mode: " + decision.reason)
 
     async def _link_phase(self):
         """(linked, account) from muon-link's GET /link, the same answer
@@ -815,10 +860,11 @@ class AuxAutoProxy:
         # The same decision the POST makes. KAN-4753 (D-166): the table
         # lets anyone ask while the printer is Open, owner known or not.
         if state is None:
-            # No [muon_access] loaded: check_access enforces nothing, so the
-            # POST is held only by the floor, and the floor level is the
-            # answer (Sloe, 17.1.1: policy absent, level Open).
-            may_ask = self._floor_is_open()
+            # No [muon_access] loaded: check_access enforces nothing, and
+            # the floor does not hold this route, so the POST handler decides
+            # (KAN-4754). Asking the same function keeps GET and POST in
+            # step (Sloe, 17.1.1: policy absent, level Open: anyone).
+            may_ask = self._no_policy_decision(webreq).allowed
         else:
             may_ask = policy.decide_action(
                 policy.ACTIONS["dev_mode_request"], principal, state).allowed

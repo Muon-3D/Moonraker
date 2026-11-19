@@ -714,3 +714,138 @@ class TestAStrangerSeesNoEmailAndCannotComplete:
                        _GatewayRequest("GET", ip=LAN))
         assert (out["as_owner"], out["may_ask"]) == (False, True)
         assert out["owner"]["account"] == "owner@example.com"
+
+
+# --------------------------------------------------------------------------
+# KAN-4754: no [muon_access] loaded (every image today) on a Protected printer
+# --------------------------------------------------------------------------
+
+class TestNoPolicyLoaded:
+    """policy.state() is None, so check_access enforces nothing and the floor
+    treats any home-network address as having an identity. The route is not on
+    the floor, so the handler itself must hold a Protected printer's POST."""
+
+    ROUTES = {
+        "/dev_mode/request": _Answered({"enabled": True}),
+        "/dev_mode/waiver": _Answered(WAIVER),
+    }
+
+    @staticmethod
+    def level(level: int) -> None:
+        policy.set_state(None)
+        muon_floor.set_protection_level(level)
+
+    def post(self, ip, user, args=None, transport=HTTP):
+        return call(self.ROUTES, _GatewayRequest(
+            "POST", {"enabled": True} if args is None else args,
+            ip=ip, user=user, transport=transport))
+
+    def get(self, ip, user):
+        out, _c = call(self.ROUTES, _GatewayRequest("GET", ip=ip, user=user))
+        return out["may_ask"]
+
+    GUESTS = {
+        "stranger at home": (LAN, None),
+        "hotspot": (HOTSPOT, None),
+        "printer password": (LAN, PASSWORD_USER),
+        "signed-out guest": (SENTINEL, gateway("signed_out_guest", "operator")),
+        "member": (SENTINEL, gateway("member", "operator")),
+        "owner as a viewer": (SENTINEL, gateway("admin", "viewer")),
+    }
+
+    @pytest.mark.parametrize("who", sorted(GUESTS))
+    def test_protected_refuses_a_guest_post_with_403(self, who):
+        self.level(muon_floor.LEVEL_PROTECTED)
+        ip, user = self.GUESTS[who]
+        proxy, server, client = make_proxy(AuxStub(self.ROUTES))
+        handler = server.handler_for(ENDPOINT)
+        with pytest.raises(ServerError) as err:
+            asyncio.run(handler(_GatewayRequest(
+                "POST", {"enabled": True}, ip=ip, user=user)))
+        assert err.value.status_code == 403
+        assert "Protected" in str(err.value)
+        assert "dev_mode_request" in str(err.value)
+        assert client.paths() == []  # never reached Aux
+
+    def test_protected_refuses_completing_a_challenge_too(self):
+        self.level(muon_floor.LEVEL_PROTECTED)
+        proxy, server, client = make_proxy(AuxStub(self.ROUTES))
+        with pytest.raises(ServerError) as err:
+            asyncio.run(server.handler_for(ENDPOINT)(_GatewayRequest(
+                "POST", {"enabled": True, "challenge_id": CHALLENGE,
+                         "waiver_acknowledged": True, "waiver_version": "v"},
+                ip=LAN)))
+        assert err.value.status_code == 403
+        assert client.paths() == []
+
+    def test_protected_lets_the_panel_ask(self):
+        self.level(muon_floor.LEVEL_PROTECTED)
+        out, client = self.post(LOOPBACK, TRUSTED_USER)
+        assert out == {"enabled": True}
+        assert client.paths() == ["/dev_mode/request"]
+
+    def test_protected_lets_an_in_process_caller_ask(self):
+        self.level(muon_floor.LEVEL_PROTECTED)
+        internal = type("_T", (), {"transport_type": type(
+            "_N", (), {"name": "INTERNAL"})()})()
+        out, _c = self.post(None, None, transport=internal)
+        assert out == {"enabled": True}
+
+    def test_protected_lets_a_paired_owner_device_ask(self):
+        self.level(muon_floor.LEVEL_PROTECTED)
+        out, client = self.post(SENTINEL, gateway("admin", "operator"))
+        assert out == {"enabled": True}
+        assert client.paths() == ["/dev_mode/request"]
+
+    @pytest.mark.parametrize("who", ["anyone", "guest", "member", "password"])
+    def test_open_lets_anyone_ask(self, who):
+        self.level(muon_floor.LEVEL_OPEN)
+        ip, user = {
+            "anyone": (LAN, None),
+            "guest": (SENTINEL, gateway("signed_out_guest", "operator")),
+            "member": (SENTINEL, gateway("member", "operator")),
+            "password": (LAN, PASSWORD_USER),
+        }[who]
+        out, _c = self.post(ip, user)
+        assert out == {"enabled": True}
+
+    @pytest.mark.parametrize("level", [muon_floor.LEVEL_OPEN,
+                                       muon_floor.LEVEL_PROTECTED])
+    @pytest.mark.parametrize("who", sorted(GUESTS) + ["panel", "owner"])
+    def test_get_may_ask_and_post_agree(self, level, who):
+        self.level(level)
+        ip, user = {**self.GUESTS,
+                    "panel": (LOOPBACK, TRUSTED_USER),
+                    "owner": (SENTINEL, gateway("admin", "operator"))}[who]
+        proxy, server, _c = make_proxy(AuxStub(self.ROUTES))
+        try:
+            asyncio.run(server.handler_for(ENDPOINT)(_GatewayRequest(
+                "POST", {"enabled": True}, ip=ip, user=user)))
+            posted = True
+        except ServerError as err:
+            assert err.status_code == 403
+            posted = False
+        assert self.get(ip, user) is posted
+
+    def test_an_unreadable_level_fails_closed(self, monkeypatch):
+        policy.set_state(None)
+
+        def boom():
+            raise RuntimeError("no level")
+        monkeypatch.setattr(muon_floor, "protection_level", boom)
+        with pytest.raises(ServerError) as err:
+            self.post(LAN, None)
+        assert err.value.status_code == 403
+
+    def test_a_loaded_policy_is_unchanged(self):
+        """With muon_access loaded the handler adds nothing: the table (via
+        check_access) decides, as before."""
+        printer(PROTECTED, LINKED)
+        out, _c = self.post(LAN, None)  # handler alone: no second gate
+        assert out == {"enabled": True}
+        assert self.get(LAN, None) is False
+        assert ask(LAN, None) is not None
+        assert ask(SENTINEL, gateway("admin", "operator")) is None
+        printer(OPEN, LINKED)
+        assert ask(LAN, None) is None
+        assert self.get(LAN, None) is True
