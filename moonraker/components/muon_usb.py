@@ -215,9 +215,8 @@ class MuonUSB:
         data_path = Path(self.server.get_app_args()['data_path'])
         self.state_path = data_path / 'muon_usb_state.json'
         self.sync_every = SYNC_EVERY
-        self.defer_poll = 5.0
-        self._deferred: set = set()
-        self._release_task: Optional[asyncio.Task] = None
+        self._exiting = False
+        self._startup_task: Optional[asyncio.Task] = None
         self.cleanup_temporaries()
         self.ensure_root()
         endpoints = (('status', RequestType.GET), ('list', RequestType.GET),
@@ -789,9 +788,49 @@ class MuonUSB:
     # copy jobs
     # ------------------------------------------------------------------
 
-    def job_snapshot(self, full: bool = False) -> Optional[Dict[str, Any]]:
+    @staticmethod
+    def _private_job(view: Any) -> bool:
+        """The job's names must not be broadcast: accounts mode, and an owner
+        who is not the whole-printer admin."""
+        if view is None:
+            return False
+        try:
+            from .. import muon_access_files as files
+            return (getattr(view.scope, 'data_mode', None) == files.ACCOUNTS
+                    and not files.is_admin(view.principal))
+        except Exception:
+            return True
+
+    @staticmethod
+    def _redact(job: Dict[str, Any], result: Dict[str, Any]) -> None:
+        """Basenames only (of files the job owner could see). A to_printer
+        job's source paths are on the stick and stay as they are. Every dest is cut
+        to the basename (it holds the owner's drive, or the gcodes path)."""
+        def base(path: Any) -> Any:
+            return path.rsplit('/', 1)[-1] if isinstance(path, str) else path
+        to_printer = job['direction'] == 'to_printer'
+
+        def item(i: Dict[str, Any]) -> Dict[str, Any]:
+            i = dict(i)
+            i['dest'] = base(i.get('dest'))
+            if not to_printer:
+                i['path'] = base(i.get('path'))
+            return i
+        if 'items' in result:
+            result['items'] = [item(i) for i in result['items']]
+        if 'item' in result:
+            result['item'] = item(result['item'])
+        if not to_printer:
+            for key in ('skipped', 'errors'):
+                result[key] = [dict(e, path=base(e.get('path')))
+                               for e in result[key]]
+            result['current'] = base(result.get('current'))
+
+    def job_snapshot(self, full: bool = False,
+                     redact: bool = False) -> Optional[Dict[str, Any]]:
         """The job object as clients see it. Past 200 items, and unless `full`,
-        only the item that changed last is carried, with the totals."""
+        only the item that changed last is carried, with the totals. `redact`
+        (the broadcast) drops names another account could not see."""
         with self._lock:
             job = self.job
             if job is None:
@@ -805,6 +844,8 @@ class MuonUSB:
                 result['items'] = [dict(i) for i in items]
             elif 0 <= job.get('_last', -1) < len(items):
                 result['item'] = dict(items[job['_last']])
+            if redact and job.get('_private'):
+                self._redact(job, result)
             return result
 
     def _touch(self, index: Optional[int] = None) -> None:
@@ -818,7 +859,7 @@ class MuonUSB:
         with self._lock:
             if self.job is not None:
                 self.job['_dirty'] = False
-        payload = self.job_snapshot()
+        payload = self.job_snapshot(redact=True)
         if payload is not None:
             self.server.send_event('muon_usb:job', payload)
 
@@ -924,6 +965,7 @@ class MuonUSB:
                'bytes_total': 0, 'bytes_done': 0, 'current': None,
                'skipped': [], 'errors': [], 'items': [],
                'started_at': None, 'ended_at': None, '_last': -1,
+               '_private': self._private_job(view),
                '_swept': set()}
         self._cancel.clear()
         self._debt = 0.0
@@ -1009,15 +1051,41 @@ class MuonUSB:
                 return False
             await asyncio.sleep(min(0.2, max(0.01, self.rw_timeout / 10)))
 
-    async def _wait_active(self, stick: str, unit: str) -> str:
-        """Wait until the rw unit is ACTIVE (its start finished) and the mount
-        really is rw. 'ok', 'failed' (the unit failed: the filesystem refused
-        rw, definitive) or 'timeout' (not yet: nothing is known)."""
+    def _mark_read_only(self, dev: str) -> None:
+        """A definitive failure (EROFS on a write): this device cannot be
+        written until replugged."""
+        self._ro_devs.add(dev)
+
+    async def _start_rw(self, unit: str) -> bool:
+        """ResetFailedUnit, then StartUnit. A `failed` state left by an earlier
+        run would otherwise be read as this start's verdict. Returns whether the
+        reset went through (when it did not, a failed state is not definitive
+        until something else has been seen)."""
+        machine = self._db_machine()
+        reset = True
+        try:
+            await machine.do_service_action('reset-failed', unit)
+        except Exception:
+            reset = False
+            logging.warning('USB: could not reset %s', unit)
+        await machine.do_service_action('start', unit)
+        return reset
+
+    async def _wait_active(self, stick: str, unit: str,
+                           reset: bool = True) -> str:
+        """Wait for the rw unit's start JOB to finish: ActiveState leaves
+        `activating` and the mount really is rw. 'ok', 'failed' (the unit failed
+        after the reset: the start itself failed) or 'timeout' (nothing is
+        known). A `failed` seen before anything else, with no successful reset,
+        is a leftover and does not count."""
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.rw_timeout
+        fresh = reset
         while True:
             state = await self._unit_state(unit)
-            if state == 'failed':
+            if state is not None and state != 'failed':
+                fresh = True
+            if state == 'failed' and fresh:
                 return 'failed'
             info = self.mount_info().get(stick)
             if info is None:
@@ -1028,14 +1096,11 @@ class MuonUSB:
                 return 'timeout'
             await asyncio.sleep(min(0.2, max(0.01, self.rw_timeout / 10)))
 
-    def _mark_read_only(self, dev: str) -> None:
-        """A definitive failure: this device cannot be written until replugged."""
-        self._ro_devs.add(dev)
-
     async def _enter_rw(self, stick: str) -> str:
-        """Remount the stick rw. Returns '' or the failure reason. Only a
-        definitive refusal marks the device read_only; a timeout does not, so
-        the next job may try again."""
+        """Remount the stick rw. Returns '' or the failure reason. This path
+        never marks the device read_only (only EROFS on a write or a
+        write-protect switch do): a failed or slow start is a write_error and
+        the next job tries again."""
         info = self.mount_info().get(stick)
         if info is None:
             return 'stick_removed'
@@ -1045,28 +1110,28 @@ class MuonUSB:
         unit = self.rw_unit(dev)
         verdict = 'timeout'
         try:
-            await self._db_machine().do_service_action('start', unit)
-            verdict = await self._wait_active(stick, unit)
+            reset = await self._start_rw(unit)
+            verdict = await self._wait_active(stick, unit, reset)
         except Exception:
             logging.exception('USB rw remount failed')
         if verdict == 'ok':
             self._rw_stick = stick
             return ''
         await self._leave_rw(stick, dev)
-        if verdict == 'failed':
-            self._mark_read_only(dev)
-            return 'read_only'
         if self.mount_info().get(stick) is None:
             return 'stick_removed'
-        logging.warning('USB stick %s did not go read-write in time; '
-                        'it stays writable for the next job', stick)
+        logging.warning('USB stick %s did not go read-write (%s); '
+                        'the next job tries again', stick, verdict)
         return 'write_error'
 
     async def _leave_rw(self, stick: str, dev: Optional[str] = None) -> bool:
-        """Back to read-only, verified against the mount table. A stick that
-        stays rw gets a stop-start-stop cycle; if that fails too it is logged
-        and reported as fault 'stuck_rw'. True when the stick is read-only (or
-        gone)."""
+        """Back to read-only, verified against the mount table. Every cycle
+        starts with the stop and ends on a stop (the unit's ExecStop and
+        ExecStopPost do the ro), so a Moonraker that dies mid-cycle leaves at
+        worst a started unit, which the startup cleanup stops. A stick that
+        stays rw gets a start-stop retry; if that fails too it is logged and
+        reported as fault 'stuck_rw'. True when the stick is read-only (or
+        gone). While Moonraker is exiting it is one stop, no verification."""
         self._rw_stick = None
         if dev is None:
             info = self.mount_info().get(stick)
@@ -1074,13 +1139,24 @@ class MuonUSB:
         if not dev:
             return True
         unit = self.rw_unit(dev)
+        if self._exiting:
+            try:
+                await self._db_machine().do_service_action('stop', unit)
+            except Exception:
+                logging.exception('USB ro remount failed at exit')
+            return True
         for cycle in range(LEAVE_CYCLES):
             try:
                 machine = self._db_machine()
                 if cycle:
-                    await machine.do_service_action('start', unit)
-                    await self._wait_active(stick, unit)
-                await machine.do_service_action('stop', unit)
+                    try:
+                        reset = await self._start_rw(unit)
+                        await self._wait_active(stick, unit, reset)
+                    finally:
+                        # never end the cycle on a start
+                        await machine.do_service_action('stop', unit)
+                else:
+                    await machine.do_service_action('stop', unit)
                 if await self._wait_rw(stick, False):
                     self._faults.pop(stick, None)
                     return True
@@ -1098,7 +1174,16 @@ class MuonUSB:
     _dev_hint: Optional[str] = None
 
     async def component_init(self) -> None:
-        await self.startup_read_only()
+        # Not awaited: Moonraker's startup must not wait on systemd. A to_usb
+        # job waits for it before opening its own window.
+        self._startup_task = asyncio.get_running_loop().create_task(
+            self._startup_guarded())
+
+    async def _startup_guarded(self) -> None:
+        try:
+            await self.startup_read_only()
+        except Exception:
+            logging.exception('USB: startup read-only check failed')
 
     async def startup_read_only(self) -> None:
         """Moonraker (re)started: no rw window may outlive the process that
@@ -1124,46 +1209,6 @@ class MuonUSB:
                     await self._wait_rw(name, False)):
                 await self._leave_rw(name, info['dev'])
 
-    # -- metadata of copied files ------------------------------------------
-
-    def _metadata_storage(self) -> Any:
-        fm = self.server.lookup_component('file_manager')
-        getter = getattr(fm, 'get_metadata_storage', None)
-        return getter() if getter is not None else None
-
-    def _defer_metadata(self, prefix: str) -> None:
-        storage = self._metadata_storage()
-        defer = getattr(storage, 'defer_prefix', None)
-        if defer is not None:
-            defer(prefix)
-            self._deferred.add(prefix)
-
-    def _release_metadata(self) -> None:
-        storage = self._metadata_storage()
-        release = getattr(storage, 'release_prefix', None)
-        for prefix in list(self._deferred):
-            self._deferred.discard(prefix)
-            if release is not None:
-                with contextlib.suppress(Exception):
-                    release(prefix)
-
-    def _release_metadata_when_idle(self) -> None:
-        """The job ended: parse what it copied now, or, if a print is running,
-        as soon as it is over."""
-        if not self._deferred:
-            return
-        if not self._printing():
-            self._release_metadata()
-            return
-        if self._release_task is not None and not self._release_task.done():
-            return
-
-        async def wait() -> None:
-            while self._printing():
-                await asyncio.sleep(self.defer_poll)
-            self._release_metadata()
-        self._release_task = asyncio.get_running_loop().create_task(wait())
-
     # -- the job -------------------------------------------------------------
 
     async def _run_job(self, job: Dict[str, Any], req: Dict[str, Any]) -> None:
@@ -1172,9 +1217,13 @@ class MuonUSB:
         outcome = 'done'
         rw = False
         thread_done: Optional[asyncio.Future] = None
-        deferred = ''
         try:
             if req['direction'] == 'to_usb':
+                task = self._startup_task
+                if task is not None and not task.done():
+                    # The startup cleanup stops stale rw units: it must not
+                    # stop the one this job is about to start.
+                    await asyncio.wait({task})
                 info = self.mount_info().get(stick)
                 self._dev_hint = info['dev'] if info else None
                 reason = await self._enter_rw(stick)
@@ -1186,12 +1235,6 @@ class MuonUSB:
             if outcome == 'done':
                 if req['direction'] == 'to_printer':
                     self.record_dest(req['dest_parts'])
-                    # The copied files are not parsed for metadata while the
-                    # copy runs (nor while a print runs): that is CPU on the
-                    # printer's own board.
-                    prefix = '/'.join(req['dest_parts']) + '/'
-                    self._defer_metadata(prefix)
-                    deferred = prefix
                 with self._lock:
                     job['state'] = 'running'
                     job['started_at'] = time.time()
@@ -1221,8 +1264,6 @@ class MuonUSB:
         finally:
             if rw:
                 await self._leave_rw(stick)
-            if deferred:
-                self._release_metadata_when_idle()
             with self._lock:
                 job['state'] = outcome
                 job['ended_at'] = time.time()
@@ -1614,8 +1655,15 @@ class MuonUSB:
     # ------------------------------------------------------------------
 
     async def on_exit(self) -> None:
-        # Moonraker stopping mid-copy: the job's finally block returns the stick
-        # to read-only before the process goes (the rw unit also BindsTo us).
+        # Moonraker stopping mid-copy: fire the stop of the rw unit and go (its
+        # ExecStop and ExecStopPost remount ro); no verify-retry loop here.
+        # StopPropagatedFrom= on the unit covers a `systemctl stop` of Moonraker
+        # but NOT a restart: that is covered by the startup cleanup, which stops
+        # any stale muon-usb-rw@ unit.
+        self._exiting = True
+        stick = self._rw_stick
+        if stick is not None:
+            await self._leave_rw(stick)
         task = self.task
         if task is not None and not task.done():
             task.cancel()

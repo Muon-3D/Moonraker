@@ -1266,6 +1266,9 @@ class SystemdDbusProvider(BaseProvider):
         elif action == "restart":
             await mgr.call_restart_unit(                        # type: ignore
                 service_name, "replace")
+        elif action == "reset-failed":
+            # MUON: clears a `failed` state before the USB rw unit starts
+            await mgr.call_reset_failed_unit(service_name)      # type: ignore
         else:
             raise self.server.error(f"Invalid service action: {action}")
 

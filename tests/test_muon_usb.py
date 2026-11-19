@@ -115,6 +115,10 @@ class Machine:
             if kind == 'muon-usb-rw' and action == 'stop' and self.stuck.get(dev, 0):
                 self.stuck[dev] -= 1
                 continue
+            if action == 'reset-failed':
+                if self.states.get(unit) == 'failed':
+                    del self.states[unit]
+                continue
             if kind == 'muon-usb-rw' and not (self.rw_fails and action == 'start'):
                 mount['rw'] = action == 'start'
             if kind == 'muon-usb-mount' and action == 'stop':
@@ -577,7 +581,8 @@ def test_rw_window_wraps_to_usb_job_only(usb: Any) -> None:
     usb._copy_file = spy
     job = do_copy(usb, direction='to_usb', stick='Demo', items=['/'])
     assert job['state'] == 'done' and seen == [(True, True)]
-    assert usb.machine.calls == [('start', 'muon-usb-rw@sda1.service'),
+    assert usb.machine.calls == [('reset-failed', 'muon-usb-rw@sda1.service'),
+                                 ('start', 'muon-usb-rw@sda1.service'),
                                  ('stop', 'muon-usb-rw@sda1.service')]
     assert usb.mounts['Demo']['rw'] is False
     assert usb.status()['sticks'][0]['writable'] is False
@@ -594,16 +599,17 @@ def test_finally_returns_to_ro_after_failure(usb: Any) -> None:
     assert usb.mounts['Demo']['rw'] is False
 
 
-def test_rw_unit_failed_is_read_only_until_replug(usb: Any) -> None:
-    # A unit that FAILED is a filesystem that refused rw: definitive.
+def test_rw_unit_failed_is_a_write_error_not_read_only(usb: Any) -> None:
+    # A stale failed state is reset before the start; this path never marks
+    # the device read_only (only EROFS or a write-protect switch do).
     printer_gcode(usb, 'p.gcode')
     usb.machine.rw_fails = True
     usb.machine.states['muon-usb-rw@sda1.service'] = 'failed'
     usb.rw_timeout = 0.05
     job = do_copy(usb, direction='to_usb', stick='Demo', items=['/'])
     assert job['state'] == 'failed'
-    assert reasons(job['errors'])[0][1] == 'read_only'
-    assert usb.status()['sticks'][0]['read_only'] is True
+    assert reasons(job['errors'])[0][1] == 'write_error'
+    assert usb.status()['sticks'][0]['read_only'] is False
     assert usb.machine.calls[-1][0] == 'stop'
 
 
@@ -1115,11 +1121,17 @@ def temp_name(char: str = 'a', suffix: str = '') -> str:
 
 # -- 5: startup ------------------------------------------------------------
 
+async def init(usb: Any) -> None:
+    await usb.component_init()
+    assert usb._startup_task is not None        # a background task, not awaited inline
+    await usb._startup_task
+
+
 def test_startup_stops_live_rw_window_and_checks_every_stick(usb: Any) -> None:
     usb.mounts['Demo']['rw'] = True            # Moonraker died mid-copy
     gcode(usb, 'Demo/a.gcode')
     gcode(usb, 'Other/b.gcode')
-    asyncio.run(usb.component_init())
+    asyncio.run(init(usb))
     assert ('stop', RW_UNIT) in usb.machine.calls
     assert ('stop', 'muon-usb-rw@sdb1.service') not in usb.machine.calls   # inactive
     assert all(not m['rw'] for m in usb.mounts.values())
@@ -1131,7 +1143,7 @@ def test_startup_stuck_rw_is_a_fault(usb: Any) -> None:
     gcode(usb, 'Demo/a.gcode')
     usb.machine.stuck['sda1'] = 99
     usb.rw_timeout = 0.05
-    asyncio.run(usb.component_init())
+    asyncio.run(init(usb))
     stick = usb.status()['sticks'][0]
     assert stick['writable'] is True and stick['fault'] == 'stuck_rw'
 
@@ -1152,7 +1164,7 @@ def test_leave_rw_retries_stop_start_stop(usb: Any) -> None:
     usb.machine.stuck['sda1'] = 1               # the first stop does not take
     usb.rw_timeout = 0.05
     assert asyncio.run(usb._leave_rw('Demo', 'sda1')) is True
-    assert [c[0] for c in usb.machine.calls] == ['stop', 'start', 'stop']
+    assert [c[0] for c in usb.machine.calls] == ['stop', 'reset-failed', 'start', 'stop']
     assert usb.mounts['Demo']['rw'] is False and 'Demo' not in usb._faults
 
 
@@ -1356,7 +1368,7 @@ def test_rw_unit_start_is_not_asked_to_sweep(usb: Any) -> None:
     usb.sweep_folder = spy
     do_copy(usb, direction='to_usb', stick='Demo', items=['/'])
     assert seen and all(rw for rw, _ in seen)
-    assert seen[0][1] == [('start', RW_UNIT)]
+    assert seen[0][1] == [('reset-failed', RW_UNIT), ('start', RW_UNIT)]
 
 
 def test_startup_cleans_to_printer_temps_recursively_and_in_recorded_dests(tmp_path: Path) -> None:
@@ -1417,89 +1429,6 @@ def test_eject_flushes_that_filesystem_only(usb: Any, monkeypatch: Any, tmp_path
     assert flushed == [usb.root / 'Demo']
 
 
-class Storage:
-    def __init__(self) -> None:
-        self.deferred: list = []
-        self.released: list = []
-
-    def defer_prefix(self, prefix: str) -> None:
-        self.deferred.append(prefix)
-
-    def release_prefix(self, prefix: str) -> None:
-        self.released.append(prefix)
-
-
-def with_storage(usb: Any) -> Storage:
-    storage = Storage()
-    usb.server.components['file_manager'].get_metadata_storage = lambda: storage
-    return storage
-
-
-def test_metadata_is_held_during_the_job_and_released_when_it_ends(usb: Any) -> None:
-    storage = with_storage(usb)
-    gcode(usb, 'Demo/a.gcode')
-    seen = []
-    original = usb._copy_file
-    def spy(*args: Any, **kwargs: Any) -> Any:
-        seen.append((list(storage.deferred), list(storage.released)))
-        return original(*args, **kwargs)
-    usb._copy_file = spy
-    do_copy(usb, direction='to_printer', stick='Demo', items=['usb/Demo'], dest='mine/x')
-    assert seen == [(['mine/x/'], [])]
-    assert storage.released == ['mine/x/']
-
-
-def test_metadata_waits_for_the_print_to_end(usb: Any) -> None:
-    storage = with_storage(usb)
-    gcode(usb, 'Demo/a.gcode')
-    state = {'state': 'printing'}
-    usb.server.components['job_state'].get_last_stats = lambda: state
-    usb.defer_poll = 0.01
-    usb._sleep = lambda s: None
-    async def run() -> None:
-        await usb._handle_copy(copy_request(direction='to_printer', stick='Demo',
-                                            items=['usb/Demo']))
-        await usb.task
-        await asyncio.sleep(0.05)
-        assert storage.deferred == ['usb-import/Demo/'] and storage.released == []
-        state['state'] = 'complete'
-        for _ in range(100):
-            if storage.released:
-                break
-            await asyncio.sleep(0.01)
-        assert storage.released == ['usb-import/Demo/']
-    (usb.root / 'Demo').mkdir(exist_ok=True)
-    asyncio.run(run())
-
-
-def test_to_usb_defers_no_metadata(usb: Any) -> None:
-    storage = with_storage(usb)
-    printer_gcode(usb, 'p.gcode')
-    do_copy(usb, direction='to_usb', stick='Demo', items=['/'])
-    assert storage.deferred == [] and storage.released == []
-
-
-def test_metadata_storage_holds_and_releases_a_prefix() -> None:
-    from moonraker.components.file_manager.file_manager import MetadataStorage
-    storage = MetadataStorage.__new__(MetadataStorage)
-    started = []
-    storage.pending_requests, storage.busy, storage.metadata = {}, False, {}
-    storage.deferred_prefixes, storage.deferred = [], {}
-    storage._has_valid_data = lambda fname, info: False        # type: ignore[method-assign]
-    storage.server = SimpleNamespace(get_event_loop=lambda: SimpleNamespace(
-        register_callback=lambda cb: started.append(cb)))
-    storage.defer_prefix('usb-import/')
-    held = storage.parse_metadata('usb-import/a.gcode', {})
-    other = storage.parse_metadata('up/b.gcode', {})
-    assert not held.is_set() and list(storage.pending_requests) == ['up/b.gcode']
-    assert list(storage.deferred) == ['usb-import/a.gcode']
-    storage.busy = False
-    storage.release_prefix('usb-import/')
-    assert sorted(storage.pending_requests) == ['up/b.gcode', 'usb-import/a.gcode']
-    assert storage.deferred == {} and storage.busy and len(started) == 2
-    assert other is not held
-
-
 # -- 11: Range, If-Range ----------------------------------------------------
 
 def test_if_range_etag_and_date_and_ignored_ranges(usb: Any) -> None:
@@ -1547,3 +1476,121 @@ def test_renamed_copy_to_usb_is_re_checked_and_truncated(usb: Any, monkeypatch: 
     assert len(written) == 1 and written[0].endswith(' (1).g')
     assert len(written[0].encode('utf-16-le')) // 2 <= 40
     assert job['items'][0]['dest'].endswith(written[0])
+
+
+# -- round 2: no metadata deferral, shutdown, reset-failed, redaction --------
+
+def test_file_manager_has_no_deferral_hooks() -> None:
+    from moonraker.components.file_manager.file_manager import MetadataStorage
+    for name in ('defer_prefix', 'release_prefix', 'deferred', 'deferred_prefixes'):
+        assert not hasattr(MetadataStorage, name)
+    assert not hasattr(muon_usb.MuonUSB, '_release_metadata_when_idle')
+
+
+def test_to_printer_copy_never_touches_metadata_storage(usb: Any) -> None:
+    called: list = []
+    storage = SimpleNamespace(parse_metadata=lambda *a: called.append(a))
+    usb.server.components['file_manager'].get_metadata_storage = lambda: storage
+    gcode(usb, 'Demo/a.gcode')
+    job = do_copy(usb, direction='to_printer', stick='Demo', items=['usb/Demo'])
+    assert job['state'] == 'done' and called == []
+
+
+def test_start_resets_a_failed_unit_first(usb: Any) -> None:
+    printer_gcode(usb, 'p.gcode')
+    usb.machine.states[RW_UNIT] = 'failed'              # left from before
+    job = do_copy(usb, direction='to_usb', stick='Demo', items=['/'])
+    calls = [c[0] for c in usb.machine.calls if c[1] == RW_UNIT]
+    assert calls[:2] == ['reset-failed', 'start']
+    assert job['state'] == 'done' and (usb.root / 'Demo/p.gcode').exists()
+
+
+def test_failed_state_with_no_reset_is_not_definitive(usb: Any) -> None:
+    usb.rw_timeout = 0.05
+    gcode(usb, 'Demo/a.gcode')
+    usb.machine.states[RW_UNIT] = 'failed'
+    assert asyncio.run(usb._wait_active('Demo', RW_UNIT, reset=False)) == 'timeout'
+    assert asyncio.run(usb._wait_active('Demo', RW_UNIT, reset=True)) == 'failed'
+
+
+def test_failed_start_is_write_error_and_never_read_only(usb: Any) -> None:
+    printer_gcode(usb, 'p.gcode')
+    usb.rw_timeout = 0.05
+    orig = usb.machine.do_service_action
+
+    async def failing(action: str, unit: str) -> None:
+        await orig(action, unit)
+        if action == 'start' and unit == RW_UNIT:
+            usb.machine.states[unit] = 'failed'
+    usb.machine.do_service_action = failing
+    job = do_copy(usb, direction='to_usb', stick='Demo', items=['/'])
+    assert job['state'] == 'failed' and reasons(job['errors'])[0][1] == 'write_error'
+    assert usb.status()['sticks'][0]['read_only'] is False
+
+
+def test_leave_rw_cycles_start_with_and_end_on_a_stop(usb: Any) -> None:
+    gcode(usb, 'Demo/a.gcode')
+    usb.mounts['Demo']['rw'] = True
+    usb.machine.stuck['sda1'] = 99
+    usb.rw_timeout = 0.05
+    asyncio.run(usb._leave_rw('Demo', 'sda1'))
+    actions = [c[0] for c in usb.machine.calls if c[0] != 'reset-failed']
+    assert actions[0] == 'stop' and actions[-1] == 'stop'
+    for i, act in enumerate(actions):
+        if act == 'start':
+            assert actions[i + 1] == 'stop'
+
+
+def test_on_exit_fires_one_stop_without_the_retry_loop(usb: Any) -> None:
+    gcode(usb, 'Demo/a.gcode')
+    usb.mounts['Demo']['rw'] = True
+    usb._rw_stick = 'Demo'
+    usb.machine.stuck['sda1'] = 99                       # a stop that would not take
+    usb.rw_timeout = 5                                   # a loop would wait this long
+    asyncio.run(usb.on_exit())
+    assert [c for c in usb.machine.calls if c[1] == RW_UNIT] == [('stop', RW_UNIT)]
+
+
+def test_component_init_does_not_wait_for_the_startup_check(usb: Any) -> None:
+    usb.mounts['Demo']['rw'] = True
+    gcode(usb, 'Demo/a.gcode')
+
+    async def run() -> None:
+        await usb.component_init()
+        assert usb.machine.calls == []                   # nothing done inline
+        await usb._startup_task
+        assert ('stop', RW_UNIT) in usb.machine.calls
+    asyncio.run(run())
+
+
+def _notifications(usb: Any, direction: str, who: Any) -> Any:
+    scope = access_files.FileScope({}, data_mode='accounts')
+    usb._view = lambda request: view_for(scope, who)
+    usb.notify_interval = 0
+    if direction == 'to_usb':
+        printer_gcode(usb, 'a/bob/mine.gcode')
+        do_copy(usb, direction='to_usb', stick='Demo', items=['a/bob'])
+    else:
+        gcode(usb, 'Demo/sub/a.gcode')
+        do_copy(usb, direction='to_printer', stick='Demo', items=['usb/Demo'])
+    return [args[0] for ev, args in usb.server.events if ev == 'muon_usb:job']
+
+
+def test_notification_to_usb_in_accounts_mode_has_basenames_only(usb: Any) -> None:
+    events = _notifications(usb, 'to_usb', member('bob'))
+    text = repr(events)
+    assert events and 'a/bob' not in text and 'mine.gcode' in text
+    assert events[-1]['files_total'] == 1
+    # the job endpoint is not redacted
+    assert usb.job_snapshot(full=True)['items'][0]['path'] == 'a/bob/mine.gcode'
+
+
+def test_notification_to_usb_for_the_admin_keeps_paths(usb: Any) -> None:
+    events = _notifications(usb, 'to_usb', policy.PANEL_PRINCIPAL)
+    assert 'a/bob/mine.gcode' in repr(events)
+
+
+def test_notification_to_printer_keeps_usb_paths_but_not_the_drive(usb: Any) -> None:
+    events = _notifications(usb, 'to_printer', member('bob'))
+    text = repr(events)
+    assert 'usb/Demo/sub/a.gcode' in text and 'a/bob' not in text

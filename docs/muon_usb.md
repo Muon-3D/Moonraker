@@ -98,10 +98,11 @@ A folder item expands to its printable files, recursively, to depth 4.
   `writable` (the real rw flag from `/proc/self/mountinfo`; true only during a
   `to_usb` job unless something is wrong), `read_only` (never writable:
   write-protect switch, unsupported filesystem, or a definitive failure: EROFS
-  on a write, or the rw unit failed; a timeout alone is NOT read_only and the
+  on a write; a failed or slow rw unit is a `write_error`, NOT read_only, and the
   next job retries) and `fault: "stuck_rw"` (present only when the stick is
-  still rw after a stop-start-stop cycle). At startup any live
-  `muon-usb-rw@*.service` is stopped and every stick is checked ro. Top level: `job` and
+  still rw after a stop-start-stop cycle). After startup (a background task, not
+  awaited) any live `muon-usb-rw@*.service` is stopped and every stick is checked
+  ro; a `to_usb` job waits for that check first. Top level: `job` and
   `ejected: [{name, at}]` (ejected, still plugged in: "Safe to remove").
 * `GET /server/muon/usb/list?path=&offset=&limit=` keeps the `dirs`/`files`
   split. Files carry `size` and `modified`, dirs `modified`. Entries are sorted
@@ -120,8 +121,8 @@ A folder item expands to its printable files, recursively, to depth 4.
   returns `{job_id}`; 409 while another job runs; 400 for bad paths. One job at
   a time, run in its own thread at ionice idle class, limited to about 2 MB/s
   while the printer prints or is paused, with an `fdatasync` every 4 MB then, so
-  dirty pages do not pile up on the SD card. Metadata extraction of copied
-  files is held until the job ends (or the print ends, if one is running).
+  dirty pages do not pile up on the SD card. Copied files get their metadata
+  parsed as an upload's do (no deferral).
   Each file goes to a hidden `.usb-<uuid>`
   name, is fsynced, renamed, and the folder is fsynced; a source that changed
   while copying is `source_changed`. Cancel removes the in-flight temp file and
@@ -129,11 +130,20 @@ A folder item expands to its printable files, recursively, to depth 4.
   * `to_usb` first starts the root unit `muon-usb-rw@<dev>.service` (remount
     rw), and always stops it again in a `finally` block (remount ro, sync). A
     stick that cannot be remounted fails the job at once with `read_only`.
-    The unit is only a remount. Moonraker waits until it is ACTIVE, then removes
+    The unit is only a remount. Before each start Moonraker calls
+    ResetFailedUnit, then waits for the start job to finish (ActiveState leaves
+    `activating`; a `failed` left from before the reset does not count), then removes
     only `.usb-<32 hex>[.suffix]` files older than the job, in the stick's top
     level and in each folder the job writes into. On the way out the mount table
-    is checked; a stick still rw gets one stop-start-stop cycle, then the
-    `stuck_rw` fault.
+    is checked; a stick still rw gets one start-stop retry (every cycle starts and
+    ends with a stop), then the `stuck_rw` fault. On shutdown Moonraker fires one
+    stop of the unit and returns (no verification); `StopPropagatedFrom=` on the
+    unit covers a `systemctl stop` of Moonraker, a restart is covered by the
+    startup cleanup.
+  * The `muon_usb:job` notification names only what the viewers may know: for
+    `to_printer`, the stick paths; for `to_usb` the item paths only when the job's
+    owner is the whole-printer admin or accounts mode is off, otherwise basenames
+    of files the owner can see (counts are always sent). `GET /job` is unchanged.
   * `to_printer` `dest` is checked as an upload is (in accounts mode the copy
     lands in the caller's own drive, never another's). `on_conflict: replace`
     needs the files permission (files_others for another account's upload) and
