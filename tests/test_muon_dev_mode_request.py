@@ -856,9 +856,13 @@ class TestNoPolicyLoaded:
 # --------------------------------------------------------------------------
 
 AUX_DEV_MODE = "/server/aux/dev_mode"
-AUX_SPEC = {"paths": {"/dev_mode": {
-    "get": {}, "post": {"requestBody": {}}, "put": {"requestBody": {}},
-    "delete": {}}}}
+AUX_SUBPATHS = ["/dev_mode/refresh", "/dev_mode/backup",
+                "/dev_mode/consent", "/dev_mode/reentry/revoke"]
+AUX_SPEC = {"paths": {
+    "/dev_mode": {"get": {}, "post": {"requestBody": {}},
+                  "put": {"requestBody": {}}, "delete": {}},
+    **{p: {"get": {}, "post": {}, "patch": {}} for p in AUX_SUBPATHS},
+}}
 
 
 class TestAuxDevModeWithoutPolicy:
@@ -866,17 +870,18 @@ class TestAuxDevModeWithoutPolicy:
     nothing gates it and the floor excludes it, so a guest holding a confirmed
     challenge id could change the mode past the dev_mode/request gate."""
 
-    ROUTES = {"/dev_mode": _Answered({"enabled": True})}
+    ROUTES = {p: _Answered({"enabled": True})
+              for p in ["/dev_mode"] + AUX_SUBPATHS}
 
     @staticmethod
     def level(level: int) -> None:
         policy.set_state(None)
         muon_floor.set_protection_level(level)
 
-    def proxy(self):
+    def proxy(self, route=AUX_DEV_MODE):
         proxy, server, client = make_proxy(AuxStub(self.ROUTES))
         proxy._register_from_spec(AUX_SPEC)
-        return server.handler_for(AUX_DEV_MODE), client
+        return server.handler_for(route), client
 
     def send(self, verb, ip, user, transport=HTTP):
         handler, client = self.proxy()
@@ -953,3 +958,54 @@ class TestAuxDevModeWithoutPolicy:
         out, client = self.send("POST", LAN, None)
         assert out == {"enabled": True}
         assert client.paths() == ["/dev_mode"]
+
+    @pytest.mark.parametrize("sub", AUX_SUBPATHS)
+    @pytest.mark.parametrize("verb", ["POST", "PATCH"])
+    @pytest.mark.parametrize("who", ["stranger at home", "signed-out guest",
+                                     "member"])
+    def test_protected_refuses_a_guest_on_every_subpath(self, who, verb, sub):
+        self.level(muon_floor.LEVEL_PROTECTED)
+        ip, user = TestNoPolicyLoaded.GUESTS[who]
+        handler, client = self.proxy("/server/aux" + sub)
+        with pytest.raises(ServerError) as err:
+            asyncio.run(handler(_GatewayRequest(verb, ip=ip, user=user)))
+        assert err.value.status_code == 403
+        assert client.paths() == []
+
+    @pytest.mark.parametrize("sub", ["/dev_mode/refresh", "/dev_mode/backup"])
+    def test_protected_lets_the_panel_and_owner_device_use_a_subpath(self, sub):
+        self.level(muon_floor.LEVEL_PROTECTED)
+        for ip, user in [(LOOPBACK, TRUSTED_USER),
+                         (SENTINEL, gateway("admin", "operator"))]:
+            handler, client = self.proxy("/server/aux" + sub)
+            asyncio.run(handler(_GatewayRequest("POST", ip=ip, user=user)))
+            assert client.paths() == [sub]
+
+    @pytest.mark.parametrize("sub", ["/dev_mode/refresh", "/dev_mode/backup"])
+    def test_open_lets_a_guest_use_a_subpath(self, sub):
+        self.level(muon_floor.LEVEL_OPEN)
+        handler, client = self.proxy("/server/aux" + sub)
+        asyncio.run(handler(_GatewayRequest("POST", ip=LAN)))
+        assert client.paths() == [sub]
+
+    @pytest.mark.parametrize("sub", AUX_SUBPATHS)
+    def test_a_subpath_get_stays_readable_on_protected(self, sub):
+        self.level(muon_floor.LEVEL_PROTECTED)
+        handler, client = self.proxy("/server/aux" + sub)
+        asyncio.run(handler(_GatewayRequest("GET", ip=LAN)))
+        assert client.paths() == [sub]
+
+    def test_a_loaded_policy_leaves_a_subpath_to_the_policy(self):
+        printer(PROTECTED, LINKED)
+        handler, client = self.proxy("/server/aux/dev_mode/refresh")
+        asyncio.run(handler(_GatewayRequest("POST", ip=LAN)))
+        assert client.paths() == ["/dev_mode/refresh"]
+
+    def test_a_non_dev_mode_route_is_not_gated(self):
+        self.level(muon_floor.LEVEL_PROTECTED)
+        proxy, server, client = make_proxy(AuxStub(
+            {"/dev_modeX": _Answered({})}))
+        proxy._register_from_spec({"paths": {"/dev_modeX": {"post": {}}}})
+        asyncio.run(server.handler_for("/server/aux/dev_modeX")(
+            _GatewayRequest("POST", ip=LAN)))
+        assert client.paths() == ["/dev_modeX"]

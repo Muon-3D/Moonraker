@@ -51,8 +51,16 @@ _PATH_PARAM_RE = re.compile(r"\{[^}]+\}")
 # access row is delegated to Aux, so a mirror of /dev_mode/request would let any
 # admitted client skip the owner rule that guards /server/muon/dev_mode/request.
 INTERNAL_ONLY_AUX_PATHS = frozenset({"/dev_mode/request"})
-# KAN-4768: the Aux route that actually changes developer mode.
-DEV_MODE_GATED_PATHS = frozenset({"/dev_mode"})
+# KAN-4768: every Aux route under /dev_mode changes developer mode or its
+# working copy (/dev_mode, /consent, /refresh, /backup, /reentry/revoke, and
+# any later subpath), and Aux checks no caller on some of them. Prefix match.
+DEV_MODE_GATED_PREFIX = "/dev_mode"
+_READ_VERBS = frozenset({"GET", "HEAD"})
+
+
+def _is_dev_mode_path(fast_path: str) -> bool:
+    return (fast_path == DEV_MODE_GATED_PREFIX
+            or fast_path.startswith(DEV_MODE_GATED_PREFIX + "/"))
 
 # KAN-3603: the Aux API's own ZONE_NAME (time_routes.py), copied. Aux still
 # checks that tzdata carries the zone; this keeps junk from being forwarded.
@@ -440,13 +448,13 @@ class AuxAutoProxy:
     def _make_static_handler(self, fast_path: str) -> Callable:
         async def handler(webreq):
             method = webreq.get_action()  # e.g. "POST"
-            # KAN-4768: /server/aux/dev_mode is the call that turns developer
-            # mode on or off. With no [muon_access] loaded (every image today)
+            # KAN-4768: /server/aux/dev_mode (and every route under it) changes
+            # developer mode. With no [muon_access] loaded (every image today)
             # nothing else gates it and the floor excludes it, so it gets the
             # same decision as the dev_mode/request POST (KAN-4754). A GET
             # stays a read; with a policy loaded the policy decides.
-            if (fast_path in DEV_MODE_GATED_PATHS
-                    and method in ("POST", "PUT", "DELETE")
+            if (_is_dev_mode_path(fast_path)
+                    and method.upper() not in _READ_VERBS
                     and policy.state() is None):
                 decision = self._no_policy_decision(webreq)
                 if not decision.allowed:
