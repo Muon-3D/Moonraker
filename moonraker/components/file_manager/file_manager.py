@@ -2663,6 +2663,11 @@ class MetadataStorage:
         self.pending_requests: Dict[
             str, Tuple[Dict[str, Any], asyncio.Event]] = {}
         self.busy: bool = False
+        # MUON: folders whose new files are parsed later (a USB copy job is
+        # running, or a print is: the parser is CPU on the printer's board).
+        self.deferred_prefixes: List[str] = []
+        self.deferred: Dict[
+            str, Tuple[Dict[str, Any], asyncio.Event]] = {}
         self.processors: Dict[str, Dict[str, Any]] = {}
 
     def prune_storage(self) -> None:
@@ -2876,6 +2881,9 @@ class MetadataStorage:
             # request already pending or not necessary
             mevt.set()
             return mevt
+        if any(fname.startswith(p) for p in self.deferred_prefixes):
+            self.deferred[fname] = (path_info, mevt)
+            return mevt
         self.pending_requests[fname] = (path_info, mevt)
         if self.busy:
             return mevt
@@ -2883,6 +2891,25 @@ class MetadataStorage:
         event_loop = self.server.get_event_loop()
         event_loop.register_callback(self._process_metadata_update)
         return mevt
+
+    def defer_prefix(self, prefix: str) -> None:
+        """Hold metadata extraction for files below `prefix` (relative to
+        gcodes, ending in '/') until release_prefix()."""
+        if prefix not in self.deferred_prefixes:
+            self.deferred_prefixes.append(prefix)
+
+    def release_prefix(self, prefix: str) -> None:
+        if prefix in self.deferred_prefixes:
+            self.deferred_prefixes.remove(prefix)
+        for fname in [f for f in self.deferred
+                      if f.startswith(prefix)
+                      and not any(f.startswith(p)
+                                  for p in self.deferred_prefixes)]:
+            self.pending_requests[fname] = self.deferred.pop(fname)
+        if self.pending_requests and not self.busy:
+            self.busy = True
+            self.server.get_event_loop().register_callback(
+                self._process_metadata_update)
 
     async def _process_metadata_update(self) -> None:
         while self.pending_requests:

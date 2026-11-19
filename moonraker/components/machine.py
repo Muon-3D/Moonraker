@@ -322,6 +322,11 @@ class Machine:
                                 ) -> None:
         await self.sys_provider.do_service_action(action, service_name)
 
+    async def unit_active_state(self, service_name: str) -> Optional[str]:
+        """The unit's ActiveState (active, inactive, failed ...), or None when
+        the provider cannot tell. MUON: the USB rw window waits for `active`."""
+        return await self.sys_provider.unit_active_state(service_name)
+
     def restart_moonraker_service(self):
         async def wrapper():
             try:
@@ -963,6 +968,9 @@ class BaseProvider:
                                 ) -> None:
         raise self.server.error("Service Actions Not Available", 503)
 
+    async def unit_active_state(self, service_name: str) -> Optional[str]:
+        return None
+
     async def check_virt_status(self) -> Dict[str, Any]:
         return {
             'virt_type': "unknown",
@@ -1001,6 +1009,16 @@ class SystemdCliProvider(BaseProvider):
                                 service_name: str
                                 ) -> None:
         await self._exec_sudo_command(f"systemctl {action} {service_name}")
+
+    async def unit_active_state(self, service_name: str) -> Optional[str]:
+        if not service_name.endswith(".service"):
+            service_name += ".service"
+        try:
+            resp: str = await self.shell_cmd.exec_cmd(
+                f"systemctl show -p ActiveState --value {service_name}")
+        except self.shell_cmd.error:
+            return None
+        return resp.strip() or None
 
     async def check_virt_status(self) -> Dict[str, Any]:
         # Fallback virtualization check
@@ -1250,6 +1268,22 @@ class SystemdDbusProvider(BaseProvider):
                 service_name, "replace")
         else:
             raise self.server.error(f"Invalid service action: {action}")
+
+    async def unit_active_state(self, service_name: str) -> Optional[str]:
+        if not self.dbus_mgr.is_connected():
+            return None
+        if not service_name.endswith(".service"):
+            service_name += ".service"
+        try:
+            path = await self.systemd_mgr.call_get_unit(  # type: ignore
+                service_name)
+        except Exception:
+            return "inactive"           # not loaded: nothing started it
+        unit = await self.dbus_mgr.get_interface(
+            "org.freedesktop.systemd1", path,
+            "org.freedesktop.systemd1.Unit")
+        state: str = await unit.get_active_state()  # type: ignore
+        return state
 
     async def check_virt_status(self) -> Dict[str, Any]:
         if not self.dbus_mgr.is_connected():
