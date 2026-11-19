@@ -396,7 +396,9 @@ class MuonUSB:
         finally:
             os.close(fd)
 
-    def _scan(self, path: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], bool]:
+    def _scan(
+        self, path: str
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], bool]:
         target = self.resolve(path)
         if not target.is_dir():
             raise ServerError('The USB directory is no longer available.', 404)
@@ -840,7 +842,8 @@ class MuonUSB:
             if job is None:
                 return None
             result = {k: v for k, v in job.items()
-                      if not k.startswith('_') and k not in ('items', 'skipped', 'errors')}
+                      if not k.startswith('_')
+                      and k not in ('items', 'skipped', 'errors')}
             result['skipped'] = [dict(e) for e in job['skipped']]
             result['errors'] = [dict(e) for e in job['errors']]
             items = job['items']
@@ -1343,7 +1346,9 @@ class MuonUSB:
         out.append({'path': (shown + '/' + name) if shown else name,
                     'real': real, 'rel': rel, 'size': size})
 
-    def _plan(self, req: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    def _plan(
+        self, req: Dict[str, Any]
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         entries: List[Dict[str, Any]] = []
         skipped: List[Dict[str, Any]] = []
         seen: set = set()
@@ -1480,7 +1485,8 @@ class MuonUSB:
             job['items'][index]['error'] = error
         self._touch(index)
 
-    def _skip_item(self, job: Dict[str, Any], entry: Dict[str, Any], reason: str) -> None:
+    def _skip_item(self, job: Dict[str, Any], entry: Dict[str, Any],
+                   reason: str) -> None:
         with self._lock:
             item = job['items'][entry['index']]
             item.update(state='skipped', error=reason)
