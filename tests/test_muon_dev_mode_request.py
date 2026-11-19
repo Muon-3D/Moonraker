@@ -42,8 +42,21 @@ def ask(ip_addr: Any, user: Any, endpoint: str = ENDPOINT) -> Optional[str]:
     return None
 
 
+@pytest.fixture(autouse=True)
+def _floor_level():
+    saved = muon_floor.protection_level()
+    try:
+        yield
+    finally:
+        muon_floor.set_protection_level(saved)
+
+
 def printer(entry: str, owner: str, **kw: Any) -> None:
     policy.set_state(state(entry=entry, owner=owner, **kw))
+    # The protection level muon_floor holds follows the entry.
+    muon_floor.set_protection_level(
+        muon_floor.LEVEL_OPEN if entry == policy.ENTRY_OPEN
+        else muon_floor.LEVEL_PROTECTED)
 
 
 OPEN, PROTECTED = policy.ENTRY_OPEN, policy.ENTRY_PROTECTED
@@ -110,17 +123,29 @@ class TestWhoMayAsk:
         printer(OPEN, LINKED, preset="relaxed")
         assert ask(LAN, None) is None
 
+    # KAN-4753 (D-166): Open means anyone, whatever the preset or override.
     @pytest.mark.parametrize("preset", ["standard", "strict"])
-    def test_a_stricter_preset_holds_a_linked_printer_to_its_owner(self, preset):
-        printer(OPEN, LINKED, preset=preset)
+    @pytest.mark.parametrize("owner", [LINKED, policy.OWNER_UNKNOWN,
+                                       policy.OWNER_ORGANISATION])
+    def test_an_open_printer_lets_a_guest_ask_on_any_preset(self, preset, owner):
+        printer(OPEN, owner, preset=preset)
+        assert ask(LAN, None) is None
+        assert ask(SENTINEL, gateway("member", "operator")) is None
+
+    def test_an_override_does_not_hold_an_open_printer_to_its_owner(self):
+        printer(OPEN, LINKED, overrides={"dev_mode_request": policy.ADMIN})
+        assert ask(LAN, None) is None
+
+    @pytest.mark.parametrize("preset", [None, "standard", "strict"])
+    def test_protected_refuses_a_guest_on_every_preset(self, preset):
+        printer(PROTECTED, LINKED, preset=preset)
         assert ask(LAN, None) is not None
         assert ask(SENTINEL, gateway("member", "operator")) is not None
         assert ask(SENTINEL, gateway("admin", "operator")) is None
 
-    def test_an_override_can_hold_an_open_printer_to_its_owner(self):
-        printer(OPEN, LINKED, overrides={"dev_mode_request": policy.ADMIN})
-        assert ask(LAN, None) is not None
-        assert ask(SENTINEL, gateway("admin", "operator")) is None
+    def test_an_open_guest_is_still_not_admitted_from_off_the_network(self):
+        printer(OPEN, LINKED, preset="standard")
+        assert ask(PUBLIC, None) is not None
 
     def test_a_phone_still_in_bluetooth_setup_is_refused(self):
         printer(OPEN, NOBODY)
@@ -314,6 +339,71 @@ class TestGetWhoMayAsk:
         assert (out["as_owner"], out["may_ask"]) == (False, True)
         assert out["owner"] == {"linked": False, "account": None}
 
+    # KAN-4753: an Open printer never waits on knowing the owner.
+    def test_open_with_the_owner_unknown_still_lets_anyone_ask(self):
+        printer(OPEN, policy.OWNER_UNKNOWN)
+        out = self.ask_as(LAN, None)
+        assert out["may_ask"] is True
+        assert out["owner"] == {"linked": None, "account": None}
+
+    def test_open_and_unknown_reads_linked_from_muon_link(self):
+        printer(OPEN, policy.OWNER_UNKNOWN)
+        proxy, server, client = make_proxy(AuxStub(self.ROUTES))
+        proxy.server.components["muon_access"] = type(
+            "_A", (), {"owner_email": None})()
+
+        class Link:
+            async def status(self):
+                return {"phase": "linked", "account": "owner@example.com"}
+
+        proxy.server.components["muon_link"] = Link()
+        out = asyncio.run(server.handler_for(ENDPOINT)(
+            _GatewayRequest("GET", ip=LAN)))
+        assert out["may_ask"] is True
+        assert out["owner"] == {"linked": True, "account": "owner@example.com"}
+
+    @pytest.mark.parametrize("preset", ["standard", "strict"])
+    def test_get_and_post_agree_on_open_with_a_stricter_preset(self, preset):
+        printer(OPEN, LINKED, preset=preset)
+        out = self.ask_as(LAN, None)
+        assert out["may_ask"] is True
+        assert ask(LAN, None) is None
+
+    def test_get_and_post_agree_on_protected(self):
+        printer(PROTECTED, LINKED)
+        assert self.ask_as(LAN, None)["may_ask"] is False
+        assert ask(LAN, None) is not None
+
+    def test_the_link_read_is_cached_between_gets(self):
+        printer(OPEN, policy.OWNER_UNKNOWN)
+        proxy, server, client = make_proxy(AuxStub(self.ROUTES))
+        reads = []
+
+        class Link:
+            async def status(self):
+                reads.append(1)
+                return {"phase": "linked"}
+
+        proxy.server.components["muon_link"] = Link()
+        handler = server.handler_for(ENDPOINT)
+        for _ in range(3):
+            out = asyncio.run(handler(_GatewayRequest("GET", ip=LAN)))
+            assert out["owner"]["linked"] is True
+        assert len(reads) == 1
+
+    def test_open_and_linked_lets_a_guest_ask(self):
+        printer(OPEN, LINKED)
+        out = self.ask_as(LAN, None)
+        assert (out["as_owner"], out["may_ask"]) == (False, True)
+        assert out["owner"] == {"linked": True, "account": "owner@example.com"}
+
+    def test_protected_lets_the_owner_not_a_non_owner(self):
+        printer(PROTECTED, LINKED)
+        assert self.ask_as(SENTINEL, gateway("member", "operator"))[
+            "may_ask"] is False
+        assert self.ask_as(SENTINEL, gateway("admin", "operator"))[
+            "may_ask"] is True
+
     def test_the_panel_counts_as_the_owner(self):
         printer(PROTECTED, LINKED)
         out = self.ask_as(LOOPBACK, TRUSTED_USER)
@@ -330,11 +420,22 @@ class TestGetWhoMayAsk:
         assert out["owner"] == {"linked": None, "account": None}
         assert out["may_ask"] is False
 
-    def test_no_policy_loaded_asks_nothing_of_anyone(self):
+    def test_no_policy_loaded_follows_the_floor_level(self):
+        # KAN-4753: Sloe had no [muon_access], so no policy state; the POST is
+        # then held only by the floor, and the GET says the same.
         policy.set_state(None)
+        muon_floor.set_protection_level(muon_floor.LEVEL_PROTECTED)
+        assert self.ask_as(LAN, None)["may_ask"] is False
+        muon_floor.set_protection_level(muon_floor.LEVEL_OPEN)
         out = self.ask_as(LAN, None)
-        assert out["may_ask"] is False
+        assert out["may_ask"] is True
         assert out["owner"]["linked"] is None
+
+    def test_sloe_open_no_policy_local_trusted_caller_may_ask(self):
+        policy.set_state(None)
+        muon_floor.set_protection_level(muon_floor.LEVEL_OPEN)
+        out = self.ask_as(LOOPBACK, TRUSTED_USER)
+        assert out["may_ask"] is True
 
     def test_the_waiver_is_null_when_aux_has_none_to_show(self):
         printer(OPEN, NOBODY)

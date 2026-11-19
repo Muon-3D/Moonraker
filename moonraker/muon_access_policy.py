@@ -390,6 +390,11 @@ def required_level(action: Action, state: AccessState) -> int:
       the panel only where that is admin. A gap in knowing the owner never
       opens the printer more than its real owner would.
     """
+    if action.name == "dev_mode_request" and state.entry == ENTRY_OPEN:
+        # KAN-4753 (D-166, Jack): on an Open printer anyone admitted may ask
+        # for, complete and poll developer mode, whoever owns it and whatever
+        # preset or override is stored. Only Protected holds it to the owner.
+        return SIGNED_OUT_GUEST
     if state.owner == OWNER_UNKNOWN and not action.delegated:
         level = max(
             required_level(action, dataclasses.replace(state, owner=owner))

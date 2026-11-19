@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import contextlib
+import time
 import unicodedata
 from pathlib import Path
 from typing import Dict, Any, Callable, Optional
@@ -38,6 +39,10 @@ CLIENT_IP_HEADER = "X-Muon-Client-Ip"
 # Map lower-case OpenAPI keys → canonical HTTP verbs
 HTTP_VERBS = {"get": "GET", "post": "POST", "put": "PUT",
               "patch": "PATCH", "delete": "DELETE"}
+
+#: How long a muon-link read for the owner stays good, so bare GETs of
+#: /dev_mode/request do not each reach muon-link.
+LINK_CACHE_SECONDS = 10.0
 
 _PATH_PARAM_RE = re.compile(r"\{[^}]+\}")
 
@@ -205,6 +210,9 @@ MAX_NAME_LENGTH = 32
 
 
 class AuxAutoProxy:
+    #: (monotonic time, (linked, account)) of the last muon-link read.
+    _link_cache: Optional[Any] = None
+
     def __init__(self, config):
         self.server = config.get_server()
         self.http_client = self.server.lookup_component("http_client")
@@ -754,6 +762,41 @@ class AuxAutoProxy:
             return await self._dev_mode_complete(enabled, args)
         return await self._dev_mode_ask(enabled)
 
+    @staticmethod
+    def _floor_is_open() -> bool:
+        try:
+            from .. import muon_floor
+            return muon_floor.protection_level() == muon_floor.LEVEL_OPEN
+        except Exception:
+            logging.exception("Could not read the protection level")
+            return False
+
+    async def _link_phase(self):
+        """(linked, account) from muon-link's GET /link, the same answer
+        muon_access.refresh_owner reads; (None, None) when it cannot say."""
+        now = time.monotonic()
+        cached = self._link_cache
+        if cached is not None and now - cached[0] < LINK_CACHE_SECONDS:
+            return cached[1]
+        link = self.server.lookup_component("muon_link", None)
+        if link is None:
+            return None, None
+        try:
+            status = await link.status()
+        except Exception as err:
+            logging.info("Could not read the link phase: %s", err)
+            self._link_cache = (now, (None, None))
+            return None, None
+        if not isinstance(status, dict) or "phase" not in status:
+            answer = (None, None)
+        elif status.get("phase") != "linked":
+            answer = (False, None)
+        else:
+            account = status.get("account")
+            answer = (True, account if isinstance(account, str) else None)
+        self._link_cache = (now, answer)
+        return answer
+
     async def _dev_mode_who_may_ask(self, webreq) -> Dict[str, Any]:
         """GET with nothing: whether this connection is the printer's owner,
         who owns it, whether this connection may ask, and the waiver."""
@@ -769,18 +812,30 @@ class AuxAutoProxy:
                 state.home,
             )
         as_owner = principal is not None and principal.level >= policy.ADMIN
-        may_ask = state is not None and policy.decide_action(
-            policy.ACTIONS["dev_mode_request"], principal, state).allowed
+        # The same decision the POST makes. KAN-4753 (D-166): the table
+        # lets anyone ask while the printer is Open, owner known or not.
+        if state is None:
+            # No [muon_access] loaded: check_access enforces nothing, so the
+            # POST is held only by the floor, and the floor level is the
+            # answer (Sloe, 17.1.1: policy absent, level Open).
+            may_ask = self._floor_is_open()
+        else:
+            may_ask = policy.decide_action(
+                policy.ACTIONS["dev_mode_request"], principal, state).allowed
         linked: Optional[bool] = None
-        if state is not None:
-            if state.owner == policy.OWNER_NONE:
-                linked = False
-            elif state.owner != policy.OWNER_UNKNOWN:
-                linked = True
+        link_account: Optional[str] = None
+        if state is not None and state.owner == policy.OWNER_NONE:
+            linked = False
+        elif state is not None and state.owner != policy.OWNER_UNKNOWN:
+            linked = True
+        else:
+            # muon_access has not heard from muon-link yet (or no policy):
+            # ask muon-link directly, the source muon_access reads.
+            linked, link_account = await self._link_phase()
         account = None
         if linked:
             access = self.server.lookup_component("muon_access", None)
-            email = getattr(access, "owner_email", None)
+            email = getattr(access, "owner_email", None) or link_account
             if isinstance(email, str) and email:
                 # Anyone who can read may GET this, and everyone is shown the
                 # whole address so a guest knows who to ask (D-176).
