@@ -76,14 +76,6 @@ def _path_pattern(fast_path: str) -> "re.Pattern[str]":
     return re.compile("^" + "/".join(parts) + "$")
 
 
-def _mask_email(email: str) -> str:
-    """`j***@example.com`: the first character and the domain."""
-    local, sep, domain = email.partition("@")
-    if not sep or not local or not domain:
-        return email[:1] + "***"
-    return f"{local[0]}***@{domain}"
-
-
 def _aux_error_message(resp: Any) -> Optional[str]:
     """The Aux API's own explanation of a failed response, if it gave one.
 
@@ -790,9 +782,9 @@ class AuxAutoProxy:
             access = self.server.lookup_component("muon_access", None)
             email = getattr(access, "owner_email", None)
             if isinstance(email, str) and email:
-                # Anyone who can read may GET this: only the owner is shown
-                # the whole address.
-                account = email if as_owner else _mask_email(email)
+                # Anyone who can read may GET this, and everyone is shown the
+                # whole address so a guest knows who to ask (D-176).
+                account = email
         return {
             "as_owner": as_owner,
             "may_ask": may_ask,
