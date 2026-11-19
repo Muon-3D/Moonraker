@@ -259,6 +259,14 @@ admin_address: 127.0.0.1:7131
 # MUON: read-only USB browsing and copy-then-print.
 [muon_usb]
 
+# KAN-4767: lighting presets, colours, speeds and the per-LED stream, rendered
+# here so klippy never has to. OFF until the bench proof and Jack's go: with
+# enabled False nothing is registered and the lights run as they do today
+# (LED_MODE and the led_effect macros). Pairs with [muon_lights_out] in the
+# printer config, which is off the same way.
+[muon_lights]
+enabled: False
+
 # KAN-162: start the bed ramp when a job is queued instead of at the top
 # of PRINT_START.  This turns on the 170W bed heater with no human input,
 # so the component itself defaults to disabled -- enabling it is an

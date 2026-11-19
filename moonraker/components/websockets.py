@@ -318,6 +318,17 @@ class WebSocket(WebSocketHandler, BaseRemoteConnection):
         self.wsm.add_client(self)
 
     def on_message(self, message: Union[bytes, str]) -> None:
+        # MUON, KAN-4767: a binary lights frame ([0x4C]...) goes straight to
+        # muon_lights, which takes it only from the connection that holds the
+        # stream lease. JSON starts with "{" or "[", so nothing else clashes.
+        if isinstance(message, bytes) and message[:1] == b"L":
+            lights = self.server.lookup_component("muon_lights", None)
+            if lights is not None:
+                try:
+                    lights.handle_binary(self.uid, message)
+                except Exception:
+                    logging.exception("Bad lights frame dropped")
+                return
         self.eventloop.register_callback(self._process_message, message)
 
     def on_pong(self, data: bytes) -> None:
