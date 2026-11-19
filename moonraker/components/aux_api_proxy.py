@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import contextlib
+import time
 import unicodedata
 from pathlib import Path
 from typing import Dict, Any, Callable, Optional
@@ -38,6 +39,10 @@ CLIENT_IP_HEADER = "X-Muon-Client-Ip"
 # Map lower-case OpenAPI keys → canonical HTTP verbs
 HTTP_VERBS = {"get": "GET", "post": "POST", "put": "PUT",
               "patch": "PATCH", "delete": "DELETE"}
+
+#: How long a muon-link read for the owner stays good, so bare GETs of
+#: /dev_mode/request do not each reach muon-link.
+LINK_CACHE_SECONDS = 10.0
 
 _PATH_PARAM_RE = re.compile(r"\{[^}]+\}")
 
@@ -205,6 +210,9 @@ MAX_NAME_LENGTH = 32
 
 
 class AuxAutoProxy:
+    #: (monotonic time, (linked, account)) of the last muon-link read.
+    _link_cache: Optional[Any] = None
+
     def __init__(self, config):
         self.server = config.get_server()
         self.http_client = self.server.lookup_component("http_client")
@@ -754,20 +762,13 @@ class AuxAutoProxy:
             return await self._dev_mode_complete(enabled, args)
         return await self._dev_mode_ask(enabled)
 
-    @staticmethod
-    def _protection_is_open() -> bool:
-        """True iff muon_floor's protection level is Open (the level #79
-        reads); any error is not open."""
-        try:
-            from .. import muon_floor
-            return muon_floor.protection_level() == muon_floor.LEVEL_OPEN
-        except Exception:
-            logging.exception("Could not read the protection level")
-            return False
-
     async def _link_phase(self):
         """(linked, account) from muon-link's GET /link, the same answer
         muon_access.refresh_owner reads; (None, None) when it cannot say."""
+        now = time.monotonic()
+        cached = self._link_cache
+        if cached is not None and now - cached[0] < LINK_CACHE_SECONDS:
+            return cached[1]
         link = self.server.lookup_component("muon_link", None)
         if link is None:
             return None, None
@@ -775,13 +776,17 @@ class AuxAutoProxy:
             status = await link.status()
         except Exception as err:
             logging.info("Could not read the link phase: %s", err)
+            self._link_cache = (now, (None, None))
             return None, None
         if not isinstance(status, dict) or "phase" not in status:
-            return None, None
-        if status.get("phase") != "linked":
-            return False, None
-        account = status.get("account")
-        return True, account if isinstance(account, str) else None
+            answer = (None, None)
+        elif status.get("phase") != "linked":
+            answer = (False, None)
+        else:
+            account = status.get("account")
+            answer = (True, account if isinstance(account, str) else None)
+        self._link_cache = (now, answer)
+        return answer
 
     async def _dev_mode_who_may_ask(self, webreq) -> Dict[str, Any]:
         """GET with nothing: whether this connection is the printer's owner,
@@ -798,12 +803,10 @@ class AuxAutoProxy:
                 state.home,
             )
         as_owner = principal is not None and principal.level >= policy.ADMIN
-        # KAN-4753 (D-166): on an Open printer anyone may ask, owner known or
-        # not. The protection level decides first; only Protected falls back
-        # to the table, which holds it to the owning account.
-        may_ask = self._protection_is_open() or (
-            state is not None and policy.decide_action(
-                policy.ACTIONS["dev_mode_request"], principal, state).allowed)
+        # The same decision the POST makes. KAN-4753 (D-166): the table
+        # lets anyone ask while the printer is Open, owner known or not.
+        may_ask = state is not None and policy.decide_action(
+            policy.ACTIONS["dev_mode_request"], principal, state).allowed
         linked: Optional[bool] = None
         link_account: Optional[str] = None
         if state is not None and state.owner == policy.OWNER_NONE:

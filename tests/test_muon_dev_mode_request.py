@@ -123,17 +123,29 @@ class TestWhoMayAsk:
         printer(OPEN, LINKED, preset="relaxed")
         assert ask(LAN, None) is None
 
+    # KAN-4753 (D-166): Open means anyone, whatever the preset or override.
     @pytest.mark.parametrize("preset", ["standard", "strict"])
-    def test_a_stricter_preset_holds_a_linked_printer_to_its_owner(self, preset):
-        printer(OPEN, LINKED, preset=preset)
+    @pytest.mark.parametrize("owner", [LINKED, policy.OWNER_UNKNOWN,
+                                       policy.OWNER_ORGANISATION])
+    def test_an_open_printer_lets_a_guest_ask_on_any_preset(self, preset, owner):
+        printer(OPEN, owner, preset=preset)
+        assert ask(LAN, None) is None
+        assert ask(SENTINEL, gateway("member", "operator")) is None
+
+    def test_an_override_does_not_hold_an_open_printer_to_its_owner(self):
+        printer(OPEN, LINKED, overrides={"dev_mode_request": policy.ADMIN})
+        assert ask(LAN, None) is None
+
+    @pytest.mark.parametrize("preset", [None, "standard", "strict"])
+    def test_protected_refuses_a_guest_on_every_preset(self, preset):
+        printer(PROTECTED, LINKED, preset=preset)
         assert ask(LAN, None) is not None
         assert ask(SENTINEL, gateway("member", "operator")) is not None
         assert ask(SENTINEL, gateway("admin", "operator")) is None
 
-    def test_an_override_can_hold_an_open_printer_to_its_owner(self):
-        printer(OPEN, LINKED, overrides={"dev_mode_request": policy.ADMIN})
-        assert ask(LAN, None) is not None
-        assert ask(SENTINEL, gateway("admin", "operator")) is None
+    def test_an_open_guest_is_still_not_admitted_from_off_the_network(self):
+        printer(OPEN, LINKED, preset="standard")
+        assert ask(PUBLIC, None) is not None
 
     def test_a_phone_still_in_bluetooth_setup_is_refused(self):
         printer(OPEN, NOBODY)
@@ -349,6 +361,35 @@ class TestGetWhoMayAsk:
             _GatewayRequest("GET", ip=LAN)))
         assert out["may_ask"] is True
         assert out["owner"] == {"linked": True, "account": "owner@example.com"}
+
+    @pytest.mark.parametrize("preset", ["standard", "strict"])
+    def test_get_and_post_agree_on_open_with_a_stricter_preset(self, preset):
+        printer(OPEN, LINKED, preset=preset)
+        out = self.ask_as(LAN, None)
+        assert out["may_ask"] is True
+        assert ask(LAN, None) is None
+
+    def test_get_and_post_agree_on_protected(self):
+        printer(PROTECTED, LINKED)
+        assert self.ask_as(LAN, None)["may_ask"] is False
+        assert ask(LAN, None) is not None
+
+    def test_the_link_read_is_cached_between_gets(self):
+        printer(OPEN, policy.OWNER_UNKNOWN)
+        proxy, server, client = make_proxy(AuxStub(self.ROUTES))
+        reads = []
+
+        class Link:
+            async def status(self):
+                reads.append(1)
+                return {"phase": "linked"}
+
+        proxy.server.components["muon_link"] = Link()
+        handler = server.handler_for(ENDPOINT)
+        for _ in range(3):
+            out = asyncio.run(handler(_GatewayRequest("GET", ip=LAN)))
+            assert out["owner"]["linked"] is True
+        assert len(reads) == 1
 
     def test_open_and_linked_lets_a_guest_ask(self):
         printer(OPEN, LINKED)
