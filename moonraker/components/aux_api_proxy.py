@@ -754,6 +754,35 @@ class AuxAutoProxy:
             return await self._dev_mode_complete(enabled, args)
         return await self._dev_mode_ask(enabled)
 
+    @staticmethod
+    def _protection_is_open() -> bool:
+        """True iff muon_floor's protection level is Open (the level #79
+        reads); any error is not open."""
+        try:
+            from .. import muon_floor
+            return muon_floor.protection_level() == muon_floor.LEVEL_OPEN
+        except Exception:
+            logging.exception("Could not read the protection level")
+            return False
+
+    async def _link_phase(self):
+        """(linked, account) from muon-link's GET /link, the same answer
+        muon_access.refresh_owner reads; (None, None) when it cannot say."""
+        link = self.server.lookup_component("muon_link", None)
+        if link is None:
+            return None, None
+        try:
+            status = await link.status()
+        except Exception as err:
+            logging.info("Could not read the link phase: %s", err)
+            return None, None
+        if not isinstance(status, dict) or "phase" not in status:
+            return None, None
+        if status.get("phase") != "linked":
+            return False, None
+        account = status.get("account")
+        return True, account if isinstance(account, str) else None
+
     async def _dev_mode_who_may_ask(self, webreq) -> Dict[str, Any]:
         """GET with nothing: whether this connection is the printer's owner,
         who owns it, whether this connection may ask, and the waiver."""
@@ -769,18 +798,26 @@ class AuxAutoProxy:
                 state.home,
             )
         as_owner = principal is not None and principal.level >= policy.ADMIN
-        may_ask = state is not None and policy.decide_action(
-            policy.ACTIONS["dev_mode_request"], principal, state).allowed
+        # KAN-4753 (D-166): on an Open printer anyone may ask, owner known or
+        # not. The protection level decides first; only Protected falls back
+        # to the table, which holds it to the owning account.
+        may_ask = self._protection_is_open() or (
+            state is not None and policy.decide_action(
+                policy.ACTIONS["dev_mode_request"], principal, state).allowed)
         linked: Optional[bool] = None
-        if state is not None:
-            if state.owner == policy.OWNER_NONE:
-                linked = False
-            elif state.owner != policy.OWNER_UNKNOWN:
-                linked = True
+        link_account: Optional[str] = None
+        if state is not None and state.owner == policy.OWNER_NONE:
+            linked = False
+        elif state is not None and state.owner != policy.OWNER_UNKNOWN:
+            linked = True
+        else:
+            # muon_access has not heard from muon-link yet (or no policy):
+            # ask muon-link directly, the source muon_access reads.
+            linked, link_account = await self._link_phase()
         account = None
         if linked:
             access = self.server.lookup_component("muon_access", None)
-            email = getattr(access, "owner_email", None)
+            email = getattr(access, "owner_email", None) or link_account
             if isinstance(email, str) and email:
                 # Anyone who can read may GET this, and everyone is shown the
                 # whole address so a guest knows who to ask (D-176).

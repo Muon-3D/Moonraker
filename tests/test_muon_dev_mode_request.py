@@ -42,8 +42,21 @@ def ask(ip_addr: Any, user: Any, endpoint: str = ENDPOINT) -> Optional[str]:
     return None
 
 
+@pytest.fixture(autouse=True)
+def _floor_level():
+    saved = muon_floor.protection_level()
+    try:
+        yield
+    finally:
+        muon_floor.set_protection_level(saved)
+
+
 def printer(entry: str, owner: str, **kw: Any) -> None:
     policy.set_state(state(entry=entry, owner=owner, **kw))
+    # The protection level muon_floor holds follows the entry.
+    muon_floor.set_protection_level(
+        muon_floor.LEVEL_OPEN if entry == policy.ENTRY_OPEN
+        else muon_floor.LEVEL_PROTECTED)
 
 
 OPEN, PROTECTED = policy.ENTRY_OPEN, policy.ENTRY_PROTECTED
@@ -314,6 +327,42 @@ class TestGetWhoMayAsk:
         assert (out["as_owner"], out["may_ask"]) == (False, True)
         assert out["owner"] == {"linked": False, "account": None}
 
+    # KAN-4753: an Open printer never waits on knowing the owner.
+    def test_open_with_the_owner_unknown_still_lets_anyone_ask(self):
+        printer(OPEN, policy.OWNER_UNKNOWN)
+        out = self.ask_as(LAN, None)
+        assert out["may_ask"] is True
+        assert out["owner"] == {"linked": None, "account": None}
+
+    def test_open_and_unknown_reads_linked_from_muon_link(self):
+        printer(OPEN, policy.OWNER_UNKNOWN)
+        proxy, server, client = make_proxy(AuxStub(self.ROUTES))
+        proxy.server.components["muon_access"] = type(
+            "_A", (), {"owner_email": None})()
+
+        class Link:
+            async def status(self):
+                return {"phase": "linked", "account": "owner@example.com"}
+
+        proxy.server.components["muon_link"] = Link()
+        out = asyncio.run(server.handler_for(ENDPOINT)(
+            _GatewayRequest("GET", ip=LAN)))
+        assert out["may_ask"] is True
+        assert out["owner"] == {"linked": True, "account": "owner@example.com"}
+
+    def test_open_and_linked_lets_a_guest_ask(self):
+        printer(OPEN, LINKED)
+        out = self.ask_as(LAN, None)
+        assert (out["as_owner"], out["may_ask"]) == (False, True)
+        assert out["owner"] == {"linked": True, "account": "owner@example.com"}
+
+    def test_protected_lets_the_owner_not_a_non_owner(self):
+        printer(PROTECTED, LINKED)
+        assert self.ask_as(SENTINEL, gateway("member", "operator"))[
+            "may_ask"] is False
+        assert self.ask_as(SENTINEL, gateway("admin", "operator"))[
+            "may_ask"] is True
+
     def test_the_panel_counts_as_the_owner(self):
         printer(PROTECTED, LINKED)
         out = self.ask_as(LOOPBACK, TRUSTED_USER)
@@ -332,6 +381,7 @@ class TestGetWhoMayAsk:
 
     def test_no_policy_loaded_asks_nothing_of_anyone(self):
         policy.set_state(None)
+        muon_floor.set_protection_level(muon_floor.LEVEL_PROTECTED)
         out = self.ask_as(LAN, None)
         assert out["may_ask"] is False
         assert out["owner"]["linked"] is None
