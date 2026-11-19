@@ -82,14 +82,17 @@ class Clock:
 
 
 class FakeDB:
-    def __init__(self) -> None:
+    def __init__(self, clock: Optional["Clock"] = None) -> None:
         self.data: Dict[str, Any] = {}
+        self.clock = clock
+        self.writes: List[Tuple[float, str]] = []
 
     async def get(self, key: str, default: Any = None) -> Any:
         return self.data.get(key, default)
 
     async def insert(self, key: str, value: Any) -> None:
         self.data[key] = json.loads(json.dumps(value))
+        self.writes.append((self.clock.t if self.clock else 0., key))
 
 
 class Apis:
@@ -114,7 +117,7 @@ class Server:
         self.events: List[Tuple[float, str, Any]] = []
         self.apis = Apis()
         self.apis.clock = clock
-        self.db = FakeDB()
+        self.db = FakeDB(clock)
         self.components: Dict[str, Any] = {
             "klippy_apis": self.apis,
             "database": SimpleNamespace(
@@ -219,19 +222,21 @@ class Rig:
                      rtype: RequestType = RequestType.POST) -> Any:
         return await self.lights._handle_preset(Req(args, rtype, conn=1))
 
-    async def start(self, conn: int = 1, **args: Any) -> Dict[str, Any]:
-        return await self.lights._handle_stream_start(Req(args, conn=conn))
+    async def start(self, conn: Optional[int] = 1, ip: Optional[str] = None,
+                    **args: Any) -> Dict[str, Any]:
+        return await self.lights._handle_stream_start(
+            Req(args, conn=conn, ip=ip))
 
     async def frame(self, lease: str, seq: int, strip: str = "left",
                     start: int = 0, count: int = 40, value: int = 100,
-                    conn: int = 1, raw: bool = False, rgb: Any = None
-                    ) -> Any:
+                    conn: Optional[int] = 1, raw: bool = False,
+                    rgb: Any = None, ip: Optional[str] = None) -> Any:
         data = rgb if rgb is not None else bytes([value]) * (3 * count)
         args = {"lease": lease, "seq": seq, "strip": strip, "start": start,
                 "rgb": base64.b64encode(data).decode()}
         if raw:
             args["raw"] = True
-        return await self.lights._handle_frame(Req(args, conn=conn))
+        return await self.lights._handle_frame(Req(args, conn=conn, ip=ip))
 
     def per_second(self) -> List[int]:
         """Sends in each half-open one second window since T0."""
@@ -497,6 +502,34 @@ class TestLease:
         b = (await rig.start(conn=1))["lease"]
         assert a != b and rig.lights.lease.id == b   # type: ignore
 
+    async def test_an_http_lease_belongs_to_its_token_not_the_address(
+            self) -> None:
+        r = Rig()
+        lease = (await r.start(conn=None, ip="192.168.1.9"))["lease"]
+        assert len(lease) == 32                       # an unguessable token
+        # same address, wrong token: refused
+        with pytest.raises(ServerError) as e:
+            await r.frame("0" * 32, 1, conn=None, ip="192.168.1.9")
+        assert e.value.status_code == 409
+        # another address with the token: it is the capability
+        assert (await r.frame(lease, 1, conn=None, ip="10.0.0.7"))["ok"]
+        # same address, no token: cannot take over a live lease (NAT)
+        with pytest.raises(ServerError) as e:
+            await r.start(conn=None, ip="192.168.1.9")
+        assert e.value.status_code == 409
+        # the token holder may restart; an idle lease may be taken
+        assert (await r.start(conn=None, ip="10.0.0.7",
+                              lease=lease))["lease"] != lease
+        r.lights.lease.last = r.clock.t - 3          # type: ignore
+        await r.start(conn=None, ip="172.16.0.1")
+
+    async def test_a_websocket_lease_is_not_usable_over_http(
+            self, rig: Rig) -> None:
+        lease = (await rig.start(conn=1))["lease"]
+        with pytest.raises(ServerError) as e:
+            await rig.frame(lease, 1, conn=None, ip="1.2.3.4")
+        assert e.value.status_code == 409
+
     async def test_another_client_cannot_use_the_lease(
             self, rig: Rig) -> None:
         lease = (await rig.start(conn=1))["lease"]
@@ -723,6 +756,139 @@ class TestBinary:
 # Output: what reaches the MCU
 # ---------------------------------------------------------------------------
 
+class TestFrameCosts:
+    async def test_length_is_checked_before_decoding(
+            self, rig: Rig, monkeypatch: Any) -> None:
+        lease = (await rig.start())["lease"]
+        calls: List[int] = []
+        real = base64.b64decode
+        monkeypatch.setattr(
+            ml.base64, "b64decode",
+            lambda *a, **k: calls.append(1) or real(*a, **k))
+        huge = "A" * 100000
+        with pytest.raises(ServerError) as e:
+            await rig.lights._handle_frame(Req({
+                "lease": lease, "seq": 1, "strip": "left", "start": 0,
+                "rgb": huge}, conn=1))
+        assert e.value.status_code == 400 and calls == []
+        # control: a legal frame is decoded
+        await rig.frame(lease, 2)
+        assert calls == [1]
+
+    async def test_a_flood_is_dropped_before_decoding(
+            self, rig: Rig, monkeypatch: Any) -> None:
+        lease = (await rig.start())["lease"]
+        calls: List[int] = []
+        real = base64.b64decode
+        monkeypatch.setattr(
+            ml.base64, "b64decode",
+            lambda *a, **k: calls.append(1) or real(*a, **k))
+        for i in range(1000):
+            await rig.frame(lease, i + 1, strip="left")
+        assert len(calls) == 120                  # the burst, no more
+        assert rig.lights.stream_dropped == 880
+
+    async def test_binary_floods_are_dropped_before_the_payload_is_read(
+            self, rig: Rig, monkeypatch: Any) -> None:
+        await rig.start(conn=7)
+        seen: List[int] = []
+        real = rig.lights._take_frame
+        monkeypatch.setattr(
+            rig.lights, "_take_frame",
+            lambda *a, **k: seen.append(1) or real(*a, **k))
+        for i in range(500):
+            rig.lights.handle_binary(7, TestBinary().packet(
+                0, 0, i + 1, bytes(120)))
+        assert len(seen) == 120
+
+
+class TestSocketNeverBreaks:
+    async def test_bad_binary_frames_do_not_raise(self, rig: Rig) -> None:
+        await rig.start(conn=7)
+        bad_frames = [
+            b"", b"L", b"L" * 7, b"\x00" * 40,
+            TestBinary().packet(0, 0, 1, b""),               # no LEDs
+            TestBinary().packet(0, 0, 2, b"ab"),             # not 3-byte
+            TestBinary().packet(0, 39, 3, bytes(30)),        # past the end
+            TestBinary().packet(1, 0xFFFF, 4, bytes(3)),     # start huge
+            TestBinary().packet(9, 0, 5, bytes(3)),          # strip id
+            TestBinary().packet(2, 0, 6, bytes(3000)),       # too long
+        ]
+        for frame in bad_frames:
+            rig.lights.handle_binary(7, frame)               # must not raise
+        assert rig.lights.stream_rejected >= len(bad_frames) - 1
+        # the lease and connection are still good: a legal frame lands
+        rig.lights.handle_binary(7, TestBinary().packet(
+            0, 0, 99, bytes([50]) * 120))
+        await settle(rig)
+        assert rig.sent
+
+    async def test_a_crashing_component_cannot_close_the_websocket(
+            self) -> None:
+        def boom(uid: int, msg: bytes) -> None:
+            raise RuntimeError("bug")
+        queued: List[Any] = []
+        fake = SimpleNamespace(
+            uid=1, server=SimpleNamespace(
+                lookup_component=lambda n, d=None: SimpleNamespace(
+                    handle_binary=boom)),
+            eventloop=SimpleNamespace(
+                register_callback=lambda *a: queued.append(a)),
+            _process_message=lambda m: None)
+        websockets.WebSocket.on_message(fake, b"Lxxxx")     # type: ignore
+        assert queued == []                                  # no raise
+
+    async def test_set_times_is_bounded(self, rig: Rig) -> None:
+        for i in range(2000):                  # 2000 different clients
+            await rig.lights._handle_set(
+                Req({"brightness": 5}, conn=None, ip=f"10.0.{i // 250}.{i}"))
+            await rig.clock.advance(1.1)
+        assert len(rig.lights._set_times) <= 33
+        # control: clients that are all active at once are capped too
+        busy = Rig()
+        for i in range(1000):
+            await busy.lights._handle_set(
+                Req({"brightness": 5}, conn=None, ip=f"c{i}"))
+        assert len(busy.lights._set_times) <= ml.MAX_SET_CLIENTS
+        # and a client that came back is still rate limited
+        for i in range(25):
+            await busy.lights._handle_set(
+                Req({"brightness": i}, conn=None, ip="again"))
+        assert busy.lights._pending_set
+
+
+class TestReservedEndpoint:
+    async def test_the_frame_endpoint_is_not_exposed_to_clients(self) -> None:
+        from unittest.mock import AsyncMock
+        from moonraker.components import klippy_connection as kc
+        assert "muon_lights_out/frame" in kc.RESERVED_ENDPOINTS
+        registered: List[str] = []
+        fake = SimpleNamespace(
+            klippy_apis=SimpleNamespace(list_endpoints=AsyncMock(
+                return_value={"endpoints": [
+                    "muon_lights_out/frame", "pause_resume/pause",
+                    "list_endpoints"]})),
+            server=SimpleNamespace(
+                register_endpoint=lambda ep, *a, **k: registered.append(ep)),
+            request=None)
+        await kc.KlippyConnection._request_endpoints(fake)   # type: ignore
+        # So /printer/muon_lights_out/frame never exists over HTTP or the
+        # websocket. Control: an ordinary klippy endpoint still does.
+        assert "muon_lights_out/frame" not in registered
+        assert registered == ["pause_resume/pause"]
+
+    async def test_the_component_still_reaches_it_internally(
+            self, rig: Rig) -> None:
+        from unittest.mock import AsyncMock
+        apis = SimpleNamespace(_send_klippy_request=AsyncMock(
+            return_value={"ok": True}))
+        rig.server.components["klippy_apis"] = apis
+        out = await ml.MuonLights._klippy_send(rig.lights, {"left": "AAAA"})
+        assert out == {"ok": True}
+        apis._send_klippy_request.assert_awaited_once_with(
+            "muon_lights_out/frame", {"left": "AAAA"})
+
+
 class TestOutputBudget:
     async def _run(self, rig: Rig, seconds: float) -> None:
         await rig.clock.advance(seconds)
@@ -869,6 +1035,21 @@ class TestOutputBudget:
         assert live == []
 
 
+class TestPartialSend:
+    async def test_a_strip_klippy_did_send_is_not_sent_again(
+            self, rig: Rig) -> None:
+        rig.reply = {"ok": False, "reason": "busy", "sent": ["left"]}
+        await rig.set({"effect": "solid", "colors": ["#336699"]})
+        await rig.clock.advance(0.2)
+        assert set(rig.sent[0][1]) == {"left", "right"}
+        assert rig.lights.last_sent["left"] is not None
+        assert rig.lights.last_sent["right"] is None
+        rig.reply = {"ok": True}
+        rig.status(stat_blocked(None))
+        await rig.clock.advance(2)
+        assert set(rig.sent[-1][1]) == {"right"}       # only what is missing
+
+
 class TestMcuBackoff:
     async def test_rising_retransmits_hold_output_then_it_resumes(
             self, rig: Rig) -> None:
@@ -1006,21 +1187,25 @@ class TestKlippyAnswers:
 # ---------------------------------------------------------------------------
 
 class TestPersistence:
-    def saves(self, rig: Rig) -> List[Tuple[float, str]]:
-        return [(t, g) for t, g in rig.server.apis.gcode
-                if g.startswith("SAVE_VARIABLE")]
+    def saves(self, rig: Rig) -> List[float]:
+        return [t for t, k in rig.server.db.writes if k == "state"]
+
+    def no_klippy_save(self, rig: Rig) -> None:
+        assert not [g for _, g in rig.server.apis.gcode
+                    if "SAVE_VARIABLE" in g]
 
     async def test_at_most_one_save_every_5_seconds(self, rig: Rig) -> None:
         for i in range(200):                           # 20 sets/s for 10 s
             await rig.set({"brightness": i % 100})
             await rig.clock.advance(0.05)
         await rig.clock.advance(6)
-        saves = self.saves(rig)
-        assert 1 <= len(saves) <= 3
-        for (a, _), (b, _) in zip(saves, saves[1:]):
+        times = self.saves(rig)
+        assert 1 <= len(times) <= 3
+        for a, b in zip(times, times[1:]):
             assert b - a >= 5.0 - 1e-6
-        last = json.loads(saves[-1][1].split("VALUE='")[1][:-1])
-        assert last["brightness"] == rig.lights.state["brightness"]
+        assert (rig.server.db.data["state"]["brightness"]
+                == rig.lights.state["brightness"])
+        self.no_klippy_save(rig)
 
     async def test_nothing_is_saved_without_a_change(self, rig: Rig) -> None:
         await rig.clock.advance(30)
@@ -1034,14 +1219,24 @@ class TestPersistence:
         await rig.clock.advance(10)
         assert self.saves(rig) == []
 
-    async def test_no_save_while_printing_it_waits(self, rig: Rig) -> None:
+    async def test_it_is_saved_in_moonrakers_database_never_in_klippy(
+            self, rig: Rig) -> None:
+        # Saving through klippy's SAVE_VARIABLE ran on klippy and was
+        # refused by its literal_eval (JSON true and null are not Python).
         rig.status({"print_stats": {"state": "printing"}})
         await rig.set({"brightness": 11})
-        await rig.clock.advance(20)
-        assert self.saves(rig) == []
-        rig.status({"print_stats": {"state": "complete"}})
         await rig.clock.advance(6)
-        assert len(self.saves(rig)) == 1
+        assert len(self.saves(rig)) == 1               # even in a print
+        self.no_klippy_save(rig)
+        assert rig.server.db.data["state"]["on"] is True
+
+    async def test_the_old_save_variable_form_could_not_be_read(
+            self, rig: Rig) -> None:
+        import ast
+        text = json.dumps(rig.lights.state, separators=(",", ":"))
+        assert "true" in text and "null" in text
+        with pytest.raises(ValueError):
+            ast.literal_eval(text)
 
     async def test_the_saved_state_comes_back_and_survives_a_bad_one(
             self, rig: Rig) -> None:
@@ -1049,15 +1244,94 @@ class TestPersistence:
                        "brightness": 61, "speed": 22,
                        "zones": {"left": {"effect": "solid"}}})
         await rig.clock.advance(6)
-        saved = json.loads(self.saves(rig)[-1][1].split("VALUE='")[1][:-1])
         fresh = Rig()
-        fresh.lights._restore(saved)
+        fresh.server.db.data = dict(rig.server.db.data)
+        fresh.lights.db = fresh.server.db
+        await fresh.lights.component_init()
         assert fresh.lights.state["effect"] == "comet"
         assert fresh.lights.state["zones"]["left"] == {"effect": "solid"}
         broken = Rig()
         broken.lights._restore({"brightness": 900})
         broken.lights._restore("junk")
         assert broken.lights.state["brightness"] == 70   # default kept
+
+    async def test_the_real_database_round_trips_the_state(
+            self, tmp_path: Any) -> None:
+        # The real save path: Moonraker's own sqlite database, not the fake.
+        from moonraker.components import database as dbm
+        from moonraker.eventloop import EventLoop
+
+        class DbServer:
+            error = ServerError
+
+            def __init__(self, root: Any) -> None:
+                self.root = root
+                self.loop = EventLoop()
+
+            def get_event_loop(self) -> Any:
+                return self.loop
+
+            def get_app_args(self) -> Dict[str, Any]:
+                return {"data_path": str(self.root), "instance_uuid": "t",
+                        "is_default_data_path": False}
+
+            def add_log_rollover_item(self, *a: Any, **k: Any) -> None:
+                pass
+
+            def register_endpoint(self, *a: Any, **k: Any) -> None:
+                pass
+
+            register_debug_endpoint = register_endpoint
+
+        class DbConfig:
+            def __init__(self, server: Any) -> None:
+                self.server = server
+
+            def get_server(self) -> Any:
+                return self.server
+
+            def get(self, key: str, default: Any = None, **kw: Any) -> Any:
+                return default
+
+            def getboolean(self, key: str, default: Any = None,
+                           **kw: Any) -> Any:
+                return default
+
+        (tmp_path / "database").mkdir()
+
+        async def open_db() -> Any:
+            opened = dbm.MoonrakerDatabase(DbConfig(DbServer(tmp_path)))
+            await opened.component_init()
+            return opened
+        db = await open_db()
+        try:
+            rig = Rig()
+            rig.server.components["database"] = db
+            await rig.lights.component_init()
+            await rig.set({"effect": "comet", "colors": ["#ff7a00"],
+                           "brightness": 61, "on": False,
+                           "zones": {"right": {"speed": 9}}})
+            await rig.preset({"save": {"name": "Real"}})
+            await rig.clock.advance(6)
+            await db.close()                      # a real restart
+            db = await open_db()
+            again = Rig()
+            again.server.components["database"] = db
+            await again.lights.component_init()
+            s = again.lights.state
+            assert s["effect"] == "comet" and s["brightness"] == 61
+            assert s["on"] is False and s["zones"]["left"] is None
+            assert s["zones"]["right"] == {"speed": 9}
+            assert [p["name"] for p in again.lights.get_state()["presets"]
+                    if not p["builtin"]] == ["Real"]
+            # control: a fresh database restores nothing
+            blank = Rig()
+            blank.server.components["database"] = SimpleNamespace(
+                register_local_namespace=lambda n: FakeDB())
+            await blank.lights.component_init()
+            assert blank.lights.state["effect"] == "status"
+        finally:
+            await db.close()
 
 
 class TestNotifications:

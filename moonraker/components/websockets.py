@@ -324,7 +324,10 @@ class WebSocket(WebSocketHandler, BaseRemoteConnection):
         if isinstance(message, bytes) and message[:1] == b"L":
             lights = self.server.lookup_component("muon_lights", None)
             if lights is not None:
-                lights.handle_binary(self.uid, message)
+                try:
+                    lights.handle_binary(self.uid, message)
+                except Exception:
+                    logging.exception("Bad lights frame dropped")
                 return
         self.eventloop.register_callback(self._process_message, message)
 

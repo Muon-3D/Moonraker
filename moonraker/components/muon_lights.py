@@ -50,10 +50,10 @@ from __future__ import annotations
 import base64
 import binascii
 import colorsys
-import json
 import logging
 import math
 import re
+import secrets
 import struct
 import uuid
 from collections import deque
@@ -81,6 +81,8 @@ EFFECTS = ["solid", "gradient", "rainbow", "breathe", "chase", "comet",
            "wave", "sparkle", "progress", "status", "off"]
 HEX_RE = re.compile(r"^#([0-9a-fA-F]{6}|[0-9a-fA-F]{3})$")
 MAGIC = 0x4C
+MAX_RGB_B64 = 4 * ((3 * 80 + 2) // 3)    # 80 LEDs, base64
+MAX_SET_CLIENTS = 256
 LEDS_PER_STRIP = 40
 MAX_PRESETS = 16
 MAX_NAME = 32
@@ -92,7 +94,6 @@ PERSIST_INTERVAL = 5.0
 NOTIFY_INTERVAL = 0.1
 SETTLE_AFTER_READY = 10.0
 BLOCKED_RETRY = 1.0
-SAVE_KEY = "muon_lights"
 DB_NAMESPACE = "muon_lights"
 SET_FIELDS = ("on", "effect", "colors", "brightness", "speed", "zones")
 ZONE_FIELDS = ("effect", "colors", "brightness", "speed")
@@ -443,6 +444,10 @@ class MuonLights:
                     self.user_presets[str(pid)] = self._clean_preset(preset)
                 except ServerError:
                     logging.warning("muon_lights: dropped bad preset %s", pid)
+        # The look is kept in Moonraker's own database, not klippy's
+        # save_variables: that runs on klippy, and its literal_eval parser
+        # refuses JSON's true and null.
+        self._restore(await self.db.get("state", None))
 
     # -- time ---------------------------------------------------------------
     def now(self) -> float:
@@ -557,6 +562,7 @@ class MuonLights:
         change = validate_set(args)           # 400 before anything applies
         client = self._client_id(web_request)
         now = self.now()
+        self._prune_clients(now, client)
         stamps = [t for t in self._set_times.get(client, [])
                   if now - t < 1.0]
         if len(stamps) >= SETS_PER_SECOND:
@@ -580,6 +586,25 @@ class MuonLights:
         self._apply(change)
         self._changed()
         return self.get_state()
+
+    def _prune_clients(self, now: float, keep: str) -> None:
+        """Forget clients that have not set anything for a second, so the
+        table is bounded by the clients active now, never by every client
+        ever seen. Held sets are kept until they are applied."""
+        if len(self._set_times) < 32 and keep in self._set_times:
+            return
+        for name in [c for c, ts in self._set_times.items()
+                     if c != keep and c not in self._pending_set
+                     and (not ts or now - ts[-1] >= 1.0)]:
+            del self._set_times[name]
+        while len(self._set_times) >= MAX_SET_CLIENTS:
+            others = [c for c in self._set_times
+                      if c != keep and c not in self._pending_set]
+            if not others:
+                break
+            oldest = min(others, key=lambda c: self._set_times[c][-1:]
+                         or [0.])
+            del self._set_times[oldest]
 
     def _flush_pending(self, client: str) -> None:
         self._pending_timer.pop(client, None)
@@ -669,15 +694,18 @@ class MuonLights:
         conn = web_request.get_client_connection()
         now = self.now()
         cur = self.lease
-        if cur is not None and cur.client != client:
-            if now - cur.last < LEASE_IDLE:
+        if cur is not None:
+            # The holder is the connection (websocket) or whoever shows the
+            # lease token (HTTP, where an address says nothing: a NAT shares
+            # one). Anyone else waits for the lease to go idle.
+            holder = (conn is not None and conn.uid == cur.conn) or (
+                args.get("lease") == cur.id)
+            if not holder and now - cur.last < LEASE_IDLE:
                 raise ServerError(
                     f"The stream is held by {cur.client}", 409)
-            self._end_lease("takeover")                    # it went idle
-        elif cur is not None:
-            self._end_lease("restart")
+            self._end_lease("restart" if holder else "takeover")
         out_fps = min(float(fps), self.idle_fps)
-        self.lease = Lease(uuid.uuid4().hex[:12], client,
+        self.lease = Lease(secrets.token_hex(16), client,
                            conn.uid if conn is not None else None,
                            [s for s in STRIPS if s in strips], out_fps, now)
         self._arm_lease_timer()
@@ -739,9 +767,11 @@ class MuonLights:
         cur = self.lease
         if cur is None or lease_id != cur.id:
             raise ServerError("No such lease (it may have expired)", 409)
-        client = self._client_id(web_request)
-        if client != cur.client:
-            raise ServerError("The lease belongs to another client", 409)
+        # A websocket lease belongs to its connection. An HTTP lease belongs
+        # to its token, which the lease id check above has just proved.
+        conn = web_request.get_client_connection()
+        if cur.conn is not None and (conn is None or conn.uid != cur.conn):
+            raise ServerError("The lease belongs to another connection", 409)
         seq = args.get("seq")
         if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
             raise bad("seq", "must be a non-negative integer")
@@ -754,28 +784,69 @@ class MuonLights:
         raw = args.get("raw", False)
         if not isinstance(raw, bool):
             raise bad("raw", "must be true or false")
+        text = args.get("rgb", "")
+        # Size and rate come before any decoding: a flood must cost nothing.
+        if not isinstance(text, str) or len(text) > MAX_RGB_B64:
+            raise bad("rgb", f"at most {MAX_RGB_B64} base64 characters")
+        if strip != "both" and strip not in cur.strips:
+            raise bad("strip", "is not part of the lease")
+        if not self._spend(cur, strip):
+            return {"ok": False, "status": "rate"}
         try:
-            data = base64.b64decode(args.get("rgb", ""), validate=True)
+            data = base64.b64decode(text, validate=True)
         except (binascii.Error, ValueError, TypeError):
             raise bad("rgb", "must be base64") from None
         status = self._take_frame(cur, strip, start, seq, data, raw)
         return {"ok": status == "ok", "status": status}
 
     def handle_binary(self, conn_uid: int, message: bytes) -> None:
-        """Binary websocket frame: [0x4C][u8 strip][u16 start][u32 seq][RGB]."""
-        cur = self.lease
-        if cur is None or cur.conn is None or cur.conn != conn_uid:
-            self.stream_rejected += 1          # no lease on this connection
-            return
-        if len(message) < 8 or message[0] != MAGIC:
+        """Binary websocket frame: [0x4C][u8 strip][u16 start][u32 seq][RGB].
+
+        Called from the socket's on_message: it must never raise. A bad
+        frame is dropped and counted; the connection stays open."""
+        try:
+            cur = self.lease
+            if cur is None or cur.conn is None or cur.conn != conn_uid:
+                self.stream_rejected += 1       # no lease on this connection
+                return
+            if (len(message) < 8 or len(message) > 8 + 240
+                    or message[0] != MAGIC):
+                self.stream_rejected += 1
+                return
+            _, strip_id, start, seq = struct.unpack(">BBHI", message[:8])
+            if strip_id > 2:
+                self.stream_rejected += 1
+                return
+            strip = ("left", "right", "both")[strip_id]
+            if strip != "both" and strip not in cur.strips:
+                self.stream_rejected += 1
+                return
+            if not self._spend(cur, strip):
+                return                           # counted: rate
+            self._take_frame(cur, strip, start, seq, bytes(message[8:]),
+                             False)
+        except ServerError:
             self.stream_rejected += 1
-            return
-        _, strip_id, start, seq = struct.unpack(">BBHI", message[:8])
-        if strip_id > 2:
+        except Exception:
             self.stream_rejected += 1
-            return
-        strip = ("left", "right", "both")[strip_id]
-        self._take_frame(cur, strip, start, seq, bytes(message[8:]), False)
+            logging.exception("muon_lights: bad binary frame dropped")
+
+    def _spend(self, cur: Lease, strip: str) -> bool:
+        """One input token per strip per frame: 60/s, burst 120. Called
+        before the payload is touched. A frame still keeps the lease alive."""
+        now = self.now()
+        cur.last = now
+        targets = list(cur.strips) if strip == "both" else [strip]
+        cur.tokens = {s: min(float(FRAME_BURST),
+                             t + (now - cur.token_time) * FRAMES_PER_SECOND)
+                      for s, t in cur.tokens.items()}
+        cur.token_time = now
+        if any(cur.tokens.get(s, 0.) < 1. for s in targets):
+            self.stream_dropped += 1              # coalesced: latest wins
+            return False
+        for s in targets:
+            cur.tokens[s] -= 1.
+        return True
 
     def _take_frame(self, cur: Lease, strip: str, start: int, seq: int,
                     data: bytes, raw: bool) -> str:
@@ -783,7 +854,6 @@ class MuonLights:
         count, rem = divmod(len(data), 3)
         if rem or count == 0:
             raise bad("rgb", "must be 3 bytes per LED")
-        targets = list(cur.strips) if strip == "both" else [strip]
         if strip != "both" and strip not in cur.strips:
             raise bad("strip", "is not part of the lease")
         if strip == "both" and cur.strips != list(STRIPS):
@@ -792,20 +862,9 @@ class MuonLights:
                  if strip == "both" else self.leds[strip])
         if count > (80 if strip == "both" else 40) or start + count > limit:
             raise bad("rgb", f"at most {limit} LEDs from index {start}")
-        now = self.now()
-        cur.last = now
         if seq <= cur.seq:
             self.stream_seq_dropped += 1
             return "seq"
-        cur.tokens = {s: min(float(FRAME_BURST),
-                             t + (now - cur.token_time) * FRAMES_PER_SECOND)
-                      for s, t in cur.tokens.items()}
-        cur.token_time = now
-        if any(cur.tokens[s] < 1. for s in targets):
-            self.stream_dropped += 1                 # coalesced: latest wins
-            return "rate"
-        for s in targets:
-            cur.tokens[s] -= 1.
         cur.seq = seq
         nleft = self.leds["left"]
         for i in range(count):
@@ -820,7 +879,7 @@ class MuonLights:
             buf = cur.buffers.get(target)
             if buf is not None and index < len(buf):
                 buf[index] = rgb
-        for s in targets:
+        for s in (cur.strips if strip == "both" else [strip]):
             cur.raw[s] = raw
         self._dirty = True
         self._kick()
@@ -999,8 +1058,9 @@ class MuonLights:
         self.stats["dropped_by_klippy"] += 1
         if reason == "failed":
             self.stats["failed"] += 1
+        done = reply.get("sent") or []
         for s in changed:                 # not applied: send it again
-            self.last_sent[s] = None
+            self.last_sent[s] = changed[s] if s in done else None
         self._dirty = True
         new = reason if reason in ("fault", "print", "busy") else None
         if new != self.blocked_reason:
@@ -1038,19 +1098,13 @@ class MuonLights:
             objects = {k: v for k, v in wanted.items() if k in listing}
             status = await apis.subscribe_objects(
                 objects, self.on_status_update, {})
-            saved = await apis.query_objects(
-                {"save_variables": ["variables"]}, {})
         except ServerError as e:
             logging.info("muon_lights: klippy setup failed: %s", e)
             return
         self.klippy_ready = True
         self.ready_at = self.now()
-        self._restore((saved.get("save_variables") or {})
-                      .get("variables", {}).get(SAVE_KEY))
         self.on_status_update(status, self.ready_at, adopt=False)
         self._dirty = True
-        if self._persist_dirty:
-            self._arm_persist()
         self._kick()
 
     def _on_klippy_down(self, *args: Any) -> None:
@@ -1118,7 +1172,9 @@ class MuonLights:
         blocked = out.get("blocked")
         if blocked != self.blocked_reason and blocked in (
                 None, "fault", "print", "busy"):
-            if blocked is None and self.blocked_reason is not None:
+            if blocked is None and self.blocked_reason in ("fault", "print"):
+                # klippy showed its own look meanwhile; homing ("busy")
+                # leaves the strips as they were, so only these need it.
                 self.last_sent = {s: None for s in STRIPS}
                 self._dirty = True
             self.blocked_reason = blocked
@@ -1178,7 +1234,7 @@ class MuonLights:
 
     # -- persistence and notifications -------------------------------------------
     def _arm_persist(self) -> None:
-        if self._persist_timer is not None or not self.klippy_ready:
+        if self._persist_timer is not None:
             return
         wait = max(0., self._last_persist + PERSIST_INTERVAL - self.now())
         self._persist_timer = self.loop.delay_callback(
@@ -1189,24 +1245,13 @@ class MuonLights:
         self.loop.register_callback(self._persist)
 
     async def _persist(self) -> None:
-        if not self._persist_dirty:
-            return
-        if self.printing:
-            # Writing the variables file runs on klippy. Wait for the print.
-            self._persist_timer = self.loop.delay_callback(
-                PERSIST_INTERVAL, self._persist_fired)
+        if not self._persist_dirty or self.db is None:
             return
         self._persist_dirty = False
         self._last_persist = self.now()
-        value = json.dumps({k: self.state[k] for k in
-                            ("on", "preset", "effect", "colors",
-                             "brightness", "speed", "zones")},
-                           separators=(",", ":"))
-        apis = self.server.lookup_component("klippy_apis", None)
-        if apis is None:
-            return
-        await apis.run_gcode(
-            f"SAVE_VARIABLE VARIABLE={SAVE_KEY} VALUE='{value}'", None)
+        await self.db.insert("state", {k: self.state[k] for k in (
+            "on", "preset", "effect", "colors", "brightness", "speed",
+            "zones")})
 
     def _notify(self) -> None:
         self._notify_due = True

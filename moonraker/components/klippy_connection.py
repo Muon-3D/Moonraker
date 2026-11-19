@@ -47,6 +47,11 @@ RESERVED_ENDPOINTS = [
     "list_endpoints",
     "gcode/subscribe_output",
     "register_remote_method",
+    # MUON, KAN-4767: finished LED frames for the strips. Only muon_lights,
+    # which owns the output budget, may send them, and it does so through
+    # klippy_apis. Registered as /printer/muon_lights_out/frame, any client
+    # could skip every cap.
+    "muon_lights_out/frame",
 ]
 
 # Items to exclude from the subscription cache.  They never change and can be
