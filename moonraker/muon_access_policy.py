@@ -223,6 +223,12 @@ _ROWS = (
     # linked printer under Standard or Strict, the owner. Overridable like any
     # general setting.
     _A("timezone", SIGNED_OUT_GUEST, ADMIN, ADMIN),
+    # KAN-4767: the lights (/server/lights, components/muon_lights.py):
+    # presets, colours, speeds, and the per-LED stream. D-166, open by
+    # default: an open printer (Relaxed, or no owner) lets anyone at home and
+    # any paired client set them. Protected, or a linked printer under
+    # Standard or Strict: the owner or a paired (admin-level) client.
+    _A("lights", SIGNED_OUT_GUEST, ADMIN, ADMIN),
     # First-run setup: muon_setup decides its own callers (02 section 3).
     _A("setup", SIGNED_OUT_GUEST, SIGNED_OUT_GUEST, SIGNED_OUT_GUEST,
        fixed=True, delegated=True),
@@ -594,6 +600,7 @@ WRITE_ACTIONS: Tuple[Tuple[str, str], ...] = (
     ("/printer/print", "print"),
     ("/server/job_queue", "print"),
     ("/server/spoolman/spool_id", "print"),
+    ("/server/lights", "lights"),
     ("/printer/restart", "motion"),
     ("/printer/firmware_restart", "motion"),
     ("/machine/wled", "motion"),
