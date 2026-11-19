@@ -298,7 +298,7 @@ class TestGetWhoMayAsk:
         out = self.ask_as(LAN, None)
         assert out["as_owner"] is False
         assert out["may_ask"] is False
-        assert out["owner"] == {"linked": True, "account": "o***@example.com"}
+        assert out["owner"] == {"linked": True, "account": "owner@example.com"}
 
     def test_a_member_is_not_the_owner_but_may_ask_while_open(self):
         printer(OPEN, LINKED)
@@ -523,11 +523,11 @@ class TestOtherMethods:
 class TestAStrangerSeesNoEmailAndCannotComplete:
     ROUTES = {"/dev_mode/waiver": _Answered(WAIVER)}
 
-    def test_a_stranger_gets_the_masked_account(self):
+    def test_a_stranger_gets_the_full_account(self):
         printer(OPEN, LINKED)
         out, _c = call(self.ROUTES, _GatewayRequest("GET", ip=LAN))
         assert out["as_owner"] is False
-        assert out["owner"]["account"] == "o***@example.com"
+        assert out["owner"]["account"] == "owner@example.com"
 
     def test_the_owner_gets_the_whole_address(self):
         printer(OPEN, LINKED)
@@ -607,9 +607,9 @@ class TestAStrangerSeesNoEmailAndCannotComplete:
                 asyncio.run(api.request(args, verb, HTTP, LAN, None))
             assert err.value.status_code == 403
 
-    def test_the_masked_email_stays_for_a_stranger_on_an_open_printer(self):
+    def test_the_full_email_is_shown_to_a_stranger_on_an_open_printer(self):
         printer(OPEN, LINKED)
         out, _c = call(TestAStrangerSeesNoEmailAndCannotComplete.ROUTES,
                        _GatewayRequest("GET", ip=LAN))
         assert (out["as_owner"], out["may_ask"]) == (False, True)
-        assert out["owner"]["account"] == "o***@example.com"
+        assert out["owner"]["account"] == "owner@example.com"
