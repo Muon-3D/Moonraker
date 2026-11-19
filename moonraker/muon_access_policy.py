@@ -571,6 +571,9 @@ READ = ACTIONS["read"]
 #: first match wins, so a longer prefix comes before a shorter one.
 WRITE_ACTIONS: Tuple[Tuple[str, str], ...] = (
     ("/server/muon/usb/print", "print"),
+    ("/server/muon/usb/copy", "print"),
+    ("/server/muon/usb/job/cancel", "print"),
+    ("/server/muon/usb/eject", "print"),
     ("/server/muon/setup", "setup"),
     ("/server/muon/link", "owner"),
     ("/server/muon/protection", "protection"),

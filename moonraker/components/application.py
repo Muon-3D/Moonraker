@@ -498,6 +498,12 @@ def _write_json_error(
 ) -> None:
     message = _error_message(req_hdlr, kwargs.get('exc_info'))
     err: Dict[str, Any] = {'code': status_code, 'message': message}
+    # MUON: an error may carry machine-readable fields (USB 409 job_running).
+    exc_info_ = kwargs.get('exc_info')
+    cause = getattr(exc_info_[1], '__cause__', None) if exc_info_ else None
+    extra = getattr(cause, 'http_extra', None)
+    if isinstance(extra, dict):
+        err.update(extra)
     if 'exc_info' in kwargs:
         err['traceback'] = "\n".join(
             traceback.format_exception(*kwargs['exc_info']))

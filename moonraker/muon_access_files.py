@@ -321,7 +321,10 @@ class FileGuard:
         scope = self.scope()
         method = getattr(request_type, "name", None)
         # MUON: removable media is shared read-only, never an account drive.
-        destinations = [args.get("dest")]
+        # The USB copy endpoints are the sanctioned writers: their dest is
+        # validated by muon_usb itself (and may name the stick).
+        usb_copy = endpoint == "/server/muon/usb/copy"
+        destinations = [None if usb_copy else args.get("dest")]
         if method != "GET" and endpoint in (
                 "/server/files/directory", "/server/files/delete_file"):
             destinations.append(args.get("path"))
@@ -330,7 +333,14 @@ class FileGuard:
         if any(isinstance(p, str) and p.strip('/').split('/')[0].lower() == 'usb'
                for p in destinations):
             raise self.error("The USB root is read-only.", 403)
-        if endpoint in READ_BY_FILENAME:
+        if usb_copy:
+            # to_usb reads the printer's gcodes: the same read as a download.
+            if args.get("direction") == "to_usb":
+                for item in args.get("items") or []:
+                    path = relative(item)
+                    if path:
+                        self._read(scope, path, principal)
+        elif endpoint in READ_BY_FILENAME:
             self._read(scope, relative(args.get("filename")), principal)
         elif endpoint == "/server/files/download":
             self._read(scope, gcodes_path(args.get("path")), principal)

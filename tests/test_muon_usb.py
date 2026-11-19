@@ -47,6 +47,7 @@ class Server:
     def __init__(self, data: Path) -> None:
         self.data = data
         self.endpoints: Dict[str, Any] = {}
+        self.events: list = []
         gcodes = data / 'gcodes'
         gcodes.mkdir()
         self.components: Dict[str, Any] = {
@@ -65,6 +66,13 @@ class Server:
     def register_endpoint(self, path: str, method: Any, handler: Any) -> None:
         self.endpoints[path] = (method, handler)
 
+    def register_notification(self, event: str, name: Any = None) -> None:
+        self.notifications = getattr(self, 'notifications', {})
+        self.notifications[event] = name
+
+    def send_event(self, event: str, *args: Any) -> None:
+        self.events.append((event, args))
+
     def lookup_component(self, name: str, default: Any = None) -> Any:
         return self.components.get(name, default)
 
@@ -80,15 +88,46 @@ class Config:
         return str(self.server.data / 'rejected') if key == 'rejected_path' else default
 
 
+class Machine:
+    # systemd as Moonraker sees it: starting/stopping the two root units
+    def __init__(self, mounts: Dict[str, Any], gone: set) -> None:
+        self.mounts, self.gone, self.calls = mounts, gone, []
+        self.rw_fails = False
+
+    async def do_service_action(self, action: str, unit: str) -> None:
+        self.calls.append((action, unit))
+        kind, _, rest = unit.partition('@')
+        dev = rest.removesuffix('.service')
+        for name, mount in self.mounts.items():
+            if mount['dev'] != dev:
+                continue
+            if kind == 'muon-usb-rw' and not (self.rw_fails and action == 'start'):
+                mount['rw'] = action == 'start'
+            if kind == 'muon-usb-mount' and action == 'stop':
+                self.gone.add(name)
+
+
 @pytest.fixture
 def usb(tmp_path: Path, monkeypatch: Any) -> Any:
+    monkeypatch.setattr(muon_usb, 'idle_io', lambda: None)
     server = Server(tmp_path)
     component = muon_usb.load_component(Config(server))  # type: ignore[arg-type]
+    mounts: Dict[str, Any] = {'Demo': {'dev': 'sda1', 'fs': 'vfat', 'rw': False},
+                              'Other': {'dev': 'sdb1', 'fs': 'exfat', 'rw': False}}
+    gone: set = set()
+    machine = Machine(mounts, gone)
+    server.components['machine'] = machine
+    component.mounts, component.machine = mounts, machine
+    monkeypatch.setattr(component, 'mount_info', lambda: {
+        n: dict(m) for n, m in mounts.items() if n not in gone})
+    monkeypatch.setattr(component, 'block_read_only', lambda dev: False)
     # tmp directories are not mountpoints: treat <root>/<name> as a mounted stick
     real_ismount = os.path.ismount
     monkeypatch.setattr(
         os.path, 'ismount',
-        lambda p: Path(p).parent == component.root or real_ismount(p))
+        lambda p: (Path(p).parent == component.root and Path(p).name not in gone
+                   and Path(p).is_dir())
+        or real_ismount(p))
     server.components['muon_usb'] = component
     return component
 
@@ -105,7 +144,8 @@ def gcode(usb: Any, path: str = 'Demo/part.gcode', data: str = 'G1 X1\n') -> Pat
 
 
 def test_missing_root_and_lazy_registration(usb: Any) -> None:
-    assert asyncio.run(usb._handle_status(request())) == {'sticks': [], 'rejected': []}
+    assert asyncio.run(usb._handle_status(request())) == {
+        'sticks': [], 'rejected': [], 'job': None, 'ejected': []}
     for callback in (usb._handle_list,):
         with pytest.raises(ServerError) as err:
             asyncio.run(callback(request('usb/Demo')))
@@ -117,8 +157,8 @@ def test_missing_root_and_lazy_registration(usb: Any) -> None:
     assert err.value.status_code == 404
     assert usb.server.components['file_manager'].get_directory('usb') == ''
     gcode(usb)
-    assert asyncio.run(usb._handle_status(request())) == {
-        'sticks': [{'name': 'Demo', 'path': 'usb/Demo'}], 'rejected': []}
+    status = asyncio.run(usb._handle_status(request()))
+    assert [(s['name'], s['path']) for s in status['sticks']] == [('Demo', 'usb/Demo')]
     files = usb.server.components['file_manager']
     assert files.get_directory('usb') == str(usb.root)
     assert 'usb' not in files.full_access_roots
@@ -131,8 +171,9 @@ def test_rejected_contract_and_corrupt_records(usb: Any) -> None:
         'uuid': '123', 'device': '/dev/sdb1'}))
     (usb.rejected / 'bad.json').write_text('{')
     (usb.rejected / 'empty.json').write_text('[]')
-    assert usb.status() == {'sticks': [], 'rejected': [
-        {'name': 'sdb1', 'fstype': 'ntfs', 'label': 'Photo stick'}]}
+    assert usb.status()['sticks'] == []
+    assert usb.status()['rejected'] == [
+        {'name': 'sdb1', 'fstype': 'ntfs', 'label': 'Photo stick'}]
     (usb.rejected / 'sdb1.json').unlink()
     assert usb.status()['rejected'] == []
 
@@ -147,9 +188,11 @@ def test_huge_directory_both_endpoints_stat_only(usb: Any, monkeypatch: Any) -> 
     monkeypatch.setattr(Path, 'open', no_read)
     monkeypatch.setattr(usb, 'open_gcode', no_read)
     start = time.monotonic()
-    listing = asyncio.run(usb._handle_list(request('usb/Demo')))
+    listing = asyncio.run(usb._handle_list(
+        WebRequest('/server/muon/usb/list', {'path': 'usb/Demo', 'limit': 2000})))
     assert len(listing['files']) == muon_usb.MAX_FOLDER_ENTRIES
     assert listing['truncated'] is True
+    assert listing['total'] == 5000
     assert time.monotonic() - start < 2
     fm = SimpleNamespace(server=usb.server, event_loop=EventLoop())
     start = time.monotonic()
@@ -425,3 +468,616 @@ def test_copy_fsyncs_before_rename(usb: Any, monkeypatch: Any) -> None:
         os, 'replace', lambda *a, **k: (calls.append('replace'), real_replace(*a, **k))[1])
     asyncio.run(usb._handle_print(request('usb/Demo/part.gcode')))
     assert calls.index('fsync') < calls.index('replace')
+
+
+# ---------------------------------------------------------------------------
+# KAN-4814: copy jobs, eject, paging, download (spec v1.1 + v1.2)
+# ---------------------------------------------------------------------------
+
+def copy_request(**body: Any) -> WebRequest:
+    return WebRequest('/server/muon/usb/copy', body)
+
+
+def do_copy(usb: Any, **body: Any) -> Dict[str, Any]:
+    (usb.root / body['stick']).mkdir(parents=True, exist_ok=True)   # the mountpoint
+    async def run() -> Dict[str, Any]:
+        result = await usb._handle_copy(copy_request(**body))
+        assert result['job_id']
+        await usb.task
+        return usb.job_snapshot(full=True)
+    return asyncio.run(run())
+
+
+def printer_gcode(usb: Any, path: str, data: str = 'G1 X1\n') -> Path:
+    target = usb.server.data / 'gcodes' / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(data)
+    return target
+
+
+def reasons(entries: Any) -> Any:
+    return sorted((e['path'], e['reason']) for e in entries)
+
+
+def test_job_state_machine_to_printer_keeps_structure(usb: Any) -> None:
+    gcode(usb, 'Demo/a/one.gcode', 'AAAA')
+    gcode(usb, 'Demo/two.gcode', 'BB')
+    gcode(usb, 'Demo/notes.txt')
+    job = do_copy(usb, direction='to_printer', stick='Demo',
+                  items=['usb/Demo'], on_conflict='rename')
+    assert job['state'] == 'done'
+    assert (job['files_total'], job['files_done']) == (2, 2)
+    assert (job['bytes_total'], job['bytes_done']) == (6, 6)
+    assert job['direction'] == 'to_printer' and job['stick'] == 'Demo'
+    assert job['started_at'] and job['ended_at'] and job['skipped'] == []
+    base = usb.server.data / 'gcodes/usb-import/Demo'
+    assert (base / 'a/one.gcode').read_text() == 'AAAA'
+    assert (base / 'two.gcode').read_text() == 'BB'
+    assert [i['state'] for i in job['items']] == ['done', 'done']
+    assert job['items'][0] == {
+        'path': 'usb/Demo/a/one.gcode', 'dest': 'usb-import/Demo/a/one.gcode',
+        'bytes_total': 4, 'bytes_done': 4, 'state': 'done', 'error': None}
+    assert not [p for p in base.rglob('.usb-*')]
+    assert usb.job_snapshot()['id'] == job['id']
+    assert usb.machine.calls == []          # to_printer never needs rw
+    states = [args[0]['state'] for ev, args in usb.server.events]
+    assert states[-1] == 'done' and len(states) <= 6
+    assert usb.server.notifications['muon_usb:job'] == 'muon_usb_job'
+
+
+def test_copy_all_root_forms_and_custom_dest(usb: Any) -> None:
+    gcode(usb, 'Demo/a/one.gcode')
+    gcode(usb, 'Demo/b/two.gcode')
+    printer_gcode(usb, 'top.gcode')
+    printer_gcode(usb, 'sub/deep.gcode')
+    printer_gcode(usb, 'sub/readme.txt')
+    # to_printer: the stick root
+    job = do_copy(usb, direction='to_printer', stick='Demo', items=['usb/Demo'],
+                  dest='mine')
+    assert job['files_total'] == 2
+    assert (usb.server.data / 'gcodes/mine/a/one.gcode').exists()
+    # a folder item, plus the same file named again, is copied once
+    job = do_copy(usb, direction='to_printer', stick='Demo',
+                  items=['usb/Demo/a', 'usb/Demo/a/one.gcode'], on_conflict='replace')
+    assert job['files_total'] == 1
+    # to_usb: the gcodes root; structure kept under the stick root
+    job = do_copy(usb, direction='to_usb', stick='Demo', items=['/'])
+    assert job['state'] == 'done'
+    assert {i['dest'] for i in job['items']} >= {
+        'usb/Demo/top.gcode', 'usb/Demo/sub/deep.gcode'}
+    assert (usb.root / 'Demo/sub/deep.gcode').exists()
+    assert not (usb.root / 'Demo/sub/readme.txt').exists()
+    job = do_copy(usb, direction='to_usb', stick='Other', items=['sub'],
+                  dest='usb/Other/imported')
+    assert (usb.root / 'Other/imported/sub/deep.gcode').exists()
+
+
+def test_rw_window_wraps_to_usb_job_only(usb: Any) -> None:
+    printer_gcode(usb, 'p.gcode')
+    seen = []
+    original = usb._copy_file
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        seen.append((usb.mounts['Demo']['rw'], usb.status()['sticks'][0]['writable']))
+        return original(*args, **kwargs)
+    usb._copy_file = spy
+    job = do_copy(usb, direction='to_usb', stick='Demo', items=['/'])
+    assert job['state'] == 'done' and seen == [(True, True)]
+    assert usb.machine.calls == [('start', 'muon-usb-rw@sda1.service'),
+                                 ('stop', 'muon-usb-rw@sda1.service')]
+    assert usb.mounts['Demo']['rw'] is False
+    assert usb.status()['sticks'][0]['writable'] is False
+
+
+def test_finally_returns_to_ro_after_failure(usb: Any) -> None:
+    printer_gcode(usb, 'p.gcode')
+    def boom(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError('boom')
+    usb._copy_file = boom
+    job = do_copy(usb, direction='to_usb', stick='Demo', items=['/'])
+    assert job['state'] == 'failed'
+    assert usb.machine.calls[-1] == ('stop', 'muon-usb-rw@sda1.service')
+    assert usb.mounts['Demo']['rw'] is False
+
+
+def test_rw_remount_failure_is_read_only(usb: Any) -> None:
+    printer_gcode(usb, 'p.gcode')
+    usb.machine.rw_fails = True
+    usb.rw_timeout = 0.05
+    job = do_copy(usb, direction='to_usb', stick='Demo', items=['/'])
+    assert job['state'] == 'failed'
+    assert reasons(job['errors'])[0][1] == 'read_only'
+    assert usb.status()['sticks'][0]['read_only'] is True
+    assert usb.machine.calls[-1][0] == 'stop'
+
+
+def test_read_only_stick_fails_immediately(usb: Any, monkeypatch: Any) -> None:
+    printer_gcode(usb, 'p.gcode')
+    (usb.root / 'Demo').mkdir(parents=True)
+    monkeypatch.setattr(usb, 'block_read_only', lambda dev: dev == 'sda1')
+    assert usb.status()['sticks'][0]['read_only'] is True
+    job = do_copy(usb, direction='to_usb', stick='Demo', items=['/'])
+    assert job['state'] == 'failed' and reasons(job['errors'])[0][1] == 'read_only'
+    assert usb.machine.calls == []
+    # to_printer from a read-only stick is fine
+    gcode(usb, 'Demo/x.gcode')
+    assert do_copy(usb, direction='to_printer', stick='Demo',
+                   items=['usb/Demo'])['state'] == 'done'
+
+
+def test_cancel_removes_inflight_temp_keeps_finished(usb: Any, monkeypatch: Any) -> None:
+    gcode(usb, 'Demo/a.gcode', 'x' * 30)
+    gcode(usb, 'Demo/b.gcode', 'y' * 30)
+    usb.server.components['job_state'].get_last_stats = lambda: {'state': 'printing'}
+    usb.chunk, usb.rate = 10, 1
+    calls = []
+    dest = usb.server.data / 'gcodes/usb-import/Demo'
+    def fake_sleep(seconds: float) -> None:
+        calls.append(seconds)
+        if len(calls) == 5:
+            assert [p.name for p in dest.glob('.usb-*')]   # in flight
+            usb.cancel_job(usb.job_snapshot()['id'])
+    usb._sleep = fake_sleep
+    usb._now = lambda: 0.0
+    job = do_copy(usb, direction='to_printer', stick='Demo', items=['usb/Demo'])
+    assert job['state'] == 'cancelled'
+    assert (dest / 'a.gcode').read_text() == 'x' * 30
+    assert not (dest / 'b.gcode').exists()
+    assert not list(dest.glob('.usb-*'))
+    assert [i['state'] for i in job['items']] == ['done', 'cancelled']
+    assert job['items'][1]['error'] == 'cancelled'
+
+
+def test_cancel_handler_and_unknown_job(usb: Any) -> None:
+    with pytest.raises(ServerError) as err:
+        asyncio.run(usb._handle_job_cancel(WebRequest('/x', {'job_id': 'nope'})))
+    assert err.value.status_code == 404
+
+
+def test_cancel_to_usb_returns_ro(usb: Any) -> None:
+    printer_gcode(usb, 'a.gcode', 'x' * 30)
+    usb.server.components['job_state'].get_last_stats = lambda: {'state': 'paused'}
+    usb.chunk, usb.rate = 10, 1
+    usb._now = lambda: 0.0
+    usb._sleep = lambda s: usb.cancel_job(usb.job_snapshot()['id'])
+    job = do_copy(usb, direction='to_usb', stick='Demo', items=['/'])
+    assert job['state'] == 'cancelled'
+    assert usb.mounts['Demo']['rw'] is False
+    assert not list((usb.root / 'Demo').glob('.usb-*'))
+
+
+@pytest.mark.parametrize('direction', ['to_printer', 'to_usb'])
+def test_stick_removed_mid_copy(usb: Any, direction: str) -> None:
+    gcode(usb, 'Demo/a.gcode', 'x' * 30)
+    printer_gcode(usb, 'a.gcode', 'x' * 30)
+    count = []
+    def vanish(handle: Any, size: int) -> bytes:
+        count.append(1)
+        if len(count) == 2:
+            usb.machine.gone.add('Demo')
+            raise OSError(errno.EIO, 'gone')
+        return handle.read(size)
+    usb.chunk = 10
+    usb._read = vanish
+    items = ['usb/Demo'] if direction == 'to_printer' else ['/']
+    job = do_copy(usb, direction=direction, stick='Demo', items=items)
+    assert job['state'] == 'failed'
+    assert reasons(job['errors'])[0][1] == 'stick_removed'
+    assert job['items'][0]['state'] == 'failed'
+    for folder in (usb.server.data / 'gcodes/usb-import/Demo', usb.root / 'Demo'):
+        assert not list(folder.glob('.usb-*')) if folder.exists() else True
+
+
+def test_read_error_continues_with_next_file(usb: Any) -> None:
+    gcode(usb, 'Demo/a.gcode', 'x')
+    gcode(usb, 'Demo/b.gcode', 'y')
+    first = []
+    def flaky(handle: Any, size: int) -> bytes:
+        if not first:
+            first.append(1)
+            raise OSError(errno.EIO, 'bad sector')
+        return handle.read(size)
+    usb._read = flaky
+    job = do_copy(usb, direction='to_printer', stick='Demo', items=['usb/Demo'])
+    assert job['state'] == 'done'
+    assert reasons(job['errors']) == [('usb/Demo/a.gcode', 'read_error')]
+    assert [i['state'] for i in job['items']] == ['failed', 'done']
+
+
+def test_no_space_to_printer_stops_cleanly(usb: Any, monkeypatch: Any) -> None:
+    gcode(usb, 'Demo/a.gcode', 'x' * 100)
+    gcode(usb, 'Demo/b.gcode', 'y' * 100)
+    monkeypatch.setattr(usb, 'free_space', lambda p: 100 + muon_usb.HEADROOM - 1)
+    job = do_copy(usb, direction='to_printer', stick='Demo', items=['usb/Demo'])
+    assert job['state'] == 'failed'
+    assert reasons(job['errors']) == [('usb/Demo/a.gcode', 'no_space')]
+    assert [i['state'] for i in job['items']] == ['failed', 'cancelled']
+    monkeypatch.setattr(usb, 'free_space', lambda p: 100 + muon_usb.HEADROOM)
+    assert do_copy(usb, direction='to_printer', stick='Demo',
+                   items=['usb/Demo'], on_conflict='replace')['state'] == 'done'
+
+
+def test_no_space_to_usb_margin_and_enospc(usb: Any, monkeypatch: Any) -> None:
+    printer_gcode(usb, 'a.gcode', 'x' * 100)
+    monkeypatch.setattr(usb, 'free_space', lambda p: 100 + muon_usb.MARGIN - 1)
+    job = do_copy(usb, direction='to_usb', stick='Demo', items=['/'])
+    assert job['state'] == 'failed' and reasons(job['errors'])[0][1] == 'no_space'
+    assert usb.mounts['Demo']['rw'] is False
+    monkeypatch.setattr(usb, 'free_space', lambda p: 100 + muon_usb.MARGIN)
+    assert do_copy(usb, direction='to_usb', stick='Demo', items=['/'])['state'] == 'done'
+    def full(handle: Any, data: bytes) -> None:
+        raise OSError(errno.ENOSPC, 'full')
+    usb._write = full
+    job = do_copy(usb, direction='to_usb', stick='Demo', items=['/'],
+                  on_conflict='replace')
+    assert job['state'] == 'failed' and reasons(job['errors'])[0][1] == 'no_space'
+    assert not list((usb.root / 'Demo').glob('.usb-*'))
+
+
+@pytest.mark.parametrize(('name', 'bad'), [
+    ('a<b.gcode', True), ('a>b.gcode', True), ('a:b.gcode', True),
+    ('a"b.gcode', True), ('a\\b.gcode', True), ('a|b.gcode', True),
+    ('a?b.gcode', True), ('a*b.gcode', True), ('trail.', True),
+    ('trail ', True), ('x' * 256, True), ('x' * 255, False),
+    ('\U0001F600' * 128, True), ('\U0001F600' * 127, False),
+    ('ok name (1).gcode', False), ('café.gcode', False)])
+def test_fat_name_rules(name: str, bad: bool) -> None:
+    assert muon_usb.fat_name_problem(name) is bad
+
+
+def test_fat_names_and_4gib_skip_not_fail(usb: Any, monkeypatch: Any) -> None:
+    printer_gcode(usb, 'good.gcode', 'g')
+    printer_gcode(usb, 'bad-name.gcode', 'b')
+    printer_gcode(usb, 'huge.gcode', 'h' * 20)
+    monkeypatch.setattr(muon_usb, 'fat_name_problem', lambda n: n.startswith('bad'))
+    monkeypatch.setattr(muon_usb, 'FAT_MAX_FILE', 10)
+    job = do_copy(usb, direction='to_usb', stick='Demo', items=['/'])
+    assert job['state'] == 'done'
+    assert reasons(job['skipped']) == [('bad-name.gcode', 'name_invalid'),
+                                       ('huge.gcode', 'too_large')]
+    assert (job['files_total'], job['files_done']) == (1, 1)
+    assert {i['state'] for i in job['items']} == {'done', 'skipped'}
+    # exFAT has no 4 GiB limit
+    job = do_copy(usb, direction='to_usb', stick='Other', items=['huge.gcode'])
+    assert job['skipped'] == [] and (usb.root / 'Other/huge.gcode').exists()
+
+
+def test_to_usb_depth_beyond_four_is_name_invalid(usb: Any) -> None:
+    printer_gcode(usb, 'a/b/c/d/e.gcode')
+    job = do_copy(usb, direction='to_usb', stick='Demo', items=['a'])
+    assert job['skipped'] == []      # four folders deep fits at the stick root
+    job = do_copy(usb, direction='to_usb', stick='Demo', items=['a'],
+                  dest='usb/Demo/x')
+    assert reasons(job['skipped']) == [('a/b/c/d/e.gcode', 'name_invalid')]
+
+
+def test_folder_full_at_cap(usb: Any, monkeypatch: Any) -> None:
+    monkeypatch.setattr(muon_usb, 'MAX_FOLDER_ENTRIES', 3)
+    for name in ('x', 'y', 'z'):
+        gcode(usb, f'Demo/{name}.gcode')
+    printer_gcode(usb, 'new.gcode')
+    job = do_copy(usb, direction='to_usb', stick='Demo', items=['/'])
+    assert job['state'] == 'done'
+    assert reasons(job['skipped']) == [('new.gcode', 'folder_full')]
+    # replacing an existing name adds no entry, so it is allowed
+    printer_gcode(usb, 'x.gcode', 'new')
+    job = do_copy(usb, direction='to_usb', stick='Demo', items=['x.gcode'],
+                  on_conflict='replace')
+    assert job['skipped'] == [] and (usb.root / 'Demo/x.gcode').read_text() == 'new'
+
+
+def test_conflicts_rename_skip_replace(usb: Any) -> None:
+    gcode(usb, 'Demo/p.gcode', 'NEW')
+    dest = usb.server.data / 'gcodes/usb-import/Demo'
+    dest.mkdir(parents=True)
+    (dest / 'p.gcode').write_text('OLD')
+    job = do_copy(usb, direction='to_printer', stick='Demo', items=['usb/Demo'],
+                  on_conflict='rename')
+    assert (dest / 'p.gcode').read_text() == 'OLD'
+    assert (dest / 'p (1).gcode').read_text() == 'NEW'
+    assert job['items'][0]['dest'] == 'usb-import/Demo/p (1).gcode'
+    job = do_copy(usb, direction='to_printer', stick='Demo', items=['usb/Demo'],
+                  on_conflict='rename')
+    assert (dest / 'p (2).gcode').exists()
+    job = do_copy(usb, direction='to_printer', stick='Demo', items=['usb/Demo'],
+                  on_conflict='skip')
+    assert reasons(job['skipped']) == [('usb/Demo/p.gcode', 'exists')]
+    assert job['items'][0]['state'] == 'skipped' and job['items'][0]['error'] == 'exists'
+    assert (job['files_total'], job['bytes_total']) == (0, 0)
+    job = do_copy(usb, direction='to_printer', stick='Demo', items=['usb/Demo'],
+                  on_conflict='replace')
+    assert (dest / 'p.gcode').read_text() == 'NEW' and job['state'] == 'done'
+
+
+def test_source_changed_during_copy(usb: Any) -> None:
+    source = gcode(usb, 'Demo/a.gcode', 'x' * 30)
+    usb.chunk = 10
+    count = []
+    def grow(handle: Any, size: int) -> bytes:
+        count.append(1)
+        if len(count) == 2:
+            with open(source, 'ab') as other:
+                other.write(b'zzz')
+        return handle.read(size)
+    usb._read = grow
+    job = do_copy(usb, direction='to_printer', stick='Demo', items=['usb/Demo'])
+    assert reasons(job['errors']) == [('usb/Demo/a.gcode', 'source_changed')]
+    assert not list((usb.server.data / 'gcodes/usb-import/Demo').glob('*'))
+
+
+def test_one_job_at_a_time_and_eject_conflict(usb: Any) -> None:
+    gcode(usb, 'Demo/a.gcode')
+    async def run() -> None:
+        first = await usb._handle_copy(copy_request(
+            direction='to_printer', stick='Demo', items=['usb/Demo']))
+        with pytest.raises(ServerError) as err:
+            await usb._handle_copy(copy_request(
+                direction='to_printer', stick='Demo', items=['usb/Demo']))
+        assert err.value.status_code == 409
+        with pytest.raises(ServerError) as err:
+            await usb._handle_eject(WebRequest('/e', {'stick': 'Demo'}))
+        assert err.value.status_code == 409
+        assert err.value.error_data == {'reason': 'job_running',
+                                        'job_id': first['job_id']}
+        await usb.task
+    asyncio.run(run())
+    assert usb.job_snapshot()['state'] == 'done'
+
+
+@pytest.mark.parametrize('body', [
+    {'direction': 'sideways', 'stick': 'Demo', 'items': ['usb/Demo']},
+    {'direction': 'to_printer', 'stick': 'Demo', 'items': []},
+    {'direction': 'to_printer', 'stick': 'Demo', 'items': ['usb/Demo/../x']},
+    {'direction': 'to_printer', 'stick': 'Demo', 'items': ['usb/Other']},
+    {'direction': 'to_printer', 'stick': 'Demo', 'items': ['usb/Demo/.hid']},
+    {'direction': 'to_printer', 'stick': 'Demo', 'items': ['usb']},
+    {'direction': 'to_printer', 'stick': 'Demo', 'items': ['usb/Demo'], 'dest': '../x'},
+    {'direction': 'to_printer', 'stick': 'Demo', 'items': ['usb/Demo'],
+     'on_conflict': 'explode'},
+    {'direction': 'to_usb', 'stick': 'Demo', 'items': ['../secret']},
+    {'direction': 'to_usb', 'stick': 'Demo', 'items': ['.hidden/x.gcode']},
+    {'direction': 'to_usb', 'stick': 'Demo', 'items': ['/'], 'dest': 'usb/Other'},
+    {'direction': 'to_usb', 'stick': 'Demo', 'items': ['/'], 'dest': 'gcodes/x'},
+    {'direction': 'to_usb', 'stick': 'Demo', 'items': ['/'], 'dest': 'usb/Demo/../x'},
+])
+def test_bad_copy_requests_are_400(usb: Any, body: Dict[str, Any]) -> None:
+    gcode(usb, 'Demo/a.gcode')
+    gcode(usb, 'Other/a.gcode')
+    with pytest.raises(ServerError) as err:
+        asyncio.run(usb._handle_copy(copy_request(**body)))
+    assert err.value.status_code == 400
+    assert usb.job_snapshot() is None
+
+
+def test_missing_stick_is_404(usb: Any) -> None:
+    with pytest.raises(ServerError) as err:
+        asyncio.run(usb._handle_copy(copy_request(
+            direction='to_printer', stick='Ghost', items=['usb/Ghost'])))
+    assert err.value.status_code == 404
+
+
+def test_throttle_only_while_printing(usb: Any) -> None:
+    gcode(usb, 'Demo/a.gcode', 'x' * 40)
+    usb.chunk = 10
+    sleeps = []
+    usb._sleep = sleeps.append
+    do_copy(usb, direction='to_printer', stick='Demo', items=['usb/Demo'])
+    assert sleeps == []
+    assert usb.rate == 8 * 1024 * 1024
+    usb.server.components['job_state'].get_last_stats = lambda: {'state': 'printing'}
+    usb.rate = 100
+    usb._now = lambda: 0.0   # time never advances: pure debt
+    do_copy(usb, direction='to_printer', stick='Demo', items=['usb/Demo'],
+            on_conflict='replace')
+    assert len(sleeps) == 4 and sleeps[-1] == pytest.approx(0.4)
+
+
+def test_job_payload_trims_past_200_items(usb: Any) -> None:
+    items = [{'path': f'p{i}', 'dest': f'd{i}', 'bytes_total': 1, 'bytes_done': 0,
+              'state': 'pending', 'error': None} for i in range(201)]
+    usb.job = {'id': 'j', 'state': 'running', 'items': items, 'skipped': [],
+               'errors': [], 'files_total': 201, 'files_done': 3, 'bytes_total': 201,
+               'bytes_done': 3, 'current': 'p3', '_last': 3}
+    payload = usb.job_snapshot()
+    assert 'items' not in payload and payload['item']['path'] == 'p3'
+    assert payload['files_total'] == 201 and '_last' not in payload
+    assert len(usb.job_snapshot(full=True)['items']) == 201
+    usb.job['items'] = items[:200]
+    assert len(usb.job_snapshot()['items']) == 200
+
+
+def test_notifications_are_rate_limited(usb: Any) -> None:
+    for index in range(30):
+        gcode(usb, f'Demo/f{index:02}.gcode', 'x')
+    usb.notify_interval = 10     # at most the first and the final
+    do_copy(usb, direction='to_printer', stick='Demo', items=['usb/Demo'])
+    events = usb.server.events
+    assert 1 <= len(events) <= 3 and events[-1][0] == 'muon_usb:job'
+    assert events[-1][1][0]['state'] == 'done'
+
+
+def test_eject_flow_and_ejected_list(usb: Any, monkeypatch: Any, tmp_path: Path) -> None:
+    gcode(usb, 'Demo/a.gcode')
+    (tmp_path / 'sys').mkdir()
+    (tmp_path / 'sys/sda1').mkdir()
+    monkeypatch.setattr(usb, 'block_path', tmp_path / 'sys')
+    result = asyncio.run(usb._handle_eject(WebRequest('/e', {'stick': 'Demo'})))
+    assert result['stick'] == 'Demo'
+    assert ('stop', 'muon-usb-mount@sda1.service') in usb.machine.calls
+    status = usb.status()
+    assert all(s['name'] != 'Demo' for s in status['sticks'])
+    assert [e['name'] for e in status['ejected']] == ['Demo']
+    assert status['ejected'][0]['at'] > 0
+    (tmp_path / 'sys/sda1').rmdir()              # unplugged: no longer listed
+    assert usb.status()['ejected'] == []
+
+
+def test_eject_unknown_stick(usb: Any) -> None:
+    with pytest.raises(ServerError) as err:
+        asyncio.run(usb._handle_eject(WebRequest('/e', {'stick': 'Ghost'})))
+    assert err.value.status_code == 404
+
+
+def test_status_additions(usb: Any, monkeypatch: Any) -> None:
+    gcode(usb, 'Demo/a.gcode')
+    monkeypatch.setattr(muon_usb.shutil, 'disk_usage',
+                        lambda p: SimpleNamespace(total=1000, used=400, free=600))
+    stick = usb.status()['sticks'][0]
+    assert stick == {'name': 'Demo', 'path': 'usb/Demo', 'dev': 'sda1',
+                     'unit': 'muon-usb-mount@sda1.service', 'fs': 'vfat',
+                     'free_bytes': 600, 'total_bytes': 1000,
+                     'writable': False, 'read_only': False}
+    usb.mounts['Demo']['fs'] = 'ntfs'     # not supported for writing
+    assert usb.status()['sticks'][0]['read_only'] is True
+
+
+def test_listing_pages_sorted_before_the_cap(usb: Any, monkeypatch: Any) -> None:
+    monkeypatch.setattr(muon_usb, 'MAX_FOLDER_ENTRIES', 5)
+    (usb.root / 'Demo').mkdir(parents=True)
+    for index in range(8):
+        path = gcode(usb, f'Demo/f{index}.gcode', 'x' * index)
+        os.utime(path, (1000 + index, 1000 + index))      # f7 is newest
+    for name in ('dirA', 'dirB'):
+        (usb.root / 'Demo' / name).mkdir()
+    page = usb.listing('usb/Demo', 0, 4)
+    assert sorted(d['name'] for d in page['dirs']) == ['dirA', 'dirB']
+    assert [f['name'] for f in page['files']] == ['f7.gcode', 'f6.gcode']
+    assert page['total'] == 10 and page['truncated'] is True
+    assert page['files'][0]['size'] == 7 and 'modified' in page['files'][0]
+    assert 'modified' in page['dirs'][0]
+    page = usb.listing('usb/Demo', 4, 4)       # only up to the cap of 5 is reachable
+    assert [f['name'] for f in page['files']] == ['f5.gcode']
+    assert page['truncated'] is True
+    page = usb.listing('usb/Demo', 0, 50)
+    assert len(page['dirs']) + len(page['files']) == 5
+    # the newest files survive the cap, not whichever the disk listed first
+    assert [f['name'] for f in page['files']] == ['f7.gcode', 'f6.gcode', 'f5.gcode']
+
+
+def test_listing_defaults_and_limits(usb: Any) -> None:
+    (usb.root / 'Demo').mkdir(parents=True)
+    for index in range(600):
+        (usb.root / 'Demo' / f'{index}.gcode').touch()
+    page = usb.listing('usb/Demo')
+    assert len(page['files']) == muon_usb.DEFAULT_LIMIT and page['total'] == 600
+    assert len(usb.listing('usb/Demo', 0, 99999)['files']) == 600
+    with pytest.raises(ServerError):
+        usb.listing('usb/Demo', -1, 5)
+    request_ = WebRequest('/server/muon/usb/list', {'path': 'usb/Demo', 'offset': 590})
+    assert len(asyncio.run(usb._handle_list(request_))['files']) == 10
+
+
+@pytest.mark.parametrize(('header', 'expected'), [
+    (None, None), ('', None), ('bytes=0-3', (0, 3)), ('bytes=4-', (4, 9)),
+    ('bytes=-3', (7, 9)), ('bytes=0-999', (0, 9)), ('bytes=9-9', (9, 9)),
+    ('bytes=-999', (0, 9)),
+])
+def test_parse_range_ok(header: Any, expected: Any) -> None:
+    assert muon_usb.parse_range(header, 10) == expected
+
+
+@pytest.mark.parametrize('header', [
+    'bytes=10-', 'bytes=10-20', 'bytes=5-2', 'bytes=-0', 'bytes=-', 'bytes=',
+    'bytes=0-1,3-4', 'items=0-1', 'bytes=a-b', 'bytes=--1', 'garbage'])
+def test_parse_range_bad_is_416(header: str) -> None:
+    with pytest.raises(muon_usb.RangeNotSatisfiable):
+        muon_usb.parse_range(header, 10)
+    with pytest.raises(muon_usb.RangeNotSatisfiable):
+        muon_usb.parse_range('bytes=0-0', 0)
+
+
+def test_download_headers_range_and_etag(usb: Any) -> None:
+    name = 'mödel 1.gcode'
+    gcode(usb, 'Demo/' + name, '0123456789')
+    path = 'usb/Demo/' + name
+    full = usb.download_info(path)
+    assert full['status'] == 200 and (full['start'], full['length']) == (0, 10)
+    headers = full['headers']
+    assert headers['Content-Length'] == '10' and headers['Accept-Ranges'] == 'bytes'
+    assert headers['Content-Disposition'] == (
+        "attachment; filename*=UTF-8''m%C3%B6del%201.gcode")
+    assert headers['ETag'].startswith('"') and headers['ETag'].endswith('"')
+    assert b''.join(usb.iter_file(path, 0, 10)) == b'0123456789'
+    part = usb.download_info(path, 'bytes=2-5')
+    assert part['status'] == 206 and (part['start'], part['length']) == (2, 4)
+    assert part['headers']['Content-Range'] == 'bytes 2-5/10'
+    assert part['headers']['Content-Length'] == '4'
+    assert b''.join(usb.iter_file(path, 2, 4)) == b'2345'
+    bad = usb.download_info(path, 'bytes=50-')
+    assert bad['status'] == 416 and bad['headers']['Content-Range'] == 'bytes */10'
+    same = usb.download_info(path, None, full['headers']['ETag'])
+    assert same['status'] == 304
+    (usb.root / 'Demo' / name).write_text('01234567890')       # size changes
+    assert usb.download_info(path)['headers']['ETag'] != headers['ETag']
+
+
+def test_download_chunks_are_small(usb: Any) -> None:
+    gcode(usb, 'Demo/big.gcode', 'x' * 1000)
+    usb.chunk = 100
+    chunks = list(usb.iter_file('usb/Demo/big.gcode', 0, 1000))
+    assert len(chunks) == 10 and all(len(c) == 100 for c in chunks)
+
+
+@pytest.mark.parametrize('path', ['usb/Demo/a.txt', 'usb/Demo/.h.gcode',
+                                  'usb/Demo/../x.gcode', 'gcodes/a.gcode'])
+def test_download_refuses_what_resolve_refuses(usb: Any, path: str) -> None:
+    gcode(usb, 'Demo/a.txt')
+    gcode(usb, 'Demo/.h.gcode')
+    with pytest.raises(ServerError) as err:
+        usb.download_info(path)
+    assert err.value.status_code in (400, 403, 404)
+
+
+def test_download_directory_and_missing(usb: Any) -> None:
+    gcode(usb, 'Demo/sub/a.gcode')
+    for path, code in (('usb/Demo/sub', 400), ('usb/Demo/gone.gcode', 404)):
+        with pytest.raises(ServerError) as err:
+            usb.download_info(path)
+        assert err.value.status_code == code
+
+
+def test_endpoints_registered(usb: Any) -> None:
+    got = {path: method for path, (method, _) in usb.server.endpoints.items()}
+    for name in ('status', 'list', 'metadata', 'job'):
+        assert got['/server/muon/usb/' + name] == RequestType.GET
+    for name in ('print', 'copy', 'job/cancel', 'eject'):
+        assert got['/server/muon/usb/' + name] == RequestType.POST
+
+
+def test_systemd_escape_and_units() -> None:
+    assert muon_usb.systemd_escape('sda1') == 'sda1'
+    assert muon_usb.systemd_escape('a-b') == 'a\\x2db'
+    assert muon_usb.systemd_escape('a/b') == 'a\\x2fb'
+
+
+def test_access_new_endpoints() -> None:
+    for endpoint in ('status', 'list', 'metadata', 'job', 'file'):
+        assert policy.classify('/server/muon/usb/' + endpoint, RequestType.GET) == (policy.READ,)
+    for endpoint in ('copy', 'job/cancel', 'eject', 'print'):
+        actions = policy.classify('/server/muon/usb/' + endpoint, RequestType.POST)
+        assert [a.name for a in actions] == ['print']
+
+
+def test_access_guard_allows_usb_copy_and_checks_gcodes_reads() -> None:
+    scope = access_files.FileScope({}, data_mode='accounts')
+    guard = access_files.FileGuard(lambda: scope, lambda *a: None, ServerError)
+    who = policy.Principal('home', '', 0, 'viewer', True, False)
+    guard.check('/server/muon/usb/copy', RequestType.POST, {
+        'direction': 'to_usb', 'stick': 'Demo', 'items': ['/'],
+        'dest': 'usb/Demo'}, who)
+    with pytest.raises(ServerError, match='not found'):     # reads are checked
+        guard.check('/server/muon/usb/copy', RequestType.POST, {
+            'direction': 'to_usb', 'stick': 'Demo', 'items': ['a/b.gcode']}, who)
+    guard.check('/server/muon/usb/copy', RequestType.POST, {
+        'direction': 'to_printer', 'stick': 'Demo', 'items': ['usb/Demo'],
+        'dest': 'mine'}, who)
+    # the old read-only guard still holds for the file manager
+    with pytest.raises(ServerError, match='read-only'):
+        guard.check('/server/files/copy', RequestType.POST,
+                    {'dest': 'usb/Demo/new'}, who)
+
+
+def test_unit_derivation_matches_mount_unit(usb: Any) -> None:
+    gcode(usb, 'Demo/a.gcode')
+    stick = usb.status()['sticks'][0]
+    assert stick['unit'] == 'muon-usb-mount@%s.service' % stick['dev']
+    assert usb.rw_unit(stick['dev']) == 'muon-usb-rw@sda1.service'
