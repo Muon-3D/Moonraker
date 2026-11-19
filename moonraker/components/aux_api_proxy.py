@@ -51,6 +51,8 @@ _PATH_PARAM_RE = re.compile(r"\{[^}]+\}")
 # access row is delegated to Aux, so a mirror of /dev_mode/request would let any
 # admitted client skip the owner rule that guards /server/muon/dev_mode/request.
 INTERNAL_ONLY_AUX_PATHS = frozenset({"/dev_mode/request"})
+# KAN-4768: the Aux route that actually changes developer mode.
+DEV_MODE_GATED_PATHS = frozenset({"/dev_mode"})
 
 # KAN-3603: the Aux API's own ZONE_NAME (time_routes.py), copied. Aux still
 # checks that tzdata carries the zone; this keeps junk from being forwarded.
@@ -438,6 +440,17 @@ class AuxAutoProxy:
     def _make_static_handler(self, fast_path: str) -> Callable:
         async def handler(webreq):
             method = webreq.get_action()  # e.g. "POST"
+            # KAN-4768: /server/aux/dev_mode is the call that turns developer
+            # mode on or off. With no [muon_access] loaded (every image today)
+            # nothing else gates it and the floor excludes it, so it gets the
+            # same decision as the dev_mode/request POST (KAN-4754). A GET
+            # stays a read; with a policy loaded the policy decides.
+            if (fast_path in DEV_MODE_GATED_PATHS
+                    and method in ("POST", "PUT", "DELETE")
+                    and policy.state() is None):
+                decision = self._no_policy_decision(webreq)
+                if not decision.allowed:
+                    raise policy.refusal(decision)
             args = dict(webreq.get_args())  # all params
             url = f"{FASTAPI_ROOT}{fast_path}"
 

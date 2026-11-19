@@ -849,3 +849,107 @@ class TestNoPolicyLoaded:
         printer(OPEN, LINKED)
         assert ask(LAN, None) is None
         assert self.get(LAN, None) is True
+
+
+# --------------------------------------------------------------------------
+# KAN-4768: the route that actually changes developer mode, /server/aux/dev_mode
+# --------------------------------------------------------------------------
+
+AUX_DEV_MODE = "/server/aux/dev_mode"
+AUX_SPEC = {"paths": {"/dev_mode": {
+    "get": {}, "post": {"requestBody": {}}, "put": {"requestBody": {}},
+    "delete": {}}}}
+
+
+class TestAuxDevModeWithoutPolicy:
+    """The proxy mirrors Aux's POST /dev_mode. With no [muon_access] loaded
+    nothing gates it and the floor excludes it, so a guest holding a confirmed
+    challenge id could change the mode past the dev_mode/request gate."""
+
+    ROUTES = {"/dev_mode": _Answered({"enabled": True})}
+
+    @staticmethod
+    def level(level: int) -> None:
+        policy.set_state(None)
+        muon_floor.set_protection_level(level)
+
+    def proxy(self):
+        proxy, server, client = make_proxy(AuxStub(self.ROUTES))
+        proxy._register_from_spec(AUX_SPEC)
+        return server.handler_for(AUX_DEV_MODE), client
+
+    def send(self, verb, ip, user, transport=HTTP):
+        handler, client = self.proxy()
+        out = asyncio.run(handler(_GatewayRequest(
+            verb, {"enabled": True, "challenge_id": CHALLENGE},
+            ip=ip, user=user, transport=transport)))
+        return out, client
+
+    @pytest.mark.parametrize("verb", ["POST", "PUT", "DELETE"])
+    @pytest.mark.parametrize("who", sorted(TestNoPolicyLoaded.GUESTS))
+    def test_protected_refuses_a_guest_with_403(self, who, verb):
+        self.level(muon_floor.LEVEL_PROTECTED)
+        ip, user = TestNoPolicyLoaded.GUESTS[who]
+        handler, client = self.proxy()
+        with pytest.raises(ServerError) as err:
+            asyncio.run(handler(_GatewayRequest(
+                verb, {"enabled": True, "challenge_id": CHALLENGE},
+                ip=ip, user=user)))
+        assert err.value.status_code == 403
+        assert client.paths() == []  # never reached Aux
+
+    def test_protected_lets_the_panel_through(self):
+        self.level(muon_floor.LEVEL_PROTECTED)
+        out, client = self.send("POST", LOOPBACK, TRUSTED_USER)
+        assert out == {"enabled": True}
+        assert client.paths() == ["/dev_mode"]
+
+    def test_protected_lets_an_in_process_caller_through(self):
+        self.level(muon_floor.LEVEL_PROTECTED)
+        internal = type("_T", (), {"transport_type": type(
+            "_N", (), {"name": "INTERNAL"})()})()
+        out, _c = self.send("POST", None, None, transport=internal)
+        assert out == {"enabled": True}
+
+    def test_protected_lets_a_paired_owner_device_through(self):
+        self.level(muon_floor.LEVEL_PROTECTED)
+        out, client = self.send("POST", SENTINEL, gateway("admin", "operator"))
+        assert out == {"enabled": True}
+        assert client.paths() == ["/dev_mode"]
+
+    @pytest.mark.parametrize("who", ["anyone", "guest", "member", "password"])
+    def test_open_lets_anyone_through(self, who):
+        self.level(muon_floor.LEVEL_OPEN)
+        ip, user = {
+            "anyone": (LAN, None),
+            "guest": (SENTINEL, gateway("signed_out_guest", "operator")),
+            "member": (SENTINEL, gateway("member", "operator")),
+            "password": (LAN, PASSWORD_USER),
+        }[who]
+        out, _c = self.send("POST", ip, user)
+        assert out == {"enabled": True}
+
+    def test_an_unreadable_level_fails_closed(self, monkeypatch):
+        policy.set_state(None)
+
+        def boom():
+            raise RuntimeError("no level")
+        monkeypatch.setattr(muon_floor, "protection_level", boom)
+        with pytest.raises(ServerError) as err:
+            self.send("POST", LAN, None)
+        assert err.value.status_code == 403
+
+    def test_a_get_stays_readable_to_a_guest_on_protected(self):
+        self.level(muon_floor.LEVEL_PROTECTED)
+        handler, client = self.proxy()
+        out = asyncio.run(handler(_GatewayRequest("GET", ip=LAN)))
+        assert out == {"enabled": True}
+        assert client.paths() == ["/dev_mode"]
+
+    def test_a_loaded_policy_is_unchanged(self):
+        """With muon_access loaded the proxy adds no gate of its own: the
+        handler alone lets a guest through, as before; check_access decides."""
+        printer(PROTECTED, LINKED)
+        out, client = self.send("POST", LAN, None)
+        assert out == {"enabled": True}
+        assert client.paths() == ["/dev_mode"]
