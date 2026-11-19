@@ -62,6 +62,7 @@ def _is_dev_mode_path(fast_path: str) -> bool:
     return (fast_path == DEV_MODE_GATED_PREFIX
             or fast_path.startswith(DEV_MODE_GATED_PREFIX + "/"))
 
+
 # KAN-3603: the Aux API's own ZONE_NAME (time_routes.py), copied. Aux still
 # checks that tzdata carries the zone; this keeps junk from being forwarded.
 ZONE_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_+-]*(/[A-Za-z0-9_+-]+){0,2}$")
