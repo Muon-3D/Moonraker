@@ -995,6 +995,20 @@ def filter_result(
     return filtered()
 
 
+def usb_view(
+    transport: Optional[Any], ip_addr: Optional[Any], user: Optional[Any]
+) -> Optional[Any]:
+    """What this caller may do in a USB copy job (visible files, where it may
+    write, whether it may replace), or None when no access model applies."""
+    principal = _file_principal(transport, ip_addr, user)
+    guard, current = _files, _state
+    if principal is None or guard is None or current is None:
+        return None
+    return guard.usb_view(
+        principal,
+        lambda name: decide_action(ACTIONS[name], principal, current).allowed)
+
+
 def plan_upload(ip_addr: Optional[Any], user: Optional[Any],
                 form_args: Dict[str, Any]) -> Optional[Any]:
     """Where an upload goes, and its tag (rewrites form_args["path"])."""
