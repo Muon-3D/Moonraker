@@ -762,6 +762,15 @@ class AuxAutoProxy:
             return await self._dev_mode_complete(enabled, args)
         return await self._dev_mode_ask(enabled)
 
+    @staticmethod
+    def _floor_is_open() -> bool:
+        try:
+            from .. import muon_floor
+            return muon_floor.protection_level() == muon_floor.LEVEL_OPEN
+        except Exception:
+            logging.exception("Could not read the protection level")
+            return False
+
     async def _link_phase(self):
         """(linked, account) from muon-link's GET /link, the same answer
         muon_access.refresh_owner reads; (None, None) when it cannot say."""
@@ -805,8 +814,14 @@ class AuxAutoProxy:
         as_owner = principal is not None and principal.level >= policy.ADMIN
         # The same decision the POST makes. KAN-4753 (D-166): the table
         # lets anyone ask while the printer is Open, owner known or not.
-        may_ask = state is not None and policy.decide_action(
-            policy.ACTIONS["dev_mode_request"], principal, state).allowed
+        if state is None:
+            # No [muon_access] loaded: check_access enforces nothing, so the
+            # POST is held only by the floor, and the floor level is the
+            # answer (Sloe, 17.1.1: policy absent, level Open).
+            may_ask = self._floor_is_open()
+        else:
+            may_ask = policy.decide_action(
+                policy.ACTIONS["dev_mode_request"], principal, state).allowed
         linked: Optional[bool] = None
         link_account: Optional[str] = None
         if state is not None and state.owner == policy.OWNER_NONE:

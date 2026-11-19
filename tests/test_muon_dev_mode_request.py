@@ -420,12 +420,22 @@ class TestGetWhoMayAsk:
         assert out["owner"] == {"linked": None, "account": None}
         assert out["may_ask"] is False
 
-    def test_no_policy_loaded_asks_nothing_of_anyone(self):
+    def test_no_policy_loaded_follows_the_floor_level(self):
+        # KAN-4753: Sloe had no [muon_access], so no policy state; the POST is
+        # then held only by the floor, and the GET says the same.
         policy.set_state(None)
         muon_floor.set_protection_level(muon_floor.LEVEL_PROTECTED)
+        assert self.ask_as(LAN, None)["may_ask"] is False
+        muon_floor.set_protection_level(muon_floor.LEVEL_OPEN)
         out = self.ask_as(LAN, None)
-        assert out["may_ask"] is False
+        assert out["may_ask"] is True
         assert out["owner"]["linked"] is None
+
+    def test_sloe_open_no_policy_local_trusted_caller_may_ask(self):
+        policy.set_state(None)
+        muon_floor.set_protection_level(muon_floor.LEVEL_OPEN)
+        out = self.ask_as(LOOPBACK, TRUSTED_USER)
+        assert out["may_ask"] is True
 
     def test_the_waiver_is_null_when_aux_has_none_to_show(self):
         printer(OPEN, NOBODY)
