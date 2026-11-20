@@ -15,6 +15,7 @@ import tornado.web
 
 from ..common import RequestType
 from .application import AuthorizedRequestHandler, _check_file_access
+from .muon_panel_nav import PanelNav
 
 if TYPE_CHECKING:
     from ..confighelper import ConfigHelper
@@ -110,6 +111,8 @@ class MuonPanel:
         app: Any = self.server.lookup_component("application")
         app.register_handler(
             ENDPOINT.replace(".", r"\."), PanelHandler, {"panel": self})
+        # KAN-4812: the live state, and navigating the panel
+        self.nav = PanelNav(self.server)
 
     async def get_page(self) -> Page:
         async with self._lock:

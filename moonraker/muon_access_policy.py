@@ -155,6 +155,10 @@ class Action:
     #: Reachable by a caller on the home network that is not admitted: a
     #: new device asking the panel to let it in (ACC-6) is not, yet.
     home_unadmitted: bool = False
+    #: Only the printer's own panel, which is above every level: no principal
+    #: below PANEL may do it, whatever the preset or an override says, and
+    #: whatever it owns (KAN-4812).
+    panel_only: bool = False
     #: The row this one was split from. Until it has an override of its own
     #: it follows that row's, so a setting made before the split still
     #: covers everything it covered (KAN-878).
@@ -238,6 +242,12 @@ _ROWS = (
     _A("access_request", SIGNED_OUT_GUEST, SIGNED_OUT_GUEST,
        SIGNED_OUT_GUEST, fixed=True, delegated=True, viewer_allowed=True,
        home_unadmitted=True),
+    # KAN-4812: what only the panel's own connection sends Moonraker, the live
+    # state it publishes and its answer to a remote navigation. Not a level
+    # an owner can hold: the owner's phone navigates the panel, it is never
+    # the panel. Delegated so a capability list does not name it.
+    _A("panel_only", PANEL, PANEL, PANEL, fixed=True, delegated=True,
+       panel_only=True),
     # Not rows of the design's table. Moonraker has surfaces it does not name.
     # A client's own preferences in the database, dismissing a notice, the
     # display's brightness: what a person needs to use the interface at all,
@@ -390,6 +400,8 @@ def required_level(action: Action, state: AccessState) -> int:
       the panel only where that is admin. A gap in knowing the owner never
       opens the printer more than its real owner would.
     """
+    if action.panel_only:
+        return PANEL
     if action.name == "dev_mode_request" and state.entry == ENTRY_OPEN:
         # KAN-4753 (D-166, Jack): on an Open printer anyone admitted may ask
         # for, complete and poll developer mode, whoever owns it and whatever
@@ -585,6 +597,12 @@ WRITE_ACTIONS: Tuple[Tuple[str, str], ...] = (
     ("/server/muon/access", "protection"),
     ("/server/muon/identity/name", "rename"),
     ("/server/muon/dev_mode/request", "dev_mode_request"),
+    # KAN-4812: the panel's live state is a read (GET, below); navigating it
+    # is a write, a Viewer may not. publish and navigate_result come only
+    # from the panel's own connection, which the component checks again.
+    ("/server/muon/panel/publish", "panel_only"),
+    ("/server/muon/panel/navigate_result", "panel_only"),
+    ("/server/muon/panel/navigate", "ui_settings"),
     ("/server/aux/dev_mode", "dev_mode"),
     ("/server/aux/wifi/ap", "hotspot"),
     ("/server/aux/wifi", "wifi"),
@@ -849,6 +867,11 @@ def decide_action(
         return Decision(False, action.name, reason)
     if principal.level >= PANEL:
         return Decision(True, action.name)
+    if action.panel_only:
+        return Decision(
+            False, action.name, "it can be done only at the printer's panel",
+            PANEL,
+        )
     if principal.kind == BLUETOOTH:
         # Before the role, the level or any setting: no preset or override
         # gives a phone being set up over Bluetooth more (KAN-436).

@@ -17,7 +17,7 @@ from abc import ABCMeta, abstractmethod
 from .utils import Sentinel
 from .utils import redact
 from .utils import json_wrapper as jsonw
-from .utils.exceptions import ServerError, AgentError
+from .utils.exceptions import ServerError, AgentError, BodyError
 from . import muon_access_policy
 from . import muon_floor
 
@@ -949,6 +949,9 @@ class JsonRPC:
             method_name = f"Requested Method: {method_name}, "
         log_msg = f"JSON-RPC Request Error - {method_name}Code: {code}, Message: {msg}"
         err = {'code': code, 'message': msg}
+        if isinstance(exc, BodyError):
+            # MUON (KAN-4812): the fields of a BodyError, as the error's data
+            err["data"] = exc.body
         if isinstance(exc, AgentError):
             err["extra"] = exc.error_data
             if self.verbose:
