@@ -91,6 +91,25 @@ def _name(value: Any) -> Optional[str]:
     return None
 
 
+#: Screens that are the owner's whatever the panel publishes (KAN-4949), so
+#: a stale or wrong panel cannot open them. Compared with route_key.
+SERVER_OWNER_ONLY = frozenset((
+    "protection", "devices", "permissions", "permvalue", "link", "linkcode",
+    "hotspot", "hotspotqr",
+))
+#: The owner's too while Moonraker's own protection level is not Open.
+LOCKED_OWNER_ONLY = frozenset(("devmode",))
+
+
+def protection_is_open() -> bool:
+    """Is Moonraker's own protection level Open? Anything else, or a level
+    that cannot be read, is not."""
+    try:
+        return muon_floor.protection_level() == muon_floor.LEVEL_OPEN
+    except Exception:
+        return False
+
+
 def route_key(screen: str) -> str:
     """A screen id as owner-only routes are compared: lower case, without
     leading or trailing slashes or spaces."""
@@ -344,6 +363,9 @@ class PanelNav:
         principal = self._caller(web_request)
         owner = principal is not None and principal.level >= policy.ADMIN
         owner_only = {route_key(r) for r in state["owner_only_routes"]}
+        owner_only |= SERVER_OWNER_ONLY
+        if not protection_is_open():
+            owner_only |= LOCKED_OWNER_ONLY
         if route_key(screen) in owner_only and not owner:
             raise refusal(403, "owner_only")
         if if_seq is not None and if_seq != state["seq"]:

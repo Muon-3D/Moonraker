@@ -1449,3 +1449,116 @@ def test_the_panel_origin_is_allowed_by_cors():
     lines = [line.strip() for line in text.splitlines()]
     assert any(line.startswith("*://127.0.0.1:100") for line in lines)
     assert any(line.startswith("*://localhost:100") for line in lines)
+
+
+# ---------------------------------------------------------------------------
+# KAN-4949: the owner-only screens Moonraker knows itself
+# ---------------------------------------------------------------------------
+
+SERVER_SCREENS = ["protection", "devices", "permissions", "permvalue", "link",
+                  "linkcode", "hotspot", "hotspotqr"]
+
+
+class TestServerOwnerOnly:
+    @staticmethod
+    async def go(rig: Rig, screen: str, who: Who, **published: Any) -> Any:
+        panel = rig.panel()
+        await rig.publish(panel, **published)
+        rig.auto_reply(panel)
+        return await rig.call("navigate", {"screen": screen}, who)
+
+    @pytest.mark.parametrize("screen", SERVER_SCREENS)
+    @pytest.mark.parametrize("level", [muon_floor.LEVEL_OPEN,
+                                       muon_floor.LEVEL_PROTECTED])
+    def test_a_stale_panel_with_no_list_cannot_open_them(self, screen, level):
+        muon_floor.set_protection_level(level)
+
+        async def scenario(rig: Rig) -> Any:
+            return await rig.refused(self.go(
+                rig, screen, MEMBER, owner_only_routes=[]))
+        err = run(scenario)
+        assert err.status_code == 403 and err.body == {"reason": "owner_only"}
+
+    @pytest.mark.parametrize("screen", ["Protection", "/devices/", " LINK "])
+    def test_compared_the_same_way(self, screen):
+        async def scenario(rig: Rig) -> Any:
+            return await rig.refused(self.go(
+                rig, screen, MEMBER, owner_only_routes=[]))
+        assert run(scenario).status_code == 403
+
+    def test_the_panel_is_not_asked_when_refused(self):
+        async def scenario(rig: Rig) -> Any:
+            panel = rig.panel()
+            await rig.publish(panel, owner_only_routes=[])
+            await rig.refused(rig.call(
+                "navigate", {"screen": "protection"}, MEMBER))
+            return panel.calls
+        assert run(scenario) == []
+
+    @pytest.mark.parametrize("screen", SERVER_SCREENS + ["devmode"])
+    @pytest.mark.parametrize("level", [muon_floor.LEVEL_OPEN,
+                                       muon_floor.LEVEL_PROTECTED])
+    def test_the_owner_is_always_allowed(self, screen, level):
+        muon_floor.set_protection_level(level)
+
+        async def scenario(rig: Rig) -> Any:
+            return await self.go(rig, screen, OWNER, owner_only_routes=[])
+        assert run(scenario) == {"seq": 5}
+
+    def test_the_local_panel_is_allowed(self):
+        muon_floor.set_protection_level(muon_floor.LEVEL_PROTECTED)
+
+        async def scenario(rig: Rig) -> Any:
+            return await self.go(rig, "devmode", LOCAL_HTTP,
+                                 owner_only_routes=[])
+        assert run(scenario) == {"seq": 5}
+
+    def test_devmode_is_allowed_for_an_operator_on_open(self):
+        muon_floor.set_protection_level(muon_floor.LEVEL_OPEN)
+
+        async def scenario(rig: Rig) -> Any:
+            return await self.go(rig, "devmode", MEMBER, owner_only_routes=[])
+        assert run(scenario) == {"seq": 5}
+
+    def test_devmode_is_owner_only_when_not_open(self):
+        muon_floor.set_protection_level(muon_floor.LEVEL_PROTECTED)
+
+        async def scenario(rig: Rig) -> Any:
+            return await rig.refused(self.go(
+                rig, "devmode", MEMBER, owner_only_routes=[]))
+        assert run(scenario).body == {"reason": "owner_only"}
+
+    @pytest.mark.parametrize("how", ["raises", "not_an_int", "none"])
+    def test_an_unreadable_level_makes_devmode_owner_only(
+            self, monkeypatch: pytest.MonkeyPatch, how: str):
+        def unreadable() -> Any:
+            if how == "raises":
+                raise RuntimeError("no level")
+            return "garbage" if how == "not_an_int" else None
+        monkeypatch.setattr(muon_floor, "protection_level", unreadable)
+
+        async def scenario(rig: Rig) -> Any:
+            return await rig.refused(self.go(
+                rig, "devmode", MEMBER, owner_only_routes=[]))
+        assert run(scenario).status_code == 403
+
+    def test_the_unreadable_level_still_lets_the_owner_in(
+            self, monkeypatch: pytest.MonkeyPatch):
+        def unreadable() -> Any:
+            raise RuntimeError("no level")
+        monkeypatch.setattr(muon_floor, "protection_level", unreadable)
+
+        async def scenario(rig: Rig) -> Any:
+            return await self.go(rig, "devmode", OWNER, owner_only_routes=[])
+        assert run(scenario) == {"seq": 5}
+
+    def test_the_published_list_still_counts(self):
+        async def scenario(rig: Rig) -> Any:
+            return await rig.refused(self.go(
+                rig, "extra", MEMBER, owner_only_routes=["extra"]))
+        assert run(scenario).status_code == 403
+
+    def test_other_screens_stay_open_to_an_operator(self):
+        async def scenario(rig: Rig) -> Any:
+            return await self.go(rig, "files", MEMBER, owner_only_routes=[])
+        assert run(scenario) == {"seq": 5}
