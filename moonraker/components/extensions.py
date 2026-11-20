@@ -10,8 +10,7 @@ import logging
 import ipaddress
 from ..common import BaseRemoteConnection, RequestType, TransportType
 from ..utils import get_unix_peer_credentials
-from .. import muon_floor
-from .muon_panel_nav import NAVIGATE_METHOD, PANEL_NAME
+from .muon_panel_nav import NAVIGATE_METHOD
 
 # Annotation imports
 from typing import (
@@ -58,16 +57,6 @@ class ExtensionManager:
         data = connection.client_data
         name = data["name"]
         client_type = data["type"]
-        # MUON, KAN-4812: the panel's name is the panel's alone. identify is
-        # open to guests, so a remote one taking it would hold it, and the
-        # real panel could not register when it reconnects.
-        if name == PANEL_NAME and not muon_floor.local_address(
-            getattr(connection, "authentication_ip", None)
-        ):
-            raise self.server.error(
-                f"The agent name '{name}' is reserved for the printer's panel",
-                403
-            )
         if client_type != "agent":
             raise self.server.error(
                 f"Cannot register client type '{client_type}' as an agent"
@@ -119,14 +108,12 @@ class ExtensionManager:
         if conn is None:
             raise self.server.error("No connection detected")
         method_name = web_request.get_str("method_name")
-        if method_name == NAVIGATE_METHOD and not (
-            conn.client_data.get("name") == PANEL_NAME
-            and muon_floor.local_address(
-                getattr(conn, "authentication_ip", None))
-        ):
+        # MUON, KAN-4812: registering a method also registers it with
+        # Klippy, where a G-code macro could call it. The panel is sent its
+        # navigations directly (muon_panel_nav), so nobody registers this.
+        if method_name == NAVIGATE_METHOD:
             raise self.server.error(
-                f"The method '{method_name}' is reserved for the printer's "
-                "panel", 403
+                f"The method '{method_name}' is reserved", 403
             )
         klippy: Klippy = self.server.lookup_component("klippy_connection")
         klippy.register_method_from_agent(conn, method_name)

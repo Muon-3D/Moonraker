@@ -113,8 +113,7 @@ class Websockets:
 
 
 class Extensions:
-    def __init__(self) -> None:
-        self.agent_methods: Dict[int, List[str]] = {}
+    pass
 
 
 class Access:
@@ -159,9 +158,10 @@ class Conn(BaseRemoteConnection):
     ids = itertools.count(1000)
 
     def __init__(self, ip: Optional[str] = "127.0.0.1", name: str = "muon-panel",
-                 unix: bool = False) -> None:
+                 unix: bool = False, ctype: str = "display") -> None:
         self._uid = next(self.ids)
-        self._client_data = {"name": name, "version": "1", "type": "agent",
+        self.server: Any = None
+        self._client_data = {"name": name, "version": "1", "type": ctype,
                              "url": ""}
         self._identified = True
         self._user_info = None
@@ -198,10 +198,7 @@ class Rig:
 
     # -- connections --------------------------------------------------------
 
-    def identify(self, conn: Conn, register: bool = True) -> Conn:
-        if register:
-            self.server.extensions.agent_methods.setdefault(
-                conn.uid, []).append(muon_panel_nav.NAVIGATE_METHOD)
+    def identify(self, conn: Conn) -> Conn:
         self.server.send_event("websockets:client_identified", conn)
         return conn
 
@@ -306,11 +303,21 @@ class TestPublishIsThePanelsAlone:
             return await rig.refused(rig.publish(conn))
         assert run(scenario).status_code == 403
 
-    def test_without_the_remote_method_registered(self):
+    @pytest.mark.parametrize("ctype", [
+        "display", "web", "mobile", "desktop", "bot", "agent", "other", ""])
+    def test_any_client_type_may_be_the_panel(self, ctype: str):
         async def scenario(rig: Rig) -> Any:
-            conn = rig.identify(Conn(), register=False)
-            return await rig.refused(rig.publish(conn))
-        assert run(scenario).status_code == 403
+            panel = rig.identify(Conn(ctype=ctype))
+            await rig.publish(panel)
+            rig.auto_reply(panel)
+            return await rig.call("navigate", {"screen": "files"}, OWNER)
+        assert run(scenario) == {"seq": 5}
+
+    def test_no_method_registration_is_needed(self):
+        async def scenario(rig: Rig) -> Any:
+            panel = rig.panel()      # identify only
+            return await rig.publish(panel)
+        assert run(scenario) == {"seq": 5}
 
     def test_a_plain_http_request_has_no_connection(self):
         async def scenario(rig: Rig) -> Any:
@@ -576,6 +583,19 @@ class TestNavigate:
                 "navigate", {"screen": "settings"}, OWNER))
         err = run(scenario)
         assert err.status_code == 403 and err.body == {"reason": "owner_only"}
+
+    def test_the_panels_400_is_passed_through(self):
+        async def scenario(rig: Rig) -> Any:
+            panel = rig.panel()
+            await rig.publish(panel)
+            rig.auto_reply(panel, ok=False, status=400, reason="bad_params")
+            return await rig.refused(rig.call(
+                "navigate", {"screen": "files"}, OWNER))
+        err = run(scenario)
+        assert err.status_code == 400 and err.body == {"reason": "bad_params"}
+
+    def test_the_passthrough_statuses(self):
+        assert muon_panel_nav.PASSTHROUGH == (400, 403, 409, 423)
 
     def test_the_panels_423_is_passed_through(self):
         async def scenario(rig: Rig) -> Any:
@@ -1065,29 +1085,28 @@ def test_the_endpoints_are_registered_for_http_and_json_rpc():
 # ---------------------------------------------------------------------------
 
 
-class TestThePanelNameCannotBeHeldRemotely:
-    """identify is open to guests: a remote one must not hold the name, or
-    the method, that the real panel needs when it reconnects."""
+class TestThePanelNameAndMethodAreReserved:
+    """identify is open to guests: a remote one must not be taken for the
+    panel, and nobody may register the navigate method, which would also
+    register it with Klippy, where a macro could call it."""
 
-    @staticmethod
-    def manager() -> Any:
+    class Klippy:
+        def __init__(self) -> None:
+            self.methods: List[str] = []
+
+        def register_method_from_agent(self, conn: Any, name: str) -> None:
+            self.methods.append(name)
+
+    @classmethod
+    def manager(cls) -> Any:
         from moonraker.components.extensions import ExtensionManager
-
-        class Klippy:
-            def __init__(self) -> None:
-                self.methods: List[str] = []
-
-            def register_method_from_agent(self, conn: Any, name: str) -> None:
-                if name in self.methods:
-                    raise ServerError("already registered")
-                self.methods.append(name)
 
         class Plain:
             error = ServerError
 
             def __init__(self) -> None:
                 self.components: Dict[str, Any] = {
-                    "klippy_connection": Klippy()}
+                    "klippy_connection": cls.Klippy()}
 
             def register_endpoint(self, *args: Any, **kwargs: Any) -> None:
                 pass
@@ -1106,52 +1125,97 @@ class TestThePanelNameCannotBeHeldRemotely:
                              {"method_name": method}, RequestType.POST, conn)
         return asyncio.run(mgr._register_agent_method(request))
 
-    def test_a_remote_guest_cannot_take_the_agent_name(self):
-        mgr, _ = self.manager()
-        guest = Conn(ip="192.168.1.50")
+    @staticmethod
+    def identify(conn: Conn, **args: Any) -> Any:
+        from moonraker.common import WebRequest
+        from moonraker.components.websockets import WebsocketManager
+        server = Server()
+        conn.server = server
+        conn._identified = False
+        conn._client_data = {"name": "unknown", "version": "", "type": "",
+                             "url": ""}
+        wsm = WebsocketManager.__new__(WebsocketManager)
+        wsm.server = server  # type: ignore[assignment]
+        params = {"client_name": "muon-panel", "version": "1", "type": "display",
+                  "url": "", **args}
+        request = WebRequest("/server/connection/identify", params,
+                             RequestType.POST, conn)
+        return asyncio.run(wsm._handle_identify(request)), server
+
+    @pytest.mark.parametrize("ctype", [
+        "display", "web", "agent", "mobile", "desktop", "bot", "other"])
+    @pytest.mark.parametrize("ip", ["192.168.1.50", "192.0.2.1", "10.1.2.3"])
+    def test_a_remote_client_cannot_identify_as_the_panel(self, ip, ctype):
+        conn = Conn(ip=ip)
         with pytest.raises(ServerError) as err:
-            mgr.register_agent(guest)
+            self.identify(conn, type=ctype)
         assert err.value.status_code == 403
-        assert "muon-panel" not in mgr.agents
-        # so the real panel can still register, whenever it reconnects
-        mgr.register_agent(Conn())
-        assert "muon-panel" in mgr.agents
+        assert not conn.identified
 
-    def test_the_gateways_sentinel_cannot_either(self):
-        mgr, _ = self.manager()
+    def test_a_local_client_can_whatever_its_type(self):
+        for ctype in ("display", "web", "other"):
+            conn = Conn()
+            result, server = self.identify(conn, type=ctype)
+            assert result == {"connection_id": conn.uid}
+            assert conn.identified and conn.client_data["type"] == ctype
+
+    def test_the_unix_socket_can(self):
+        conn = Conn(unix=True)
+        assert self.identify(conn)[0] == {"connection_id": conn.uid}
+
+    def test_other_names_are_open_to_remote_clients(self):
+        conn = Conn(ip="192.168.1.50")
+        result, _ = self.identify(conn, client_name="fluidd", type="web")
+        assert result == {"connection_id": conn.uid}
+
+    def test_a_remote_guest_does_not_lock_the_panel_out(self):
+        rig = Rig()
         with pytest.raises(ServerError):
-            mgr.register_agent(Conn(ip="192.0.2.1"))
+            self.identify(Conn(ip="192.168.1.50"))
+        panel = rig.panel()
+        assert rig.nav._panel is panel
 
-    def test_another_agent_name_is_unaffected(self):
-        mgr, _ = self.manager()
-        mgr.register_agent(Conn(ip="192.168.1.50", name="helper"))
-        assert "helper" in mgr.agents
-
-    def test_a_remote_connection_cannot_register_the_navigate_method(self):
+    @pytest.mark.parametrize("conn", [
+        Conn(), Conn(ip="192.168.1.50"), Conn(name="helper", ctype="agent"),
+        Conn(ctype="agent"), Conn(unix=True)])
+    def test_nobody_may_register_the_navigate_method(self, conn: Conn):
         mgr, server = self.manager()
-        for conn in (Conn(ip="192.168.1.50"),
-                     Conn(ip="192.168.1.50", name="helper")):
-            with pytest.raises(ServerError) as err:
-                self.register(mgr, conn, muon_panel_nav.NAVIGATE_METHOD)
-            assert err.value.status_code == 403
+        with pytest.raises(ServerError) as err:
+            self.register(mgr, conn, muon_panel_nav.NAVIGATE_METHOD)
+        assert err.value.status_code == 403
+        assert "reserved" in str(err.value)
         assert server.components["klippy_connection"].methods == []
-
-    def test_a_local_connection_that_is_not_the_panel_cannot_either(self):
-        mgr, _ = self.manager()
-        with pytest.raises(ServerError):
-            self.register(mgr, Conn(name="fluidd"),
-                          muon_panel_nav.NAVIGATE_METHOD)
-
-    def test_the_local_panel_registers_it(self):
-        mgr, server = self.manager()
-        assert self.register(
-            mgr, Conn(), muon_panel_nav.NAVIGATE_METHOD) == "ok"
-        assert server.components["klippy_connection"].methods == [
-            "muon_panel_navigate"]
+        assert not mgr.agent_methods
 
     def test_other_methods_are_free_to_anyone(self):
-        mgr, _ = self.manager()
+        mgr, server = self.manager()
         assert self.register(mgr, Conn(ip="192.168.1.50"), "x") == "ok"
+        assert server.components["klippy_connection"].methods == ["x"]
+
+    def test_a_navigation_never_touches_klippys_methods(self):
+        async def scenario(rig: Rig) -> Any:
+            klippy = self.Klippy()
+            rig.server.components["klippy_connection"] = klippy
+            panel = rig.panel()                  # a display; nothing registered
+            await rig.publish(panel)
+            rig.auto_reply(panel)
+            await rig.call("navigate", {"screen": "files"}, OWNER)
+            return klippy.methods, [c[0] for c in panel.calls]
+        methods, calls = run(scenario)
+        assert methods == []                     # a macro has nothing to call
+        assert calls == ["muon_panel_navigate"]  # sent to the connection
+
+    def test_the_method_is_sent_as_a_notification_with_no_id(self):
+        async def scenario(rig: Rig) -> Any:
+            panel = rig.panel()
+            await rig.publish(panel)
+            rig.auto_reply(panel)
+            await rig.call("navigate", {"screen": "files"}, OWNER)
+            return panel.calls
+        (method, params), = run(scenario)
+        assert method == "muon_panel_navigate"
+        assert set(params) == {"req_id", "screen", "params", "caller_role",
+                               "caller_is_owner", "caller_level"}
 
 
 class TestWhatTheOwnerOnlyCheckSendsAndCompares:

@@ -24,14 +24,18 @@ Code: `moonraker/components/muon_panel_nav.py`, loaded by `muon_panel`.
 
 **The panel connection.** One connection: local (a peer at 127.0.0.1 or
 ::1, or the unix socket) that called `server.connection.identify` with
-`client_name` `muon-panel` and registered the remote method
-`muon_panel_navigate`. The latest one to identify wins; when it
+`client_name` `muon-panel`, of any client type (the panel is a `display`).
+Nothing is registered. The latest one to identify wins; when it
 disconnects the state is `{connected: false}` and every pending navigation
-fails with 503. The agent name `muon-panel` and the remote method
-`muon_panel_navigate` are reserved: identify and `register_remote_method`
-refuse them (403) from any non-local connection, and the method from any
-local one that is not the panel, so a guest cannot hold them and lock the
-real panel out.
+fails with 503.
+
+The client name `muon-panel` is refused (403) at identify to every
+non-local connection, whatever its type, so a guest cannot be taken for the
+panel or lock it out. A navigation is sent to the panel connection directly,
+as the JSON-RPC notification `muon_panel_navigate`, and never through
+Klippy's remote methods, where a G-code macro could call it with a forged
+`caller_is_owner`. So `connection.register_remote_method` refuses the name
+`muon_panel_navigate` (403, reserved) from every connection.
 
 | Method | HTTP | Who |
 | --- | --- | --- |
@@ -70,8 +74,9 @@ as `error.data` over JSON-RPC):
   `muon_panel_navigate {req_id, screen, params, caller_role,
   caller_is_owner, caller_level}` (`caller_level` is the access level name,
   `panel` for local callers) and has 2.0 s to answer with `navigate_result`.
-  `ok` gives 200 `{seq}`, Moonraker's current seq, not the panel's; not `ok` gives its `status` (409 or 423, anything else is
-  409) with `{reason}`; no answer gives 504 `panel_timeout`.
+  `ok` gives 200 `{seq}`, Moonraker's current seq, not the panel's; not `ok`
+  gives its `status` (400, 403, 409 or 423, anything else is 409) with
+  `{reason}`; no answer gives 504 `panel_timeout`.
 
 A `navigate_result` that is late, for an unknown `req_id`, or from any
 connection but the panel is dropped (debug log; 403 for a foreign
