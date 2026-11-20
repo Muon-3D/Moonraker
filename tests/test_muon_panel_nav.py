@@ -567,6 +567,16 @@ class TestNavigate:
                 "navigate", {"screen": "files", "if_seq": 5}, OWNER)
         assert run(scenario) == {"seq": 5}
 
+    def test_the_panels_403_owner_only_is_passed_through(self):
+        async def scenario(rig: Rig) -> Any:
+            panel = rig.panel()
+            await rig.publish(panel)
+            rig.auto_reply(panel, ok=False, status=403, reason="owner_only")
+            return await rig.refused(rig.call(
+                "navigate", {"screen": "settings"}, OWNER))
+        err = run(scenario)
+        assert err.status_code == 403 and err.body == {"reason": "owner_only"}
+
     def test_the_panels_423_is_passed_through(self):
         async def scenario(rig: Rig) -> Any:
             panel = rig.panel()
@@ -587,7 +597,7 @@ class TestNavigate:
         err = run(scenario)
         assert err.status_code == 409 and err.body == {"reason": "modal_open"}
 
-    @pytest.mark.parametrize("status", [None, 200, 500, "x", 403])
+    @pytest.mark.parametrize("status", [None, 200, 500, "x", 401])
     def test_any_other_status_from_the_panel_is_a_409(self, status: Any):
         async def scenario(rig: Rig) -> Any:
             panel = rig.panel()

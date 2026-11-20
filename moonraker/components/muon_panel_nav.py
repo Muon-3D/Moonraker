@@ -56,7 +56,9 @@ CALLER_PENDING = 2
 CALLER_RATE = 2
 CALLER_WINDOW = 1.0
 #: What a panel may say when it refuses a navigation.
-PASSTHROUGH = (409, 423)
+# 403: the panel refused an owner-only screen itself (it enforces owner-only
+# too, including sub-pages opened by params), KAN-4949.
+PASSTHROUGH = (403, 409, 423)
 
 
 def refusal(status: int, reason: str, **fields: Any) -> BodyError:
