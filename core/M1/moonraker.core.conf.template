@@ -259,6 +259,11 @@ admin_address: 127.0.0.1:7131
 # MUON: read-only USB browsing and copy-then-print.
 [muon_usb]
 
+# KAN-4868: the panel page for Control over Bluetooth or the relay, where
+# nginx is not reachable: GET /server/muon/panel/index.html
+[muon_panel]
+path: /usr/share/muon-panel/index.html
+
 # KAN-162: start the bed ramp when a job is queued instead of at the top
 # of PRINT_START.  This turns on the 170W bed heater with no human input,
 # so the component itself defaults to disabled -- enabling it is an
