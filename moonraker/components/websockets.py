@@ -19,6 +19,7 @@ from ..utils import ServerError, parse_ip_address
 from ..utils.real_ip import validate_real_ip_header
 from .. import muon_access_policy
 from .. import muon_floor
+from .muon_panel_nav import PANEL_NAME
 
 # Annotation imports
 from typing import (
@@ -97,6 +98,16 @@ class WebsocketManager:
                 f"Connection already identified: {sc.client_data}"
             )
         name = web_request.get_str("client_name")
+        # MUON, KAN-4812: the panel's name is the panel's alone, whatever the
+        # client type. identify is open to guests; a remote one taking the
+        # name would be taken for the panel.
+        if name == PANEL_NAME and not muon_floor.local_address(
+            sc.authentication_ip
+        ):
+            raise self.server.error(
+                f"The client name '{name}' is reserved for the printer's "
+                "panel", 403
+            )
         version = web_request.get_str("version")
         client_type: str = web_request.get_str("type").lower()
         url = web_request.get_str("url")

@@ -12,8 +12,12 @@
 # WHO THE PANEL IS
 #
 # Exactly one connection: a local one (a peer at 127.0.0.1 or ::1, or the unix
-# socket) that identified itself as client_name "muon-panel" and registered
-# the remote method `muon_panel_navigate`. The latest one to identify wins.
+# socket) that identified itself as client_name "muon-panel", of any client
+# type. The latest one to identify wins. A navigation is sent to it directly
+# as the JSON-RPC notification `muon_panel_navigate`, never through Klippy's
+# remote methods, which a G-code macro could call: that method is reserved
+# and nobody may register it (components/extensions.py), and the name is
+# refused to every non-local client at identify (components/websockets.py).
 # publish and navigate_result are accepted from that connection and from no
 # other, which this module checks on every call; muon_access_policy refuses
 # them to every remote principal, the owner included, before it gets here.
@@ -56,7 +60,9 @@ CALLER_PENDING = 2
 CALLER_RATE = 2
 CALLER_WINDOW = 1.0
 #: What a panel may say when it refuses a navigation.
-PASSTHROUGH = (409, 423)
+# 403: the panel refused an owner-only screen itself (it enforces owner-only
+# too, including sub-pages opened by params), KAN-4949.
+PASSTHROUGH = (400, 403, 409, 423)
 
 
 def refusal(status: int, reason: str, **fields: Any) -> BodyError:
@@ -130,18 +136,12 @@ class PanelNav:
         return muon_floor.local_address(
             getattr(conn, "authentication_ip", None))
 
-    def _registered_method(self, conn: BaseRemoteConnection) -> bool:
-        extensions: Any = self.server.lookup_component("extensions", None)
-        methods = getattr(extensions, "agent_methods", {})
-        return NAVIGATE_METHOD in methods.get(conn.uid, ())
-
     def _qualifies(self, conn: BaseRemoteConnection) -> bool:
         return (
             not conn.is_closed
             and conn.identified
             and conn.client_data.get("name") == PANEL_NAME
             and self._is_local(conn)
-            and self._registered_method(conn)
         )
 
     def _is_panel(self, conn: Optional[BaseRemoteConnection]) -> bool:
