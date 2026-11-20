@@ -24,7 +24,7 @@ import asyncio
 import json
 import logging
 import secrets
-from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from .. import muon_access_policy as policy
 from .. import muon_floor
@@ -49,6 +49,12 @@ MAX_STATE_BYTES = 64 * 1024
 MAX_PARAMS_BYTES = 16 * 1024
 MAX_ROUTES = 256
 MAX_NAME = 128
+#: What a published seq may be: a JSON number a browser reads exactly.
+MAX_SEQ = 2 ** 53 - 1
+#: One caller's navigations: waiting at once, and started per second.
+CALLER_PENDING = 2
+CALLER_RATE = 2
+CALLER_WINDOW = 1.0
 #: What a panel may say when it refuses a navigation.
 PASSTHROUGH = (409, 423)
 
@@ -79,6 +85,12 @@ def _name(value: Any) -> Optional[str]:
     return None
 
 
+def route_key(screen: str) -> str:
+    """A screen id as owner-only routes are compared: lower case, without
+    leading or trailing slashes or spaces."""
+    return screen.strip().strip("/").strip().lower()
+
+
 class PanelNav:
     def __init__(self, server: Server) -> None:
         self.server = server
@@ -89,6 +101,10 @@ class PanelNav:
         #: req_id -> (answer, the connection it was sent to)
         self._pending: Dict[
             str, Tuple[asyncio.Future, BaseRemoteConnection]] = {}
+        #: req_id -> whose navigation it is
+        self._callers: Dict[str, str] = {}
+        #: caller -> when its recent navigations started
+        self._starts: Dict[str, List[float]] = {}
         self._last_sent = float("-inf")
         self._dirty = False
         self._timer: Optional[asyncio.TimerHandle] = None
@@ -99,6 +115,7 @@ class PanelNav:
             ("navigate_result", RequestType.POST, self._navigate_result),
         ):
             server.register_endpoint(f"{PREFIX}/{name}", verb, handler)
+        policy.register_notification_filter(NOTIFICATION, self._visible)
         server.register_event_handler(
             "websockets:client_identified", self._on_identified)
         server.register_event_handler(
@@ -196,6 +213,19 @@ class PanelNav:
         wsm: Any = self.server.lookup_component("websockets")
         wsm.notify_clients(NOTIFICATION, [self.view()], mask)
 
+    def _visible(self, data: Any, connection: Any) -> Any:
+        """Who is sent the state: whoever may read it by GET."""
+        current = policy.state()
+        if current is None:
+            return data
+        principal = policy.resolve_principal(
+            connection, connection.ip_addr, connection.user_info,
+            current.entry, current.home)
+        if principal is None or not policy.decide_action(
+                policy.READ, principal, current).allowed:
+            return None
+        return data
+
     @staticmethod
     def _checked(raw: Any) -> Dict[str, Any]:
         """The published state as the panel may say it, or a 400."""
@@ -204,6 +234,8 @@ class PanelNav:
         if _size(raw) > MAX_STATE_BYTES:
             raise refusal(400, "state_too_large")
         seq = _plain_int(raw.get("seq", 0))
+        if seq is not None and not 0 <= seq <= MAX_SEQ:
+            raise refusal(400, "bad_seq")
         screen = _name(raw.get("screen"))
         params = raw.get("params")
         busy = raw.get("busy", False)
@@ -234,9 +266,10 @@ class PanelNav:
         state = self._checked(web_request.get("state"))
         # Moonraker's own count, so a client can compare it for if_seq
         # whatever the panel numbers.
-        state["seq"] = (
-            state["seq"] if state["seq"] > self._last_seq
-            else self._last_seq + 1)
+        if state["seq"] <= self._last_seq:
+            if self._last_seq >= MAX_SEQ:
+                raise refusal(400, "bad_seq")
+            state["seq"] = self._last_seq + 1
         self._last_seq = state["seq"]
         self._state = state
         self._changed()
@@ -260,6 +293,35 @@ class PanelNav:
             web_request.transport, web_request.get_ip_address(),
             web_request.get_current_user(), state.entry, state.home)
 
+    @staticmethod
+    def _caller_key(
+        web_request: WebRequest, principal: Optional[policy.Principal]
+    ) -> Optional[str]:
+        """Whose navigations are counted together: the muon access
+        principal. None for the panel and local callers, who are exempt."""
+        if principal is None:
+            return f"ip:{web_request.get_ip_address()}"
+        if principal.level >= policy.PANEL:
+            return None
+        return f"{principal.kind}:{principal.name}"
+
+    def _check_caller(self, caller: Optional[str]) -> None:
+        """429 rate_limited past CALLER_PENDING waiting or CALLER_RATE
+        started in the last CALLER_WINDOW; counts this one when it passes."""
+        if caller is None:
+            return
+        now = self.server.get_event_loop().get_loop_time()
+        recent = [t for t in self._starts.get(caller, [])
+                  if now - t < CALLER_WINDOW]
+        waiting = sum(1 for who in self._callers.values() if who == caller)
+        if waiting >= CALLER_PENDING or len(recent) >= CALLER_RATE:
+            self._starts[caller] = recent
+            raise refusal(429, "rate_limited")
+        self._starts[caller] = recent + [now]
+        if len(self._starts) > 256:
+            self._starts = {k: v for k, v in self._starts.items() if v and
+                            now - v[-1] < CALLER_WINDOW}
+
     async def _navigate(self, web_request: WebRequest) -> Dict[str, Any]:
         screen = _name(web_request.get("screen"))
         params = web_request.get("params", None)
@@ -281,21 +343,30 @@ class PanelNav:
             raise refusal(503, "panel_offline")
         principal = self._caller(web_request)
         owner = principal is not None and principal.level >= policy.ADMIN
-        if screen in state["owner_only_routes"] and not owner:
+        owner_only = {route_key(r) for r in state["owner_only_routes"]}
+        if route_key(screen) in owner_only and not owner:
             raise refusal(403, "owner_only")
         if if_seq is not None and if_seq != state["seq"]:
             raise refusal(409, "stale_seq", seq=state["seq"])
+        caller = self._caller_key(web_request, principal)
+        self._check_caller(caller)
         if len(self._pending) >= MAX_PENDING:
             raise refusal(429, "too_many_navigations")
         req_id = secrets.token_hex(8)
         fut: asyncio.Future = self.server.get_event_loop().create_future()
         self._pending[req_id] = (fut, panel)
+        if caller is not None:
+            self._callers[req_id] = caller
         try:
             panel.call_method(NAVIGATE_METHOD, {
                 "req_id": req_id,
                 "screen": screen,
                 "params": params,
                 "caller_role": principal.role if principal else policy.VIEWER,
+                "caller_is_owner": owner,
+                "caller_level": (
+                    policy.LEVEL_NAMES[principal.level] if principal
+                    else "none"),
             })
             try:
                 answer = await asyncio.wait_for(fut, NAV_TIMEOUT)
@@ -303,8 +374,10 @@ class PanelNav:
                 raise refusal(504, "panel_timeout") from None
         finally:
             self._pending.pop(req_id, None)
+            self._callers.pop(req_id, None)
         if answer["ok"]:
-            return {"seq": answer["seq"] or (self._state or state)["seq"]}
+            # Moonraker's own count, whatever the panel says it reached
+            return {"seq": (self._state or state)["seq"]}
         raise refusal(answer["status"], answer["reason"])
 
     async def _navigate_result(
@@ -324,7 +397,6 @@ class PanelNav:
         ok = web_request.get("ok", False) is True
         status = _plain_int(web_request.get("status", None))
         reason = web_request.get("reason", None)
-        seq = _plain_int(web_request.get("seq", None))
         fut = entry[0]
         if not fut.done():
             fut.set_result({
@@ -333,6 +405,5 @@ class PanelNav:
                 "reason": (
                     reason[:MAX_NAME] if isinstance(reason, str) and reason
                     else "refused"),
-                "seq": seq,
             })
         return {"accepted": True}

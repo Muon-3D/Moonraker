@@ -153,6 +153,7 @@ cors_domains:
     *://app.muon3d.com
     https://slicer.muon3d.com
     *://localhost:100 #Access for MuonUI Local Service
+    *://127.0.0.1:100 #The MuonUI panel origin (KAN-4812): the panel page is also opened by IP
     *://localhost:5173 #Acces for MuonUI Dev Server
 trusted_clients:
     127.0.0.0/8

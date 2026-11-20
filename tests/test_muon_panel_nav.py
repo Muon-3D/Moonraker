@@ -143,7 +143,7 @@ class Server:
         return self.loop
 
     def register_endpoint(self, path: str, verbs: Any, handler: Any,
-                          *args: Any) -> None:
+                          *args: Any, **kwargs: Any) -> None:
         self.endpoints[path] = APIDefinition.create(path, verbs, handler)
 
     def register_event_handler(self, event: str, callback: Any) -> None:
@@ -178,6 +178,9 @@ class Conn(BaseRemoteConnection):
     @property
     def authentication_ip(self) -> Any:
         return LOOPBACK if self.unix else self._ip
+
+    def send_notification(self, name: str, data: List[Any]) -> None:
+        pass
 
     def call_method(self, method: str, params: Any = None) -> None:
         self.calls.append((method, params))
@@ -502,14 +505,17 @@ class TestNavigate:
             assert not rig.nav._pending
             return answer, panel.calls
         answer, calls = run(scenario)
-        assert answer == {"seq": 6}
+        assert answer == {"seq": 5}     # Moonraker's, not the panel's 6
         (method, params), = calls
         assert method == "muon_panel_navigate"
         assert params["screen"] == "files"
         assert params["params"] == {"path": "a"}
         assert params["caller_role"] == "operator"
         assert isinstance(params["req_id"], str) and params["req_id"]
-        assert set(params) == {"req_id", "screen", "params", "caller_role"}
+        assert params["caller_is_owner"] is False
+        assert params["caller_level"] == "member"
+        assert set(params) == {"req_id", "screen", "params", "caller_role",
+                               "caller_is_owner", "caller_level"}
 
     def test_the_reply_without_a_seq_answers_with_the_current_one(self):
         async def scenario(rig: Rig) -> Any:
@@ -526,6 +532,7 @@ class TestNavigate:
             rig.auto_reply(panel)
             for _ in range(5):
                 await rig.call("navigate", {"screen": "files"}, OWNER)
+                rig.server.loop.advance(1)
             return [p["req_id"] for _, p in panel.calls]
         ids = run(scenario)
         assert len(set(ids)) == 5
@@ -782,7 +789,7 @@ class TestRepliesAreMatched:
         with caplog.at_level("DEBUG"):
             err, answer = run(scenario)
         assert err.status_code == 403
-        assert answer == {"seq": 6}
+        assert answer == {"seq": 5}
         assert "dropped" in caplog.text
 
     def test_a_remote_principal_cannot_answer(self):
@@ -827,16 +834,16 @@ class TestTheCap:
             tasks = []
             for _ in range(8):
                 tasks.append(asyncio.ensure_future(
-                    rig.call("navigate", {"screen": "files"}, OWNER)))
+                    rig.call("navigate", {"screen": "files"}, LOCAL_HTTP)))
             await asyncio.sleep(0)
             assert len(rig.nav._pending) == 8
             err = await rig.refused(rig.call(
-                "navigate", {"screen": "files"}, OWNER))
+                "navigate", {"screen": "files"}, LOCAL_HTTP))
             # answering one makes room
             await rig.result(panel, panel.calls[0][1]["req_id"])
             await tasks[0]
             tasks.append(asyncio.ensure_future(
-                rig.call("navigate", {"screen": "files"}, OWNER)))
+                rig.call("navigate", {"screen": "files"}, LOCAL_HTTP)))
             await asyncio.sleep(0)
             assert len(rig.nav._pending) == 8
             for call in panel.calls[1:]:
@@ -854,7 +861,7 @@ class TestDisconnect:
             panel = rig.panel()
             await rig.publish(panel)
             tasks = [asyncio.ensure_future(
-                rig.call("navigate", {"screen": "files"}, OWNER))
+                rig.call("navigate", {"screen": "files"}, LOCAL_HTTP))
                 for _ in range(3)]
             await asyncio.sleep(0)
             assert len(rig.nav._pending) == 3
@@ -1041,3 +1048,330 @@ def test_the_endpoints_are_registered_for_http_and_json_rpc():
         assert TransportType.WEBSOCKET in api.transports
         assert api.rpc_methods == [path[1:].replace("/", ".")]
     assert muon_panel.PanelNav is muon_panel_nav.PanelNav
+
+
+# ---------------------------------------------------------------------------
+# Review fixes (Moonraker#88)
+# ---------------------------------------------------------------------------
+
+
+class TestThePanelNameCannotBeHeldRemotely:
+    """identify is open to guests: a remote one must not hold the name, or
+    the method, that the real panel needs when it reconnects."""
+
+    @staticmethod
+    def manager() -> Any:
+        from moonraker.components.extensions import ExtensionManager
+
+        class Klippy:
+            def __init__(self) -> None:
+                self.methods: List[str] = []
+
+            def register_method_from_agent(self, conn: Any, name: str) -> None:
+                if name in self.methods:
+                    raise ServerError("already registered")
+                self.methods.append(name)
+
+        class Plain:
+            error = ServerError
+
+            def __init__(self) -> None:
+                self.components: Dict[str, Any] = {
+                    "klippy_connection": Klippy()}
+
+            def register_endpoint(self, *args: Any, **kwargs: Any) -> None:
+                pass
+
+            def lookup_component(self, name: str, default: Any = None) -> Any:
+                return self.components.get(name, default)
+
+        server = Plain()
+        config = type("C", (), {"get_server": lambda self: server})()
+        return ExtensionManager(config), server
+
+    @staticmethod
+    def register(mgr: Any, conn: Conn, method: str) -> Any:
+        from moonraker.common import WebRequest
+        request = WebRequest("/connection/register_remote_method",
+                             {"method_name": method}, RequestType.POST, conn)
+        return asyncio.run(mgr._register_agent_method(request))
+
+    def test_a_remote_guest_cannot_take_the_agent_name(self):
+        mgr, _ = self.manager()
+        guest = Conn(ip="192.168.1.50")
+        with pytest.raises(ServerError) as err:
+            mgr.register_agent(guest)
+        assert err.value.status_code == 403
+        assert "muon-panel" not in mgr.agents
+        # so the real panel can still register, whenever it reconnects
+        mgr.register_agent(Conn())
+        assert "muon-panel" in mgr.agents
+
+    def test_the_gateways_sentinel_cannot_either(self):
+        mgr, _ = self.manager()
+        with pytest.raises(ServerError):
+            mgr.register_agent(Conn(ip="192.0.2.1"))
+
+    def test_another_agent_name_is_unaffected(self):
+        mgr, _ = self.manager()
+        mgr.register_agent(Conn(ip="192.168.1.50", name="helper"))
+        assert "helper" in mgr.agents
+
+    def test_a_remote_connection_cannot_register_the_navigate_method(self):
+        mgr, server = self.manager()
+        for conn in (Conn(ip="192.168.1.50"),
+                     Conn(ip="192.168.1.50", name="helper")):
+            with pytest.raises(ServerError) as err:
+                self.register(mgr, conn, muon_panel_nav.NAVIGATE_METHOD)
+            assert err.value.status_code == 403
+        assert server.components["klippy_connection"].methods == []
+
+    def test_a_local_connection_that_is_not_the_panel_cannot_either(self):
+        mgr, _ = self.manager()
+        with pytest.raises(ServerError):
+            self.register(mgr, Conn(name="fluidd"),
+                          muon_panel_nav.NAVIGATE_METHOD)
+
+    def test_the_local_panel_registers_it(self):
+        mgr, server = self.manager()
+        assert self.register(
+            mgr, Conn(), muon_panel_nav.NAVIGATE_METHOD) == "ok"
+        assert server.components["klippy_connection"].methods == [
+            "muon_panel_navigate"]
+
+    def test_other_methods_are_free_to_anyone(self):
+        mgr, _ = self.manager()
+        assert self.register(mgr, Conn(ip="192.168.1.50"), "x") == "ok"
+
+
+class TestWhatTheOwnerOnlyCheckSendsAndCompares:
+    def test_the_owner_flag_and_level_go_to_the_panel(self):
+        async def scenario(rig: Rig) -> Any:
+            panel = rig.panel()
+            await rig.publish(panel)
+            rig.auto_reply(panel)
+            await rig.call("navigate", {"screen": "files"}, OWNER)
+            rig.server.loop.advance(1)
+            await rig.call("navigate", {"screen": "files"}, LOCAL_HTTP)
+            return [c[1] for c in panel.calls]
+        owner, local = run(scenario)
+        assert owner["caller_is_owner"] is True
+        assert owner["caller_level"] == "admin"
+        assert owner["caller_role"] == "operator"
+        assert local["caller_is_owner"] is True
+        assert local["caller_level"] == "panel"
+
+    @pytest.mark.parametrize("screen", [
+        "Settings", "SETTINGS", "/settings", "settings/", "/settings/",
+        "//settings//", " settings ", "/Settings/",
+    ])
+    def test_screens_compare_without_case_or_edge_slashes(self, screen: str):
+        async def scenario(rig: Rig) -> Any:
+            panel = rig.panel()
+            await rig.publish(panel)
+            err = await rig.refused(rig.call(
+                "navigate", {"screen": screen}, MEMBER))
+            return err, panel.calls
+        err, calls = run(scenario)
+        assert err.body == {"reason": "owner_only"} and calls == []
+
+    def test_the_published_routes_are_normalised_too(self):
+        async def scenario(rig: Rig) -> Any:
+            panel = rig.panel()
+            await rig.publish(
+                panel, owner_only_routes=["/Settings/", "LINK", "/a/b/"])
+            out = []
+            for screen in ("settings", "link", "a/b", "A/B/"):
+                out.append((await rig.refused(rig.call(
+                    "navigate", {"screen": screen}, MEMBER))).body)
+                rig.server.loop.advance(1)
+            return out
+        assert run(scenario) == [{"reason": "owner_only"}] * 4
+
+    def test_the_owner_still_passes_a_differently_spelled_screen(self):
+        async def scenario(rig: Rig) -> Any:
+            panel = rig.panel()
+            await rig.publish(panel)
+            rig.auto_reply(panel)
+            return await rig.call("navigate", {"screen": "/Settings"}, OWNER)
+        assert run(scenario) == {"seq": 5}
+
+
+class TestSeq:
+    def test_the_answer_is_moonrakers_seq_not_the_panels(self):
+        async def scenario(rig: Rig) -> Any:
+            panel = rig.panel()
+            await rig.publish(panel, seq=12)
+            rig.auto_reply(panel, seq=2 ** 60)
+            return await rig.call("navigate", {"screen": "files"}, OWNER)
+        assert run(scenario) == {"seq": 12}
+
+    def test_the_answer_follows_a_publish_made_meanwhile(self):
+        async def scenario(rig: Rig) -> Any:
+            panel = rig.panel()
+            await rig.publish(panel, seq=12)
+            task = asyncio.ensure_future(
+                rig.call("navigate", {"screen": "files"}, OWNER))
+            await asyncio.sleep(0)
+            await rig.publish(panel, seq=13)
+            await rig.result(panel, panel.calls[0][1]["req_id"], seq=1)
+            return await task
+        assert run(scenario) == {"seq": 13}
+
+    @pytest.mark.parametrize("seq", [2 ** 53, 2 ** 63, 10 ** 30, -1])
+    def test_a_seq_beyond_what_json_holds_is_refused(self, seq: int):
+        async def scenario(rig: Rig) -> Any:
+            panel = rig.panel()
+            return await rig.refused(rig.publish(panel, seq=seq))
+        assert run(scenario).status_code == 400
+
+    def test_the_largest_seq_is_accepted_then_the_count_stops(self):
+        async def scenario(rig: Rig) -> Any:
+            panel = rig.panel()
+            top = await rig.publish(panel, seq=2 ** 53 - 1)
+            err = await rig.refused(rig.publish(panel, seq=1))
+            return top, err
+        top, err = run(scenario)
+        assert top == {"seq": 2 ** 53 - 1} and err.status_code == 400
+
+    def test_the_count_survives_a_reconnect_with_a_lower_seq(self):
+        async def scenario(rig: Rig) -> Any:
+            first = rig.panel()
+            await rig.publish(first, seq=500)
+            rig.disconnect(first)
+            second = rig.panel()
+            a = await rig.publish(second, seq=1)
+            b = await rig.publish(second, seq=1)
+            return a, b
+        assert run(scenario) == ({"seq": 501}, {"seq": 502})
+
+
+class TestPerCallerLimit:
+    @staticmethod
+    async def ready(rig: Rig) -> Conn:
+        panel = rig.panel()
+        await rig.publish(panel)
+        return panel
+
+    def test_two_a_second_then_rate_limited(self):
+        async def scenario(rig: Rig) -> Any:
+            panel = await self.ready(rig)
+            rig.auto_reply(panel)
+            for _ in range(2):
+                await rig.call("navigate", {"screen": "files"}, MEMBER)
+            err = await rig.refused(rig.call(
+                "navigate", {"screen": "files"}, MEMBER))
+            rig.server.loop.advance(1.01)
+            again = await rig.call("navigate", {"screen": "files"}, MEMBER)
+            return err, again, len(panel.calls)
+        err, again, calls = run(scenario)
+        assert err.status_code == 429
+        assert err.body == {"reason": "rate_limited"}
+        assert again == {"seq": 5} and calls == 3
+
+    def test_two_pending_at_most(self):
+        async def scenario(rig: Rig) -> Any:
+            panel = await self.ready(rig)
+            tasks = []
+            for _ in range(2):
+                tasks.append(asyncio.ensure_future(
+                    rig.call("navigate", {"screen": "files"}, MEMBER)))
+                await asyncio.sleep(0)
+                rig.server.loop.advance(1.01)    # the rate is not the limit
+            err = await rig.refused(rig.call(
+                "navigate", {"screen": "files"}, MEMBER))
+            await rig.result(panel, panel.calls[0][1]["req_id"])
+            await tasks[0]
+            tasks.append(asyncio.ensure_future(
+                rig.call("navigate", {"screen": "files"}, MEMBER)))
+            await asyncio.sleep(0)
+            for call in panel.calls[1:]:
+                await rig.result(panel, call[1]["req_id"])
+            await asyncio.gather(*tasks)
+            return err
+        err = run(scenario)
+        assert err.status_code == 429 and err.body == {"reason": "rate_limited"}
+
+    def test_each_principal_has_its_own_allowance(self):
+        async def scenario(rig: Rig) -> Any:
+            panel = await self.ready(rig)
+            rig.auto_reply(panel)
+            for who in (MEMBER, OWNER):
+                for _ in range(2):
+                    await rig.call("navigate", {"screen": "files"}, who)
+            return len(panel.calls)
+        assert run(scenario) == 4
+
+    def test_a_refused_attempt_does_not_use_the_allowance(self):
+        async def scenario(rig: Rig) -> Any:
+            panel = await self.ready(rig)
+            rig.auto_reply(panel)
+            for _ in range(5):
+                await rig.refused(rig.call(
+                    "navigate", {"screen": "settings"}, MEMBER))
+            return await rig.call("navigate", {"screen": "files"}, MEMBER)
+        assert run(scenario) == {"seq": 5}
+
+    def test_local_callers_are_exempt(self):
+        async def scenario(rig: Rig) -> Any:
+            panel = await self.ready(rig)
+            rig.auto_reply(panel)
+            for _ in range(6):
+                await rig.call("navigate", {"screen": "files"}, LOCAL_HTTP)
+            return len(panel.calls)
+        assert run(scenario) == 6
+
+    def test_the_global_cap_of_eight_stands(self):
+        assert muon_panel_nav.MAX_PENDING == 8
+        assert muon_panel_nav.CALLER_PENDING == 2
+        assert muon_panel_nav.CALLER_RATE == 2
+
+
+class TestWhoIsSentTheState:
+    @staticmethod
+    def send(who: Who, state: Optional[policy.AccessState]) -> Any:
+        Rig()                                   # registers the filter
+        policy.set_state(state)
+        conn = Conn(ip=str(who[1]) if who[1] else None)
+        conn._user_info = who[2]
+        return policy.filter_notification(
+            muon_panel_nav.NOTIFICATION, [{"connected": True}], conn)
+
+    def test_a_connection_that_may_read_gets_it(self):
+        open_state = policy.state()
+        for who in (OWNER, MEMBER, VIEWER, LOCAL_HTTP):
+            assert self.send(who, open_state) == [{"connected": True}]
+
+    def test_a_connection_that_is_not_admitted_does_not(self):
+        protected = policy.AccessState(
+            entry=policy.ENTRY_PROTECTED, owner=policy.OWNER_ACCOUNT)
+        assert self.send((HTTP, LAN, None), protected) is None
+
+    def test_a_connection_from_outside_the_home_network_does_not(self):
+        assert self.send((HTTP, ipaddress.ip_address("203.0.113.9"), None),
+                         policy.state()) is None
+
+    def test_the_decision_is_the_gets(self):
+        # whoever the table refuses a read gets no notification either
+        strict = policy.AccessState(
+            entry=policy.ENTRY_OPEN, preset=policy.STRICT,
+            owner=policy.OWNER_ACCOUNT)
+        who = (HTTP, ipaddress.ip_address("203.0.113.9"), None)
+
+        async def get(rig: Rig) -> Any:
+            return await rig.refused(rig.call("state", who=who))
+        policy.set_state(strict)
+        assert run(get).status_code == 403
+        assert self.send(who, strict) is None
+
+    def test_without_the_level_table_it_is_sent(self):
+        assert self.send(OWNER, None) == [{"connected": True}]
+
+
+def test_the_panel_origin_is_allowed_by_cors():
+    import pathlib
+    text = (pathlib.Path(__file__).parent.parent / "core" / "M1"
+            / "moonraker.core.conf.template").read_text()
+    lines = [line.strip() for line in text.splitlines()]
+    assert any(line.startswith("*://127.0.0.1:100") for line in lines)
+    assert any(line.startswith("*://localhost:100") for line in lines)
