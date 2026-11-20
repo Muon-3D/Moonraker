@@ -25,6 +25,7 @@ from tornado.http1connection import HTTP1Connection
 from tornado.httpserver import HTTPServer
 from tornado.log import access_log
 from ..utils import ServerError, source_info, parse_ip_address, redact
+from ..utils.exceptions import BodyError
 from ..utils.real_ip import validate_real_ip_header
 from .. import muon_access_policy
 from .. import muon_floor
@@ -510,9 +511,15 @@ def _write_json_error(
     if 'exc_info' in kwargs:
         err['traceback'] = "\n".join(
             traceback.format_exception(*kwargs['exc_info']))
+    out: Dict[str, Any] = {'error': err}
+    # MUON (KAN-4812): a BodyError carries fields of its own, such as the
+    # `reason` of a refused panel navigation, beside the `error` object.
+    cause = getattr(kwargs.get('exc_info', (None, None))[1], "__cause__", None)
+    if isinstance(cause, BodyError):
+        out = {**cause.body, 'error': err}
     req_hdlr.set_status(status_code, _status_line_reason(status_code, message))
     req_hdlr.set_header("Content-Type", "application/json; charset=UTF-8")
-    req_hdlr.finish(jsonw.dumps({'error': err}))
+    req_hdlr.finish(jsonw.dumps(out))
 
 def _set_cors_headers(req_hdlr: tornado.web.RequestHandler) -> None:
     request = req_hdlr.request

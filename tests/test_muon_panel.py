@@ -63,6 +63,12 @@ class Server:
     def is_verbose_enabled(self) -> bool:
         return False
 
+    def register_endpoint(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    def register_event_handler(self, *args: Any) -> None:
+        pass
+
 
 class Config:
     def __init__(self, server: Server, path: Path) -> None:
