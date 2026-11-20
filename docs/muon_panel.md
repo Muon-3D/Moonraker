@@ -65,6 +65,10 @@ as `error.data` over JSON-RPC):
   and the caller is not the printer owner (the admin level, or the panel
   itself); returned before the panel is contacted. Both sides are compared
   lower case with leading and trailing `/` removed
+  The set Moonraker enforces is the published list plus its own: `protection`,
+  `devices`, `permissions`, `permvalue`, `link`, `linkcode`, `hotspot`,
+  `hotspotqr`, and `devmode` whenever its protection level is not Open (or
+  cannot be read), so a stale panel cannot open them
 - 429 `rate_limited`: one caller (the muon access principal; local callers
   are exempt) has two navigations waiting, or started two in the last
   second
