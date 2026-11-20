@@ -403,6 +403,15 @@ class MoonrakerApp:
             f"{self._route_prefix}{pattern}", FileRequestHandler, params
         )
 
+    def register_handler(
+        self, pattern: str, handler: Type[tornado.web.RequestHandler],
+        params: Optional[Dict[str, Any]] = None
+    ) -> None:
+        # MUON: a component serving a raw (non-JSON) body brings its own handler
+        self.mutable_router.add_handler(
+            f"{self._route_prefix}{pattern}", handler, params
+        )
+
     def register_upload_handler(
         self, pattern: str, location_prefix: str = "server/files"
     ) -> None:
