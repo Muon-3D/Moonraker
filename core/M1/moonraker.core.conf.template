@@ -198,12 +198,19 @@ subscriptions:
     #todo add ciruclar screen
 
 [gcode_preprocessor]
-# KAN-193 / invariant I5.  This section is a safety control, not a feature: if
-# it is absent the component never loads, and both enforcement points in
-# file_manager.py and klippy_apis.py degrade to a logged error while G-code
-# reaches Klipper without ever passing avoid_excluded_zone.
+# The notch check is OFF (Harry, 2026-11-24). The slicer now keeps toolpaths
+# off the bed notch itself (muon3d-slicer#70, 0.6.0-m1.5), and the notch that
+# avoid_excluded_zone hard-codes (x81-119, y0-27.7) is out of date: the slicer
+# has moved the bed 6 mm towards -Y, so the checker refused valid files whose
+# travels follow the new notch edge.
+#
+# The section stays, with /bin/true as the binary, because the component does
+# more than the check: it signs each upload with the muon-safety-pass marker
+# that start_print verifies, and it starts the muon_toolpath preview. Deleting
+# the section would turn those off too. To put the check back, set this to
+# ${AVOID_EXCLUDED_ZONE_BINARY}; the binary is still installed.
 # tests/test_gcode_guard.py asserts the section is present and names a binary.
-binary: ${AVOID_EXCLUDED_ZONE_BINARY}
+binary: /bin/true
 # Bound on a single postprocessor run.  Before KAN-193 there was no timeout at
 # all, so a postprocessor that hung hung the upload -- and, via start_print, the
 # print request -- indefinitely.
