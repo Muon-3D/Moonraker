@@ -583,6 +583,9 @@ READ = ACTIONS["read"]
 #: first match wins, so a longer prefix comes before a shorter one.
 WRITE_ACTIONS: Tuple[Tuple[str, str], ...] = (
     ("/server/muon/usb/print", "print"),
+    ("/server/muon/usb/copy", "print"),
+    ("/server/muon/usb/job/cancel", "print"),
+    ("/server/muon/usb/eject", "print"),
     ("/server/muon/setup", "setup"),
     ("/server/muon/link", "owner"),
     ("/server/muon/protection", "protection"),
@@ -1013,6 +1016,20 @@ def filter_result(
             await guard.flush()
         return result
     return filtered()
+
+
+def usb_view(
+    transport: Optional[Any], ip_addr: Optional[Any], user: Optional[Any]
+) -> Optional[Any]:
+    """What this caller may do in a USB copy job (visible files, where it may
+    write, whether it may replace), or None when no access model applies."""
+    principal = _file_principal(transport, ip_addr, user)
+    guard, current = _files, _state
+    if principal is None or guard is None or current is None:
+        return None
+    return guard.usb_view(
+        principal,
+        lambda name: decide_action(ACTIONS[name], principal, current).allowed)
 
 
 def plan_upload(ip_addr: Optional[Any], user: Optional[Any],

@@ -242,6 +242,48 @@ def printed_files(script: Any) -> list:
     return found
 
 
+class UsbView:
+    """What one caller may do in a USB copy job: which of the printer's files
+    it may see, where it may write, and whether it may overwrite."""
+
+    def __init__(self, scope: FileScope, principal: policy.Principal,
+                 may: Any, error: Any) -> None:
+        self.scope = scope
+        self.principal = principal
+        #: (action name) -> bool, the permission table for this caller
+        self.may = may
+        self.error = error
+
+    def readable(self, path: str) -> bool:
+        """The same visibility as a file listing (account scope, private)."""
+        return self.scope.readable(path, self.principal)
+
+    def dest_dir(self, directory: str) -> str:
+        """The folder a to_printer copy lands in, as an upload would: inside the
+        caller's own drive in accounts mode, refused in another account's."""
+        try:
+            mapped, _tag, _answer = self.scope.upload(self.principal, directory)
+        except ValueError:
+            raise self.error("Copies may not go to another account's drive.", 403)
+        probe = posixpath.join(mapped, "x")
+        if self.scope.hidden_tree(probe, self.principal):
+            raise self.error(f"File '{mapped}' not found", 404)
+        if not self.scope.in_scope(probe, self.principal):
+            raise self.error(f"'{mapped}' is in another account's drive.", 403)
+        return mapped
+
+    def may_replace(self, path: str) -> bool:
+        """Overwriting is a delete of what was there: the files permission, and
+        files_others for a file somebody else uploaded."""
+        if not self.may("files") or not self.readable(path):
+            return False
+        tag = self.scope.index.get(path)
+        if (tag is not None and tag.uploader != self.principal.name
+                and not self.may("files_others")):
+            return False
+        return True
+
+
 class FileGuard:
     def __init__(self, scope: Any, record: Any, error: Any,
                  persist: Any = None) -> None:
@@ -291,6 +333,9 @@ class FileGuard:
             return "delete", [gcodes_path(args.get("path"))]
         return "", []
 
+    def usb_view(self, principal: policy.Principal, may: Any) -> UsbView:
+        return UsbView(self.scope(), principal, may, self.error)
+
     def adjust(self, actions: Tuple[policy.Action, ...], endpoint: str,
                request_type: Any, args: Mapping[str, Any],
                principal: policy.Principal) -> Tuple[policy.Action, ...]:
@@ -321,7 +366,10 @@ class FileGuard:
         scope = self.scope()
         method = getattr(request_type, "name", None)
         # MUON: removable media is shared read-only, never an account drive.
-        destinations = [args.get("dest")]
+        # The USB copy endpoints are the sanctioned writers: their dest is
+        # validated by muon_usb itself (and may name the stick).
+        usb_copy = endpoint == "/server/muon/usb/copy"
+        destinations = [None if usb_copy else args.get("dest")]
         if method != "GET" and endpoint in (
                 "/server/files/directory", "/server/files/delete_file"):
             destinations.append(args.get("path"))
@@ -330,7 +378,24 @@ class FileGuard:
         if any(isinstance(p, str) and p.strip('/').split('/')[0].lower() == 'usb'
                for p in destinations):
             raise self.error("The USB root is read-only.", 403)
-        if endpoint in READ_BY_FILENAME:
+        if usb_copy:
+            # to_usb reads the printer's gcodes: the same read as a download.
+            if args.get("direction") == "to_usb":
+                for item in args.get("items") or []:
+                    path = relative(item)
+                    if path:
+                        self._read(scope, path, principal)
+            elif args.get("direction") == "to_printer":
+                # to_printer writes the printer's gcodes: the same check as an
+                # upload (inside the caller's own drive in accounts mode).
+                stick = args.get("stick")
+                dest = args.get("dest")
+                if not isinstance(dest, str) or not dest.strip("/"):
+                    dest = f"usb-import/{stick}" if isinstance(stick, str) else ""
+                directory = relative(dest)
+                if directory:
+                    self.usb_view(principal, lambda _a: True).dest_dir(directory)
+        elif endpoint in READ_BY_FILENAME:
             self._read(scope, relative(args.get("filename")), principal)
         elif endpoint == "/server/files/download":
             self._read(scope, gcodes_path(args.get("path")), principal)
