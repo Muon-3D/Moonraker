@@ -299,11 +299,13 @@ class TestWriteHygiene:
         "null",
         # Near misses on the console's origins: the wrong scheme, a lookalike
         # host, a port that is not the default, and a subdomain.
-        "http://app.muon3d.com",
-        "https://app.muon3d.com.evil.example",
-        "https://app.muon3d.com:8443",
-        "https://app.muon3d.com:443",
-        "https://evil.app.muon3d.com",
+        "http://control.muon3d.com",
+        "https://control.muon3d.com.evil.example",
+        "https://control.muon3d.com:8443",
+        "https://control.muon3d.com:443",
+        "https://evil.control.muon3d.com",
+        # The old console name, retired 24 Nov 2026 (KAN-414 phase C).
+        "https://app.muon3d.com",
         "https://muon3d.com",
     ])
     def test_a_foreign_origin_is_a_403(self, endpoint: str, origin: str) -> None:
@@ -313,7 +315,6 @@ class TestWriteHygiene:
         assert "Origin" in str(refused)
 
     @pytest.mark.parametrize("origin", [
-        "https://app.muon3d.com",
         "https://control.muon3d.com",
     ])
     def test_muon3ds_own_consoles_may_start_and_cancel(
@@ -330,19 +331,18 @@ class TestWriteHygiene:
         """The browser names the printer in Host when the console fetches it,
         so a rebinding page borrowing the console's Origin still fails."""
         headers = {"Host": "evil.example", "Content-Type": "application/json",
-                   "Origin": "https://app.muon3d.com"}
+                   "Origin": "https://control.muon3d.com"}
         refused, _ = self._refused(request("lan", endpoint, headers=headers))
         assert refused.status_code == 403
 
     def test_a_console_origin_still_needs_json(self, endpoint: str) -> None:
-        headers = {"Host": "10.42.0.1", "Origin": "https://app.muon3d.com"}
+        headers = {"Host": "10.42.0.1", "Origin": "https://control.muon3d.com"}
         refused, _ = self._refused(request("lan", endpoint, headers=headers))
         assert refused.status_code == 415
 
     def test_the_console_origins_are_pinned(self) -> None:
         """The list is the decision, so pin it exactly."""
         assert CONSOLE_ORIGINS == frozenset({
-            "https://app.muon3d.com",
             "https://control.muon3d.com",
         })
 

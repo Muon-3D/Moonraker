@@ -96,7 +96,6 @@ STANDING_PHASES = ("offer", "linked")
 #: is the DNS-rebinding and cross-site defence. muon_setup does not accept these.
 #: Jack's decision, 2026-09-28.
 CONSOLE_ORIGINS = frozenset({
-    "https://app.muon3d.com",
     "https://control.muon3d.com",
 })
 #: At most START_LIMIT `start` calls per START_WINDOW seconds per caller address.
