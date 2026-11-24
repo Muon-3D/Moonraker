@@ -128,10 +128,9 @@ force_logins: true
 # served from that domain drive the machine; and `.lan` is a suffix no Muon
 # address uses (WEB-1: `muon3d.local` and `control.muon3d.com`, nothing else).
 #
-# `control.muon3d.com` is the console's name (ADR 0025). `app.muon3d.com`
-# stays until its redirect covers every caller (WEB-8, KAN-414): the hosted
-# Fluidd moves to the new name only after printers admit it, which needs this
-# entry baked into an image first.
+# `control.muon3d.com` is the console's name (ADR 0025). The old `app` name
+# was dropped on 24 Nov 2026 (KAN-414 phase C): every Control page there
+# 301s to control.muon3d.com, so no page runs on that origin any more.
 #
 # `https://slicer.muon3d.com` is the hosted Muon3D Slicer (KAN-541). It sends a
 # sliced plate to an M1 on the same network by the printer's `.local` name, and
@@ -150,7 +149,6 @@ force_logins: true
 cors_domains:
     *://*.local
     *://control.muon3d.com
-    *://app.muon3d.com
     https://slicer.muon3d.com
     *://localhost:100 #Access for MuonUI Local Service
     *://127.0.0.1:100 #The MuonUI panel origin (KAN-4812): the panel page is also opened by IP
