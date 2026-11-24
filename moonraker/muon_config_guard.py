@@ -93,9 +93,14 @@ ALLOWED_SECTION_KEYS: Dict[str, FrozenSet[str]] = {
     "bed_tilt": frozenset({"x_adjust", "y_adjust", "z_adjust"}),
     "skew_correction": frozenset({"xy_skew", "xz_skew", "yz_skew"}),
     "load_cell": frozenset({"counts_per_gram", "reference_tare_counts"}),
+    # trigger_counts, mesh_trigger_counts and mesh_settle: the B1's fixed
+    # probe triggers are per printer (Muon3D_Klipper#157). Core.cfg gives
+    # default_* values for a printer whose block lacks them; the per-printer
+    # values live here so they can be tuned without changing core.
     "load_cell_probe": frozenset({
         "z_offset", "reference_max_load_counts",
         "counts_per_gram", "reference_tare_counts", "trigger_phase",
+        "trigger_counts", "mesh_trigger_counts", "mesh_settle",
     }),
     "probe": frozenset({"z_offset"}),
 }
