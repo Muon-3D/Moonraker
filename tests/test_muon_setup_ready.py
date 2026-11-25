@@ -165,6 +165,35 @@ class TestItems:
         assert result["state"]["steps"]["ready"]["items"][1]["status"] == "skipped"
         assert result["state"]["steps"]["ready"]["status"] == "pending"
 
+    @pytest.mark.parametrize("before", [
+        # otter, 25 Nov 2026: the self-test was skipped.
+        {"transport_clips": "done", "self_test": "skipped"},
+        # smew, 25 Nov 2026: the clips were skipped (self-test hidden there).
+        {"transport_clips": "skipped", "self_test": "skipped"},
+        {"transport_clips": "skipped", "self_test": "failed"},
+    ])
+    def test_skipping_the_last_item_moves_on_when_a_required_one_was_skipped(
+            self, before: Dict[str, str]):
+        """Skip on the last item used to change nothing the panel could see:
+        the step stayed pending with no item pending, so the panel stayed on
+        "Load your first filament" and Skip seemed dead."""
+        async def go():
+            h = await harness(at_ready(**before)).start()
+            return await post(h, "load_filament", "skip")
+        result = run(go())
+        assert result["error"] is None
+        assert result["state"]["steps"]["ready"]["status"] == "skipped"
+        assert result["state"]["cursor"] != "ready"
+
+    def test_skipping_only_the_optional_item_still_finishes_it_done(self):
+        async def go():
+            h = await harness(at_ready(
+                transport_clips="done", self_test="done")).start()
+            return await post(h, "load_filament", "skip")
+        result = run(go())
+        assert result["state"]["steps"]["ready"]["status"] == "done"
+        assert result["state"]["cursor"] != "ready"
+
 
 class TestMotionGuards:
     """02 §5.10: the self-test moves the printer."""
