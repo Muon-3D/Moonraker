@@ -151,6 +151,26 @@ def settle(setup: MuonSetup, doc: Dict[str, Any]) -> None:
             setup.advance()
 
 
+def settle_skipped(setup: MuonSetup, doc: Dict[str, Any]) -> None:
+    """After an item skip: a step with nothing left to offer is skipped.
+
+    settle() only finishes the step when every required item is done. If the
+    owner skipped a required item (the clips, the self-test) and then skips
+    the last one, no item is pending and settle() never advances, so the
+    panel sat on the last item and Skip did nothing (otter, smew, 25 Nov
+    2026). Treat that like the step-level skip: the step is `skipped`, the
+    cursor moves on, and the "Finish setup" card lists it.
+    """
+    step = doc["steps"]["ready"]
+    if step["status"] != model.PENDING:
+        return
+    if any(s["status"] == model.PENDING for s in step["items"]):
+        return
+    step["status"] = model.SKIPPED
+    if doc["state"] != "complete" and doc["cursor"] == "ready":
+        setup.advance()
+
+
 def _earlier_required_pending(setup: MuonSetup, doc: Dict[str, Any],
                               item_id: str) -> List[str]:
     """Required items before `item_id` in manifest order that aren't done."""
@@ -205,6 +225,7 @@ async def handle_ready(setup: MuonSetup, webreq: WebRequest) -> Dict[str, Any]:
             state["status"] = model.SKIPPED
             state["error"] = None
             settle(setup, doc)
+            settle_skipped(setup, doc)
             return None
         if action == "confirm":
             if item["kind"] not in ("confirm", "panel_flow"):
