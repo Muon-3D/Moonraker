@@ -32,6 +32,9 @@
 #     the least there is (KAN-877): a signed-out guest with a Viewer's role,
 #     off the home network and unidentified. It used to be admin and Operator;
 #     muon-link must now name the principal for every session it forwards.
+#     That holds without a [muon_access] section too: such a token is then
+#     decided under UNNAMED_GATEWAY_STATE, while every other caller keeps
+#     upstream behaviour.
 #   * a browser on the LAN or the hotspot signed in with the printer password
 #     (Moonraker#32): a signed-out guest with Operator (access-model 6). The
 #     password works only from home (ACC-16), so the same login arriving
@@ -478,19 +481,18 @@ def _gateway_principal(user: Any) -> Principal:
         getattr(user, "principal", "") or getattr(user, "username", "") or ""
     )
     home = getattr(user, "access_home", False) is True
-    if level_name is None and role is None:
-        # KAN-877: a muon-link that sends no principal is nobody in
-        # particular, so it fails closed to the least there is: a signed-out
-        # guest with a Viewer's role, off the home network, unidentified,
-        # whatever else the token carries. It never held an identity, so it
-        # is never given admin by omission.
+    if level_name not in PRINCIPAL_LEVELS or role not in ROLES:
+        # KAN-877: a muon-link that does not name a valid level and role is
+        # nobody in particular, so it fails closed to the least there is: a
+        # signed-out guest with a Viewer's role, off the home network,
+        # unidentified, whatever else the token carries. It never held an
+        # identity, so it is never given admin by omission.
         return Principal(
             "gateway", name, SIGNED_OUT_GUEST, VIEWER, False, False
         )
-    level = PRINCIPAL_LEVELS.get(level_name or "", SIGNED_OUT_GUEST)
-    if role not in ROLES:
-        role = VIEWER
-    return Principal("gateway", name, level, role, home, True)
+    return Principal(
+        "gateway", name, PRINCIPAL_LEVELS[level_name], role, home, True
+    )
 
 
 #: KAN-436: the principal of a phone setting the printer up over Bluetooth.
@@ -915,6 +917,32 @@ def refusal(decision: Decision) -> ServerError:
     )
 
 
+#: KAN-877: what a gateway token that names no principal is decided under
+#: when no [muon_access] section has set a state: an Open printer with no
+#: owner, at the default preset. Its principal is a signed-out guest with a
+#: Viewer's role, so it reaches the reads and an emergency stop, nothing else.
+UNNAMED_GATEWAY_STATE = AccessState(entry=ENTRY_OPEN, owner=OWNER_NONE)
+
+
+def unnamed_gateway_caller(
+    transport: Optional[Any], ip_addr: Optional[Any], user: Optional[Any]
+) -> bool:
+    """A paired-session token from muon_gateway (192.0.2.1) that does not
+    name a valid level and role. Bluetooth (192.0.2.2) is held to the setup
+    routes by muon_floor.check_bluetooth instead."""
+    return (
+        not muon_floor._is_internal(transport)
+        and muon_floor._is_gateway_address(ip_addr)
+        and not muon_floor.is_bluetooth_address(ip_addr)
+        and user is not None
+        and getattr(user, "source", None) == muon_floor.GATEWAY_USER_SOURCE
+        and (
+            getattr(user, "access_level", None) not in PRINCIPAL_LEVELS
+            or getattr(user, "access_role", None) not in ROLES
+        )
+    )
+
+
 # Credential validation still runs in the endpoint. These exact home-network
 # entry points must be reachable before the caller has acquired an identity.
 AUTH_BOOTSTRAP = frozenset((
@@ -937,7 +965,12 @@ def check_access(
     request. Called after the floor and after check_protection."""
     current = _state
     if current is None:
-        return
+        # KAN-877: the table is off without [muon_access], which is how the
+        # M1 ships, but a muon-link token that names no principal is still
+        # the least there is: it is decided under UNNAMED_GATEWAY_STATE.
+        if not unnamed_gateway_caller(transport, ip_addr, user):
+            return
+        current = UNNAMED_GATEWAY_STATE
     if muon_floor._is_internal(transport):
         return
     if muon_floor.local_address(ip_addr):

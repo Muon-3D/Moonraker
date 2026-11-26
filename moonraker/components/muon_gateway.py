@@ -64,7 +64,9 @@
 # user the token carries holds them, and a request is decided on them. A
 # request without them names nobody, and `muon_access` decides it as the least
 # there is: a signed-out guest with a Viewer's role, off the home network and
-# unidentified (KAN-877). It used to be admin with Operator.
+# unidentified (KAN-877). It used to be admin with Operator. That holds on a
+# printer without [muon_access] too (muon_access_policy.UNNAMED_GATEWAY_STATE):
+# such a token reaches the reads and an emergency stop, nothing else.
 
 from __future__ import annotations
 
