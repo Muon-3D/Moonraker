@@ -376,16 +376,16 @@ class TestPrincipals:
 
     def test_a_half_named_principal_is_not_admin_either(self):
         # Level without role (or the reverse) never reaches the parser, but
-        # the resolver must not read it as admin: the lowest level, or a
-        # Viewer's role, comes of whatever is missing.
+        # the resolver must not read it as admin: anything short of a valid
+        # level and role is the least there is, as no principal is.
         for level, role in ((None, "operator"), ("admin", None)):
             user = GatewayUser(
                 "muon-link:0123456789abcdef", "", source="muon_gateway",
                 principal="device:abcd", access_level=level, access_role=role)
             p = policy.resolve_principal(HTTP, SENTINEL, user, "open", HOME)
             assert p is not None
-            assert (p.level, p.role) in (
-                (policy.SIGNED_OUT_GUEST, "operator"), (policy.ADMIN, "viewer"))
+            assert (p.level, p.role, p.home, p.identified) == (
+                policy.SIGNED_OUT_GUEST, "viewer", False, False)
 
     def test_a_principal_less_token_may_not_touch_any_write_row(self):
         # The fix, per row and per preset: only reads and (a Viewer's)
@@ -900,6 +900,115 @@ class TestTheGatewayRequest:
         assert isinstance(user, UserInfo)
         assert user.source == muon_floor.GATEWAY_USER_SOURCE
         assert muon_gateway.SENTINEL == muon_floor.GATEWAY_SENTINEL
+
+
+class TestWithoutTheComponent:
+    """KAN-877 with no [muon_access] section, which is how the M1 ships: the
+    table is off, but a gateway token naming no principal is still the least
+    there is. Every other caller keeps upstream behaviour."""
+
+    WRITES = sorted(set(SAMPLES) - VIEWER_ROWS)
+
+    @staticmethod
+    def _minted(line: bytes) -> GatewayUser:
+        # What muon_gateway._handle builds from the socket line.
+        client = muon_gateway.parse_request(line)
+        return GatewayUser(
+            f"muon-link:{client[:16]}", "", source="muon_gateway",
+            **parse_principal(line),
+        )
+
+    @pytest.mark.parametrize("row", sorted(VIEWER_ROWS))
+    def test_a_token_naming_nobody_still_reads_and_stops(self, row):
+        policy.set_state(None)
+        user = self._minted(b'{"client":"ab12"}')
+        assert refused(row, SENTINEL, user) is None
+
+    @pytest.mark.parametrize("row", WRITES)
+    def test_a_token_naming_nobody_writes_nothing(self, row):
+        policy.set_state(None)
+        user = self._minted(b'{"client":"ab12"}')
+        reason = refused(row, SENTINEL, user)
+        assert reason is not None, row
+        assert reason.startswith("access-denied:"), reason
+
+    @pytest.mark.parametrize("user", [
+        LEGACY_GATEWAY_USER,
+        GatewayUser("muon-link:ab", "", source="muon_gateway",
+                    access_level="admin"),
+        GatewayUser("muon-link:ab", "", source="muon_gateway",
+                    access_role="operator"),
+        GatewayUser("muon-link:ab", "", source="muon_gateway",
+                    access_level="panel", access_role="operator"),
+    ])
+    def test_a_partial_or_unknown_principal_is_the_least_too(self, user):
+        policy.set_state(None)
+        assert policy.unnamed_gateway_caller(HTTP, SENTINEL, user)
+        assert refused("print", SENTINEL, user) is not None
+        assert refused("read", SENTINEL, user) is None
+        p = policy.resolve_principal(HTTP, SENTINEL, user, "open")
+        assert p is not None
+        assert (p.level, p.role, p.home, p.identified) == (
+            policy.SIGNED_OUT_GUEST, policy.VIEWER, False, False)
+
+    @pytest.mark.parametrize("line", [
+        b'{"client":"ab12","principal":"device:ab12","level":"admin",'
+        b'"role":"operator"}',
+        # An Open guest (muon-link#116): nearby strangers keep using it
+        b'{"client":"ab12","principal":"device:ab12",'
+        b'"level":"signed_out_guest","role":"operator"}',
+    ])
+    def test_a_named_session_keeps_upstream_behaviour(self, line):
+        policy.set_state(None)
+        user = self._minted(line)
+        assert not policy.unnamed_gateway_caller(HTTP, SENTINEL, user)
+        for row in ("read", "emergency_stop", "print", "files", "motion",
+                    "heat", "console"):
+            assert refused(row, SENTINEL, user) is None, row
+
+    def test_the_daemons_own_reads_are_named(self):
+        policy.set_state(None)
+        user = self._minted(
+            b'{"client":"0","principal":"muon-link:entry","level":"admin",'
+            b'"role":"viewer"}')
+        assert not policy.unnamed_gateway_caller(HTTP, SENTINEL, user)
+        assert refused("read", SENTINEL, user) is None
+
+    @pytest.mark.parametrize("ip_addr,user", [
+        (LOOPBACK, None),
+        (LAN, None),
+        (LAN, TRUSTED_USER),
+        (HOTSPOT, PASSWORD_USER),
+    ])
+    def test_other_callers_are_untouched(self, ip_addr, user):
+        policy.set_state(None)
+        assert not policy.unnamed_gateway_caller(HTTP, ip_addr, user)
+        assert refused("print", ip_addr, user) is None
+
+    def test_the_panel_and_in_process_calls_are_untouched(self):
+        policy.set_state(None)
+        assert not policy.unnamed_gateway_caller(
+            INTERNAL, SENTINEL, LEGACY_GATEWAY_USER)
+        endpoint, request_type, args = SAMPLES["print"]
+        asyncio.run(_api(endpoint).request(
+            dict(args), request_type, INTERNAL, None, None))
+
+    def test_an_upload_naming_nobody_is_refused(self):
+        policy.set_state(None)
+        request = type("_Req", (), {"remote_ip": str(SENTINEL)})()
+        with pytest.raises(application.tornado.web.HTTPError) as err:
+            application._check_file_access(
+                request, LEGACY_GATEWAY_USER, "/server/files/upload",
+                RequestType.POST, {"root": "gcodes", "print": "true"})
+        assert err.value.status_code == 403
+
+    def test_the_m1_image_still_has_no_access_section(self):
+        # If this fails, [muon_access] ships and its own state decides; the
+        # fallback stays as the guard for a printer without it.
+        from pathlib import Path
+        template = (Path(__file__).resolve().parents[1] / "core" / "M1"
+                    / "moonraker.core.conf.template").read_text()
+        assert "[muon_access]" not in template
 
 
 # ---------------------------------------------------------------------------

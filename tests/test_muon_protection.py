@@ -19,6 +19,7 @@ import pytest
 from moonraker import muon_floor
 from moonraker.common import RequestType, UserInfo, WebRequest
 from moonraker.components import muon_protection
+from moonraker.components.muon_gateway import GatewayUser
 from moonraker.components.muon_protection import MuonProtection
 from moonraker.utils.exceptions import ServerError
 
@@ -32,6 +33,12 @@ check_protection = muon_floor.check_protection
 
 TRUSTED_USER = UserInfo("_TRUSTED_USER_", "")
 GATEWAY_USER = UserInfo("muon-link:0123456789abcdef", "", source="muon_gateway")
+# A paired Owner as muon-link names it (muon-link#116). Since KAN-877 one that
+# names no principal reaches only reads and an emergency stop.
+PAIRED_GATEWAY_USER = GatewayUser(
+    "muon-link:0123456789abcdef", "", source="muon_gateway",
+    principal="device:0123456789abcdef", access_level="admin",
+    access_role="operator")
 
 
 class _Transport:
@@ -343,9 +350,17 @@ class TestTheCheckIsWiredIn:
     def test_the_panel_and_a_paired_client_reach_the_handler(self):
         muon_floor.set_protection_level(muon_floor.LEVEL_PROTECTED)
         api = self._api("/server/aux/wifi/connect")
-        for ip_addr, user in ((LOOPBACK, TRUSTED_USER), (SENTINEL, GATEWAY_USER)):
+        for ip_addr, user in ((LOOPBACK, TRUSTED_USER),
+                              (SENTINEL, PAIRED_GATEWAY_USER)):
             result = _run(api.request({}, RequestType.POST, HTTP, ip_addr, user))
             assert result == {"reached": "/server/aux/wifi/connect"}
+
+    def test_a_gateway_token_naming_nobody_does_not_reach_it(self):
+        # KAN-877, with no [muon_access] section
+        api = self._api("/server/aux/wifi/connect")
+        with pytest.raises(ServerError) as excinfo:
+            _run(api.request({}, RequestType.POST, HTTP, SENTINEL, GATEWAY_USER))
+        assert excinfo.value.status_code == 403
 
     def test_level_zero_passes_a_lan_browser_through(self):
         api = self._api("/server/aux/wifi/connect")
